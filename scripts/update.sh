@@ -1,9 +1,9 @@
 #!/bin/sh
 # Met à jour synoarr (installation native) depuis GitHub puis redémarre.
-# Usage : sudo sh scripts/update.sh VOTRE-COMPTE
+# Usage : sudo sh scripts/update.sh [COMPTE-GITHUB]   (défaut : FloFrad)
 # config.ini et data/ sont conservés.
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-OWNER="${1:-}"
+OWNER="${1:-FloFrad}"
 cd "$DIR" || exit 1
 WAS_RUNNING=0
 if [ -f "$DIR/synoarr.pid" ] && grep -q "synoarr.py" "/proc/$(cat "$DIR/synoarr.pid")/cmdline" 2>/dev/null; then

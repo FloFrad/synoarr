@@ -25,7 +25,7 @@ Suivez le guide pas à pas : **[docs/INSTALLATION.md](docs/INSTALLATION.md)** (2
 Résumé :
 
 ```bash
-cd /volume1/docker && wget -O synoarr.tar.gz https://github.com/VOTRE-COMPTE/synoarr/archive/refs/heads/main.tar.gz && tar xzf synoarr.tar.gz && mv synoarr-main synoarr && cd synoarr
+cd /volume1/docker && wget -O synoarr.tar.gz https://github.com/FloFrad/synoarr/archive/refs/heads/main.tar.gz && tar xzf synoarr.tar.gz && mv synoarr-main synoarr && cd synoarr
 ```
 
 ```bash

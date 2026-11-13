@@ -57,12 +57,43 @@ def _not_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() != 0
 
 
+def _in_docker() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
+def _command(rest: str = "") -> str:
+    """How the user should run a synoarr command here ("sudo python3 synoarr.py check"...)."""
+    rest = rest if rest else " ".join(sys.argv[1:])
+    if _in_docker():
+        return "docker exec -it synoarr python3 /app/synoarr.py %s" % rest
+    return "sudo python3 synoarr.py %s" % rest
+
+
 def _sudo_hint() -> str:
-    if not _not_root():
+    if not _not_root() or _in_docker():
         return ""
     return ("      Le dossier de données a sans doute été créé par root (démon lancé avec sudo ou tâche "
-            "planifiée DSM en root) : relancez la commande avec sudo, ex. : sudo python3 synoarr.py "
-            + " ".join(sys.argv[1:]))
+            "planifiée DSM en root). Relancez la commande avec sudo : " + _command())
+
+
+def _chown_to_sudo_user(path: str) -> None:
+    """Under sudo, give a created file/folder back to the real user (DSM Text Editor can then save it)."""
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if not uid or not hasattr(os, "chown") or _not_root():
+        return
+    try:
+        os.chown(path, int(uid), int(gid or -1))
+    except (OSError, ValueError) as exc:
+        log.debug("chown %s impossible : %s", path, exc)
+
+
+def _share_problem(path: str) -> Optional[str]:
+    from .config import missing_share_root
+    root = missing_share_root(path)
+    if root:
+        return ("Dossier partagé %s introuvable (File Station > clic droit > Propriétés > Emplacement) : "
+                "corrigez le chemin %s" % (root, path))
+    return None
 
 
 def _check_data_dir(cfg: Config) -> Optional[str]:
@@ -103,10 +134,15 @@ def cmd_init(args: argparse.Namespace) -> int:
         _out(WARN + "%s existe déjà, rien n'a été modifié." % target)
         return 0
     example = os.path.join(ROOT_DIR, "config.example.ini")
-    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+    folder = os.path.dirname(os.path.abspath(target))
+    created_folder = not os.path.isdir(folder)
+    os.makedirs(folder, exist_ok=True)
+    if created_folder:
+        _chown_to_sudo_user(folder)
     shutil.copyfile(example, target)
+    _chown_to_sudo_user(target)
     _out(OK + "Fichier créé : %s" % target)
-    _out("      Éditez-le (identifiants Download Station, dossiers), puis lancez : python3 synoarr.py check")
+    _out("      Éditez-le (identifiants Download Station, dossiers), puis lancez : " + _command("check"))
     return 0
 
 
@@ -149,6 +185,11 @@ def cmd_check(args: argparse.Namespace) -> int:
              "le chemin du dossier où Download Station enregistre (ex. destination = Download ↔ download_dir = "
              "/volume1/Download)" % (dest, pc.download_dir))
     for label, d in (("Films", pc.movies_dir), ("Séries", pc.series_dir)):
+        share = _share_problem(d)
+        if share:  # never create a share root: a typo ("Videos" for "Vidéos") would create a hidden folder
+            _out(KO + share)
+            errors += 1
+            continue
         try:
             os.makedirs(d, exist_ok=True)
             fd, probe = tempfile.mkstemp(prefix=".synoarr-probe-", dir=d)
@@ -175,6 +216,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     if app.ds is None:
         _out(KO + "Download Station : [downloadstation] username/password non renseignés")
         errors += 1
+    elif not cfg.downloadstation.password:
+        _out(KO + "Download Station : [downloadstation] password est vide")
+        errors += 1
     else:
         ok, msg = _safe_test(app.ds.test)
         _out((OK if ok else KO) + "Download Station : " + msg)
@@ -182,7 +226,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     # Plex
     if app.plex is None:
-        _out(KO + "Plex : aucun jeton. Lancez : python3 synoarr.py plex-login")
+        _out(KO + "Plex : aucun jeton. Lancez : " + _command("plex-login"))
         errors += 1
     else:
         ok, msg = _safe_test(app.plex.test)
@@ -205,7 +249,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     # Indexers
     rows = app.indexer_manager.list()
     if not rows:
-        _out(KO + "Aucun indexer. Exemple : python3 synoarr.py indexer add internet_archive")
+        _out(KO + "Aucun indexer. Exemple : " + _command("indexer add internet_archive"))
         errors += 1
     for row in rows:
         if not row["enabled"]:
@@ -219,7 +263,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     if errors:
         _out("%d problème(s) à corriger avant de lancer synoarr." % errors)
         return 1
-    _out("Tout est prêt. Lancez : python3 synoarr.py run   (ou scripts/start.sh)")
+    _out("Tout est prêt. Lancez : " + ("docker restart synoarr" if _in_docker() else "scripts/start.sh (ou " + _command("run") + ")"))
     return 0
 
 
@@ -274,17 +318,17 @@ def cmd_indexer(args: argparse.Namespace) -> int:
         if action == "list":
             rows = mgr.list()
             if not rows:
-                _out("Aucun indexer. Voir : python3 synoarr.py indexer catalog")
+                _out("Aucun indexer. Voir : " + _command("indexer catalog"))
             for r in rows:
                 _out("%3d  %-25s %-17s %-8s %s" % (r["id"], r["name"], r["type"],
                                                     "actif" if r["enabled"] else "inactif", r["url"]))
         elif action == "catalog":
-            _out("Indexers légaux disponibles (ajout : python3 synoarr.py indexer add <id>) :")
+            _out("Indexers légaux disponibles (ajout : %s) :" % _command("indexer add <id>"))
             for e in mgr.catalog():
                 _out("  %-22s %-30s %s%s" % (e["id"], e["name"], e.get("description", ""),
                                              "  [installé]" if e["installed"] else ""))
             _out("Vous pouvez aussi ajouter n'importe quel flux Torznab ou RSS :")
-            _out("  python3 synoarr.py indexer add-url \"Mon indexer\" https://exemple.org/api --api-key XXXX")
+            _out("  " + _command("indexer add-url \"Mon indexer\" https://exemple.org/api --api-key XXXX"))
         elif action == "add":
             if not args.target:
                 _out(KO + "Précisez l'identifiant du catalogue, ex. : indexer add internet_archive")
@@ -293,6 +337,8 @@ def cmd_indexer(args: argparse.Namespace) -> int:
             _out(OK + "Ajouté : %s" % row.get("name"))
             ok, msg = mgr.test(row["id"])
             _out((OK if ok else KO) + "Test : " + msg)
+            if not ok:
+                return 1
         elif action == "add-url":
             if not args.target or not args.url:
                 _out(KO + "Usage : indexer add-url \"Nom\" URL [--api-key CLE] [--categories 2000,5000]")
@@ -302,6 +348,8 @@ def cmd_indexer(args: argparse.Namespace) -> int:
             _out(OK + "Ajouté : %s (type %s)" % (row.get("name"), row.get("type")))
             ok, msg = mgr.test(row["id"])
             _out((OK if ok else KO) + "Test : " + msg)
+            if not ok:
+                return 1
         elif action == "test":
             rows = [mgr._row(args.target)] if args.target else mgr.list()
             for r in rows:
@@ -323,7 +371,10 @@ def cmd_watchlist(args: argparse.Namespace) -> int:
     app = _app(args)
     if not args.no_sync:
         _sync(app)
-    for m in app.db.list_media():
+    medias = app.db.list_media()
+    if not medias:
+        _out("Watchlist vide (ou pas encore synchronisée).")
+    for m in medias:
         extra = ""
         if m["type"] == "show":
             eps = app.db.list_episodes(m["id"])
@@ -372,8 +423,18 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _quiet_console(args: argparse.Namespace) -> None:
+    """The command prints its own report: console log lines would only duplicate it."""
+    if getattr(args, "verbose", False):
+        return
+    for h in logging.getLogger().handlers:
+        if type(h) is logging.StreamHandler:
+            h.setLevel(logging.WARNING)
+
+
 def cmd_process(args: argparse.Namespace) -> int:
     app = _app(args)
+    _quiet_console(args)
     actions = app.organizer.run_once(dry_run=args.dry_run or app.cfg.general.dry_run)
     if not actions:
         _out("Rien à traiter dans %s" % app.cfg.paths.download_dir)
@@ -389,9 +450,50 @@ def cmd_once(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_for_docker_config(args: argparse.Namespace) -> bool:
+    """Docker first run: create config.ini from the example and wait until the user edits it.
+    Returns True if it waited (the configuration then exists)."""
+    target = args.config
+    folder = os.path.dirname(os.path.abspath(target))
+    if os.path.exists(target) or not _in_docker() or not os.path.isdir(folder):
+        return False
+    shutil.copyfile(os.path.join(ROOT_DIR, "config.example.ini"), target)
+    mtime = os.path.getmtime(target)
+    msg = ("Configuration créée : éditez %s (config/config.ini sur le NAS) ; synoarr démarrera dès qu'il sera "
+           "enregistré (ou redémarrez le conteneur)." % target)
+    _out(WARN + msg)
+    last_msg = time.time()
+    while True:
+        time.sleep(_DOCKER_POLL)
+        try:
+            if os.path.getmtime(target) != mtime:
+                _out(OK + "Configuration modifiée : démarrage")
+                time.sleep(min(2, _DOCKER_POLL))  # let the editor finish writing
+                return True
+        except OSError:
+            pass
+        if time.time() - last_msg >= 600:
+            _out(WARN + msg)
+            last_msg = time.time()
+
+
+_DOCKER_POLL = 10.0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    app = _app(args)
-    app.run_forever()
+    _wait_for_docker_config(args)
+    from .app import App, setup_logging
+    cfg = _load(args)
+    if getattr(args, "verbose", False):
+        cfg.general.log_level = "DEBUG"
+    # started in the background (start.sh redirects stdout to a file): the log file is enough
+    setup_logging(cfg, console=sys.stderr.isatty() or _in_docker())
+    problems = cfg.validate()
+    if problems:
+        for p in problems:
+            _out(KO + p)
+        return 2
+    App(cfg).run_forever()
     return 0
 
 
@@ -410,11 +512,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="synoarr", description="Watchlist Plex → indexers → Download Station → "
                                 "renommage Plex. Toutes les commandes acceptent --config.")
     p.add_argument("--version", action="version", version="synoarr " + __version__)
+    # accepted before ("synoarr --config x check") or after the command: the sub-command only overrides
+    # the value when the option is given there (SUPPRESS), defaults live on the main parser
+    p.add_argument("--config", "-c", default=default_config_path(),
+                   help="chemin du config.ini (défaut : %(default)s)")
+    p.add_argument("--dry-run", action="store_true", help="simulation : rien n'est envoyé ni déplacé")
+    p.add_argument("--verbose", "-v", action="store_true", help="journal détaillé (DEBUG)")
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--config", "-c", default=default_config_path(),
-                        help="chemin du config.ini (défaut : %(default)s)")
-    common.add_argument("--dry-run", action="store_true", help="simulation : rien n'est envoyé ni déplacé")
-    common.add_argument("--verbose", "-v", action="store_true", help="journal détaillé (DEBUG)")
+    common.add_argument("--config", "-c", default=argparse.SUPPRESS,
+                        help="chemin du config.ini (défaut : %s)" % default_config_path())
+    common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
+                        help="simulation : rien n'est envoyé ni déplacé")
+    common.add_argument("--verbose", "-v", action="store_true", default=argparse.SUPPRESS,
+                        help="journal détaillé (DEBUG)")
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("init", parents=[common], help="créer config.ini à partir de config.example.ini") \
@@ -469,7 +579,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ConfigError as exc:
         _out(KO + str(exc))
         if "introuvable" in str(exc):
-            _out("      Créez-le avec : python3 synoarr.py init")
+            _out("      Créez-le avec : " + _command("init"))
         return 2
     except KeyboardInterrupt:
         return 130
@@ -508,7 +618,7 @@ def _report_error(exc: BaseException, args: argparse.Namespace) -> int:
         return 1
     if isinstance(exc, HttpError):
         _out(KO + "Erreur réseau : %s" % text)
-        _out("      Vérifiez la connexion du NAS et les adresses dans config.ini (python3 synoarr.py check).")
+        _out("      Vérifiez la connexion du NAS et les adresses dans config.ini (%s)." % _command("check"))
         return 1
     if isinstance(exc, OSError):
         _out(KO + "Erreur système : %s" % exc)

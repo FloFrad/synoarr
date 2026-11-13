@@ -8,8 +8,6 @@ Deux méthodes :
 - **Méthode A — native (recommandée, fonctionne sur tous les modèles)** : utilise le Python déjà présent dans DSM 7.
 - **Méthode B — Docker / Container Manager** : seulement si votre modèle propose Container Manager.
 
-Dans les commandes, remplacez `VOTRE-COMPTE` par votre nom d'utilisateur GitHub.
-
 > Déjà installé ? Allez directement à « Mise à jour » en bas de page.
 
 ---
@@ -49,7 +47,7 @@ Le mot de passe ne s'affiche pas pendant la saisie : c'est normal, tapez-le puis
 Puis :
 
 ```bash
-cd /volume1/docker && wget -O synoarr.tar.gz https://github.com/VOTRE-COMPTE/synoarr/archive/refs/heads/main.tar.gz && tar xzf synoarr.tar.gz && mv synoarr-main synoarr && rm synoarr.tar.gz && cd synoarr
+cd /volume1/docker && wget -O synoarr.tar.gz https://github.com/FloFrad/synoarr/archive/refs/heads/main.tar.gz && tar xzf synoarr.tar.gz && mv synoarr-main synoarr && rm synoarr.tar.gz && cd synoarr
 ```
 
 Vérifiez Python :
@@ -274,7 +272,7 @@ Journal : `data/synoarr.log` (consultable dans File Station).
 Installation native :
 
 ```bash
-cd /volume1/docker/synoarr && sudo sh scripts/update.sh VOTRE-COMPTE
+cd /volume1/docker/synoarr && sudo sh scripts/update.sh
 ```
 
 `config.ini` et `data/` sont conservés.
