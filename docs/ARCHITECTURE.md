@@ -103,8 +103,18 @@ class PlexClient:
     def test(self) -> Tuple[bool, str]
     def start_pin_login(self) -> Tuple[int, str]      # (pin_id, code à saisir sur https://plex.tv/link)
     def check_pin(self, pin_id: int) -> Optional[str]  # authToken ou None
+    def search(self, query: str, kind: Optional[str] = None) -> List[Dict]  # candidats discover, lève HttpError
+    def add_to_watchlist(self, rating_key: str) -> None       # lève HttpError
+    def remove_from_watchlist(self, rating_key: str) -> None  # lève HttpError
 def refresh_library(server_url: str, token: str, http: HttpClient) -> bool
 ```
+Ajout/retrait (comme python-plexapi) : `GET {discover}/library/search` (`query`, `limit`, `searchTypes` =
+`movies,tv` | `movies` | `tv`, `searchProviders=discover`, `includeMetadata=1`, `includeGuids=1`) →
+`MediaContainer.SearchResults[].SearchResult[].Metadata` (ou `MediaContainer.Metadata[]`) ;
+`PUT {discover}/actions/addToWatchlist?ratingKey=..` et `PUT {discover}/actions/removeFromWatchlist?ratingKey=..`
+(repli metadata provider sur 404). Entrées ajoutées à la main sans Plex : `media.plex_key = "local:..."`, jamais
+marquées « retirées » par la synchro (épisodes via TMDb). Entrée retirée dans synoarr mais restée dans la
+Watchlist Plex : `media.hidden = 1` + statut `ignored` (supprimée quand Plex ne la renvoie plus).
 Endpoints (JSON via header `Accept: application/json`, en-têtes `X-Plex-Token`, `X-Plex-Client-Identifier`,
 `X-Plex-Product: synoarr`) : watchlist `https://discover.provider.plex.tv/library/sections/watchlist/all`
 (`X-Plex-Container-Start`, `X-Plex-Container-Size=100`, `includeGuids=1`), métadonnées
@@ -124,6 +134,9 @@ class TmdbClient:
     def search_show(self, title: str) -> Optional[Dict]                      # {"title","year","tmdb"}
     def episode_title(self, tmdb_id: str, season: int, episode: int) -> Optional[str]
     def show_episodes(self, tmdb_id: str) -> List[EpisodeInfo]
+    def search_multi(self, query: str, kind: Optional[str] = None, year: Optional[int] = None) -> List[Dict]
+        # candidats {"source": "tmdb", "type", "title", "year", "tmdb", "overview", "poster_url"...}
+    def external_ids(self, tmdb_id: str, kind: str) -> Dict[str, str]   # {"imdb", "tvdb"}
 ```
 Clé v3 en paramètre `api_key` ; si la clé ressemble à un jeton v4 (commence par "eyJ") → header `Authorization: Bearer`.
 `base_url` attribut. Ne lève pas : None/[] sur erreur.

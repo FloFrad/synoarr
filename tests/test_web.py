@@ -905,3 +905,377 @@ class HostCheckTests(unittest.TestCase):
             self.assertTrue(host_is_local(h), h)
         for h in ("evil.example.com", "attacker.com:8778", "rebind.evil.net"):
             self.assertFalse(host_is_local(h), h)
+
+
+# ------------------------------------------------- progression, changer de source, priorité, Prowlarr
+from synoarr.bencode import bencode as _bencode  # noqa: E402
+
+
+def _torrent(name: str) -> bytes:
+    info = {b"name": name.encode("utf-8"), b"piece length": 16384, b"pieces": b"\0" * 20, b"length": 4321}
+    return _bencode({b"announce": b"http://tracker.invalid/announce", b"info": info})
+
+
+class WebDownloadsTest(RealAppWebBase):
+    def grab_all(self) -> None:
+        self.add_indexer()
+        self.run_cmd("sync")
+        job = self.run_cmd("search_all", force=True)
+        self.assertEqual(job["result"]["grabbed"], 3, job)
+
+    def media(self, key: str) -> Dict[str, Any]:
+        mid = self.app.db.get_media_by_key(key)["id"]
+        return [m for m in self.req("/api/media")[1] if m["id"] == mid][0]
+
+    def list_calls(self) -> int:
+        return sum(1 for r in self.srv.requests if r.params().get("method") == "list")
+
+    def test_progress_in_media_and_dashboard(self) -> None:
+        self.grab_all()
+        movie = self.media("m1")
+        self.assertEqual(len(movie["downloads"]), 1)
+        d = movie["downloads"][0]
+        self.assertEqual(d["release_title"], MOVIE)
+        self.assertEqual((d["status"], d["progress"], d["size"], d["downloaded"]), ("downloading", 25.0, 1000, 250))
+        self.assertEqual((d["speed_down"], d["speed_up"], d["seeders"], d["leechers"], d["peers"]),
+                         (50, 5, 7, 2, 31))
+        self.assertEqual(d["eta_seconds"], 15)
+        self.assertTrue(d["active"])
+        self.assertTrue(d["task_id"])
+        self.assertEqual(d["indexer"], "Fake")
+        show = self.media("s1")
+        self.assertEqual(sorted((x["season"], x["episode"]) for x in show["downloads"]), [(1, None), (2, 1)])
+        status, dl, _ = self.req("/api/downloads")
+        self.assertEqual(status, 200)
+        self.assertEqual((dl["ok"], dl["warning"], dl["active"], len(dl["items"])), (True, None, 3, 3))
+        # finished / seeding task, unknown task
+        with self.world.lock:
+            for t in self.world.tasks.values():
+                if t["title"] == MOVIE:
+                    t["status"] = "seeding"
+                    t["additional"]["transfer"]["size_downloaded"] = 1000
+        self.app.invalidate_downloads()
+        d = self.media("m1")["downloads"][0]
+        self.assertEqual((d["status"], d["progress"], d["active"], d["eta_seconds"]), ("seeding", 100.0, False, None))
+        with self.world.lock:
+            self.world.tasks.clear()
+        self.app.invalidate_downloads()
+        self.assertEqual(self.media("m1")["downloads"][0]["status"], "introuvable")
+
+    def test_status_cache_spares_dsm(self) -> None:
+        self.grab_all()
+        self.app.invalidate_downloads()
+        before = self.list_calls()
+        for _ in range(4):
+            self.req("/api/media")
+            self.req("/api/downloads")
+        self.assertEqual(self.list_calls() - before, 1)
+
+    def test_ds_unreachable_gives_inconnu_and_one_warning(self) -> None:
+        movie = self.app.db.upsert_media("m9", "movie", "Heat", 1995, None, None, None)
+        self.app.db.add_grab(movie, None, None, "Heat.1995.1080p", "Heat.1995.1080p", "Fake", None, 10)
+
+        def boom() -> List[Any]:
+            raise HttpError("connexion refusée", None)
+        self.app.ds.list_tasks = boom  # type: ignore[assignment]
+        status, ms, _ = self.req("/api/media")
+        self.assertEqual(status, 200, ms)
+        d = [m for m in ms if m["id"] == movie][0]["downloads"][0]
+        self.assertEqual(d["status"], "inconnu")
+        self.assertIsNone(d["error"])
+        status, dl, _ = self.req("/api/downloads")
+        self.assertEqual(status, 200)
+        self.assertFalse(dl["ok"])
+        self.assertIn("injoignable", dl["warning"])
+        self.app.ds = None
+        self.app.invalidate_downloads()
+        self.assertIn("pas configuré", self.req("/api/downloads")[1]["warning"])
+
+    def test_failed_grab_still_wanted_is_listed(self) -> None:
+        movie = self.app.db.upsert_media("m9", "movie", "Heat", 1995, None, None, None)
+        gid = self.app.db.add_grab(movie, None, None, "Heat.1995.CAM", "Heat.1995.CAM", "Fake", None, 10)
+        self.app.db.set_grab_status(gid, "failed", "broken_link")
+        d = [m for m in self.req("/api/media")[1] if m["id"] == movie][0]["downloads"]
+        self.assertEqual([(x["status"], x["error"], x["grab_id"]) for x in d], [("failed", "broken_link", gid)])
+        self.app.db.set_media_status(movie, "done")
+        self.assertEqual([m for m in self.req("/api/media")[1] if m["id"] == movie][0]["downloads"], [])
+
+    def sources(self, media_id: int, **body: Any) -> Dict[str, Any]:
+        status, data, _ = self.req("/api/media/%d/sources" % media_id, "POST", body)
+        self.assertEqual(status, 200, data)
+        return self.wait(data["job"]["id"])
+
+    def test_change_source_from_search_results(self) -> None:
+        self.grab_all()
+        movie = self.app.db.get_media_by_key("m1")
+        old = [g for g in self.app.db.list_grabs() if g["media_id"] == movie["id"]][0]
+        old_task = [t["id"] for t in self.world.tasks.values() if t["title"] == MOVIE][0]
+        job = self.sources(movie["id"])
+        self.assertEqual(job["status"], "done", job)
+        res = job["result"]
+        self.assertEqual((res["kind"], res["languages"]), ("movie", ["en"]))
+        by_title = {r["title"]: r for r in res["results"]}
+        self.assertIsNotNone(by_title[MOVIE]["score"])
+        self.assertEqual(by_title[MOVIE]["priority"], 25)
+        ita = by_title["Night.of.the.Living.Dead.1968.iTALiAN.1080p.BluRay-ITA"]
+        self.assertIsNone(ita["score"])
+        self.assertNotIn("download_url", json.dumps(res))
+        url = "/api/media/%d/replace" % movie["id"]
+        body = {"grab_id": old["id"], "job_id": job["id"], "index": ita["index"], "blocklist_old": True}
+        status, data, _ = self.req(url, "POST", body)
+        self.assertEqual(status, 400, data)
+        self.assertIn("rejetée", data["error"])
+        show = self.app.db.get_media_by_key("s1")
+        status, data, _ = self.req("/api/media/%d/replace" % show["id"], "POST",
+                                   {"season": 1, "job_id": job["id"], "index": 0})
+        self.assertEqual(status, 400)
+        self.assertIn("autre élément", data["error"])
+        body["accept_rejected"] = True
+        status, data, _ = self.req(url, "POST", body)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"], data)
+        self.assertIn("ancienne tâche supprimée", data["message"])
+        self.assertIn(old_task, self.world.deleted)
+        grabs = {g["id"]: g for g in self.app.db.list_grabs()}
+        self.assertEqual((grabs[old["id"]]["status"], grabs[old["id"]]["message"]), ("failed", "remplacé manuellement"))
+        new = grabs[data["grab_id"]]
+        self.assertEqual((new["status"], new["media_id"], new["release_title"]), ("sent", movie["id"], ita["title"]))
+        self.assertTrue(self.app.db.is_blocked(MOVIE))
+        self.assertEqual(self.app.db.get_media(movie["id"])["status"], "grabbed")
+        dls = self.media("m1")["downloads"]
+        self.assertEqual([(x["grab_id"], x["status"]) for x in dls], [(new["id"], "downloading")])
+
+    def test_change_source_with_magnet_and_torrent_file(self) -> None:
+        self.grab_all()
+        show = self.app.db.get_media_by_key("s1")
+        grabs = {(g["season"], g["episode"]): g for g in self.app.db.list_grabs() if g["media_id"] == show["id"]}
+        url = "/api/media/%d/replace" % show["id"]
+        magnet = "magnet:?xt=urn:btih:%s&dn=Test.Show.S02E01.MAGNET" % ("ab" * 20)
+        status, data, _ = self.req(url, "POST", {"grab_id": grabs[(2, 1)]["id"], "link": magnet, "delete_old": False})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"], data)
+        self.assertNotIn("supprimée", data["message"])
+        new = self.app.db.query_one("SELECT * FROM grabs WHERE id = ?", (data["grab_id"],))
+        self.assertEqual((new["season"], new["episode"], new["indexer"], new["release_title"]),
+                         (2, 1, "manuel", "Test.Show.S02E01.MAGNET"))
+        d = [x for x in self.media("s1")["downloads"] if x["grab_id"] == new["id"]][0]
+        self.assertEqual(d["status"], "downloading")  # task found (title = dn / info hash)
+        # .torrent upload for the season pack
+        b64 = base64.b64encode(_torrent("Test.Show.S01.720p.UPLOAD")).decode()
+        status, data, _ = self.req(url, "POST", {"grab_id": grabs[(1, None)]["id"], "torrent_base64": b64})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"], data)
+        self.assertIn("Test.Show.S01.720p.UPLOAD", [n for n, _d in self.world.uploads][-1])
+        new = self.app.db.query_one("SELECT * FROM grabs WHERE id = ?", (data["grab_id"],))
+        self.assertEqual((new["season"], new["episode"], new["size"]), (1, None, 4321))
+        # wanted episode without grab: data URL accepted too
+        status, data, _ = self.req(url, "POST", {"season": 1, "episode": 3, "torrent_base64":
+                                                 "data:application/x-bittorrent;base64," +
+                                                 base64.b64encode(_torrent("Test.Show.S01E03.X")).decode()})
+        self.assertTrue(data["ok"], data)
+        # validation errors (French, 400)
+        for body, needle in (({"season": 1, "link": "magnet:?dn=x"}, "magnet"),
+                             ({"season": 1, "link": "ftp://x/y.torrent"}, "Lien non reconnu"),
+                             ({"season": 1, "torrent_base64": "%%%"}, "base64"),
+                             ({"season": 1, "torrent_base64": base64.b64encode(b"<html>").decode()}, "invalide"),
+                             ({"season": 1, "link": magnet, "torrent_base64": b64}, "une seule source"),
+                             ({"link": magnet}, "saison"),
+                             ({"season": 1}, "une seule source"),
+                             ({"grab_id": 99999, "link": magnet}, "introuvable")):
+            with self.subTest(body=body):
+                status, data, _ = self.req(url, "POST", body)
+                self.assertEqual(status, 400, data)
+                self.assertIn(needle, data["error"])
+
+    def test_failed_send_keeps_the_old_download(self) -> None:
+        self.grab_all()
+        movie = self.app.db.get_media_by_key("m1")
+        old = [g for g in self.app.db.list_grabs() if g["media_id"] == movie["id"]][0]
+        n_tasks = len(self.world.tasks)
+        status, data, _ = self.req("/api/media/%d/replace" % movie["id"], "POST",
+                                   {"grab_id": old["id"], "link": self.srv.url + "/absent/file.torrent"})
+        self.assertEqual(status, 200, data)
+        self.assertFalse(data["ok"])
+        self.assertIn("Échec", data["message"])
+        self.assertEqual(self.app.db.query_one("SELECT status FROM grabs WHERE id = ?", (old["id"],))["status"], "sent")
+        self.assertEqual((len(self.world.tasks), self.world.deleted), (n_tasks, []))
+
+    def test_dry_run_changes_nothing(self) -> None:
+        self.grab_all()
+        self.app.cfg.general.dry_run = True
+        movie = self.app.db.get_media_by_key("m1")
+        old = [g for g in self.app.db.list_grabs() if g["media_id"] == movie["id"]][0]
+        status, data, _ = self.req("/api/media/%d/replace" % movie["id"], "POST",
+                                   {"grab_id": old["id"], "link": "magnet:?xt=urn:btih:" + "c" * 40})
+        self.assertEqual((status, data["ok"]), (200, False))
+        self.assertIn("simulation", data["message"])
+        self.assertEqual(self.app.db.query_one("SELECT status FROM grabs WHERE id = ?", (old["id"],))["status"], "sent")
+        self.assertEqual(self.world.deleted, [])
+
+    def test_sources_validation(self) -> None:
+        self.run_cmd("sync")
+        show = self.app.db.get_media_by_key("s1")
+        status, data, _ = self.req("/api/media/%d/sources" % show["id"], "POST", {})
+        self.assertEqual(status, 400)
+        self.assertIn("saison", data["error"])
+        self.assertEqual(self.req("/api/media/%d/sources" % show["id"], "POST", {"season": "x"})[0], 400)
+        self.assertEqual(self.req("/api/media/9999/sources", "POST", {})[0], 404)
+        job = self.sources(show["id"], season=2, episode=1)
+        self.assertEqual(job["result"]["kind"], "episode")
+        self.assertIn("S02E01", job["label"])
+
+    def test_page_has_new_ui(self) -> None:
+        status, html, _ = self.req("/")
+        for needle in ("Changer de source", "Téléchargements en cours", "Priorité", "Importer depuis Prowlarr",
+                       "torrent_base64", 'id="srcm"'):
+            self.assertIn(needle, html)
+
+
+class WebIndexerPriorityTest(RealAppWebBase):
+    def cli(self, *argv: str) -> Tuple[int, str]:
+        import io
+        from contextlib import redirect_stdout
+        from synoarr import cli
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(list(argv) + ["--config", self.cfg_path])
+        return rc, buf.getvalue()
+
+    def test_priority_endpoint_and_order(self) -> None:
+        self.add_indexer()
+        status, row, _ = self.req("/api/indexers", "POST", {"name": "Second", "url": self.srv.url + "/torznab",
+                                                            "priority": "40"})
+        self.assertEqual(status, 200, row)
+        self.assertEqual(row["priority"], 40)
+        fake = self.app.db.get_indexer("Fake")
+        self.assertEqual(fake["priority"], 25)
+        status, data, _ = self.req("/api/indexers/%d/priority" % fake["id"], "POST", {"priority": 50})
+        self.assertEqual(status, 200, data)
+        self.assertEqual([i["name"] for i in self.req("/api/indexers")[1]], ["Second", "Fake"])
+        self.assertEqual([i.name for i in self.app.indexer_manager.active()], ["Second", "Fake"])
+        for bad in (0, 51, "3", True, None, 2.5):
+            with self.subTest(bad=bad):
+                status, data, _ = self.req("/api/indexers/%d/priority" % fake["id"], "POST", {"priority": bad})
+                self.assertEqual(status, 400, data)
+                self.assertIn("Priorité invalide", data["error"])
+        self.assertEqual(self.req("/api/indexers/999/priority", "POST", {"priority": 3})[0], 400)
+        status, data, _ = self.req("/api/indexers", "POST", {"name": "X", "url": self.srv.url + "/torznab",
+                                                             "priority": "99"})
+        self.assertEqual(status, 400)
+        self.assertIn("Priorité invalide", data["error"])
+
+    def test_manual_search_shows_priority(self) -> None:
+        self.add_indexer()
+        self.app.indexer_manager.set_priority("Fake", 3)
+        job = self.run_cmd("search", query="Night of the Living Dead 1968")
+        self.assertEqual({r["priority"] for r in job["result"]["results"]}, {3})
+
+    def test_cli_priority(self) -> None:
+        self.add_indexer()
+        rc, out = self.cli("indexer", "priority", "Fake", "7")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Priorité de l'indexer Fake : 7", out)
+        self.assertEqual(self.app.db.get_indexer("Fake")["priority"], 7)
+        rc, out = self.cli("indexer", "list")
+        self.assertIn("prio", out)
+        self.assertRegex(out, r"Fake\s+torznab\s+actif\s+7 ")
+        rc, out = self.cli("indexer", "priority", "Fake", "0")
+        self.assertEqual(rc, 1)
+        self.assertIn("Priorité invalide", out)
+        rc, out = self.cli("indexer", "priority", "Fake")
+        self.assertEqual(rc, 2)
+        rc, out = self.cli("indexer", "add-url", "Autre", self.srv.url + "/torznab", "--type", "torznab",
+                           "--priority", "12")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.app.db.get_indexer("Autre")["priority"], 12)
+
+
+class FakeProwlarr:
+    KEY = "PKEY123"
+
+    def __init__(self) -> None:
+        self.indexers = [
+            {"id": 1, "name": "YTS", "protocol": "torrent", "enable": True, "priority": 10},
+            {"id": 2, "name": "NZBgeek", "protocol": "usenet", "enable": True, "priority": 25},
+            {"id": 3, "name": "Off", "protocol": "torrent", "enable": False, "priority": 25},
+            {"id": 4, "name": "1337x", "protocol": "torrent", "enable": True, "priority": 99},
+        ]
+
+    def __call__(self, req: Any) -> Tuple[int, Dict[str, str], Any]:
+        key = req.headers.get("x-api-key") or req.query.get("apikey")
+        if req.path == "/api/v1/indexer":
+            if key != self.KEY:
+                return 401, {}, {"error": "Unauthorized"}
+            return 200, {}, self.indexers
+        if req.path.endswith("/api") and req.query.get("t") == "caps":
+            if key != self.KEY:
+                return 401, {}, b"bad key"
+            return 200, {"Content-Type": "application/xml"}, (
+                '<?xml version="1.0"?><caps><server title="Prowlarr"/><searching><search available="yes"/>'
+                '</searching></caps>')
+        return 404, {}, b"not found"
+
+
+class WebProwlarrImportTest(RealAppWebBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.prowlarr = FakeProwlarr()
+        self.psrv = FakeServer(self.prowlarr).__enter__()
+        self.addCleanup(self.psrv.__exit__, None, None, None)
+
+    def test_import_update_and_errors(self) -> None:
+        base = self.psrv.url
+        hostport = base.split("://", 1)[1]
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST", {"url": hostport + "/", "api_key": FakeProwlarr.KEY})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(sorted(data["added"]), ["1337x (Prowlarr)", "YTS (Prowlarr)"])
+        self.assertEqual(data["updated"], [])
+        self.assertEqual(len(data["skipped"]), 2)
+        self.assertTrue(any("Usenet" in s for s in data["skipped"]))
+        self.assertIn("2 ajouté(s)", data["message"])
+        yts = self.app.db.get_indexer("YTS (Prowlarr)")
+        self.assertEqual((yts["type"], yts["url"], yts["api_key"], yts["priority"]),
+                         ("torznab", base + "/1/api", FakeProwlarr.KEY, 10))
+        self.assertEqual(self.app.db.get_indexer("1337x (Prowlarr)")["priority"], 50)  # clamped
+        ok, msg = self.app.indexer_manager.test(yts["id"])
+        self.assertTrue(ok, msg)
+        self.assertNotIn(FakeProwlarr.KEY, json.dumps(self.req("/api/indexers")[1]))
+        # second import: update (priority changed in Prowlarr), key given in the URL
+        self.prowlarr.indexers[0]["priority"] = 2
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST",
+                                   {"url": base + "/api/v1/indexer?apikey=" + FakeProwlarr.KEY, "api_key": ""})
+        self.assertEqual(status, 200, data)
+        self.assertEqual((data["added"], sorted(data["updated"])), ([], ["1337x (Prowlarr)", "YTS (Prowlarr)"]))
+        self.assertEqual(self.app.db.get_indexer("YTS (Prowlarr)")["priority"], 2)
+        self.assertEqual(len(self.app.db.list_indexers()), 2)
+        # errors
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST", {"url": base, "api_key": "faux"})
+        self.assertEqual(status, 400)
+        self.assertIn("Clé API Prowlarr refusée", data["error"])
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST", {"url": base, "api_key": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("clé API", data["error"])
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST", {"url": self.srv.url, "api_key": "k"})
+        self.assertEqual(status, 400)  # not a Prowlarr (404)
+        self.assertIn("127.0.0.1:9696", data["error"])
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = "http://127.0.0.1:%d" % s.getsockname()[1]
+        s.close()
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST", {"url": dead, "api_key": "k"})
+        self.assertEqual(status, 400)
+        self.assertIn("injoignable", data["error"])
+        self.assertIn("http://127.0.0.1:9696", data["error"])
+        self.assertEqual(self.req("/api/indexers/import-prowlarr", "POST", {"api_key": "k"})[0], 400)
+
+    def test_cli_import(self) -> None:
+        rc, out = WebIndexerPriorityTest.cli(self, "indexer", "import-prowlarr", self.psrv.url, "--api-key",  # type: ignore[arg-type]
+                                             FakeProwlarr.KEY)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 ajouté(s)", out)
+        self.assertIn("YTS (Prowlarr)", out)
+        self.assertNotIn(FakeProwlarr.KEY, out)
+        rc, out = WebIndexerPriorityTest.cli(self, "indexer", "import-prowlarr", self.psrv.url, "--api-key", "x")  # type: ignore[arg-type]
+        self.assertEqual(rc, 1)
+        self.assertIn("refusée", out)

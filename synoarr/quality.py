@@ -4,12 +4,19 @@
 ``pick_best()`` returns the best acceptable release of a search.
 
 Score layout (higher is better, each level dominates the following ones):
-    resolution rank   x 100000   (first entry of cfg.resolutions = best)
-    language          0 .. 48000 (order of cfg.languages, MULTI bonus)
-    source            0 .. 6000  (bluray > webdl > webrip > web > hdtv > dvdrip)
-    prefer_words      1500 each  (capped at 4500)
+    resolution rank   x 1000000  (first entry of cfg.resolutions = best)
+    language          0 .. 480000 (order of cfg.languages, MULTI bonus)
+    source            0 .. 60000 (10000 per step: bluray > webdl > webrip > web > hdtv > dvdrip)
+    prefer_words      15000 each (capped at 45000)
+    indexer priority  0 .. 9800  ((50 - priority) x 200 ; priority 1 = most preferred, 50 = no bonus)
     seeders           0 .. 800   (log scale)
     size              0 .. 200   (reasonable size)
+
+Indexer priority (1..50, see ``evaluate(priorities=...)``): the whole range (9800) is bigger than
+seeders + size together (1000) but smaller than ONE source step (10000), so it never overrides
+resolution, language, source or prefer_words; it decides between equivalent releases, and a gap of 5
+priority levels or more (1000 points) always beats a seeders/size difference. Without ``priorities``
+(older callers) no indexer bonus is added. An indexer missing from the mapping counts as priority 25.
 """
 from __future__ import annotations
 
@@ -17,7 +24,7 @@ import logging
 import math
 import re
 import unicodedata
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Mapping, Optional, Set, Tuple
 
 from .config import QualityConfig
 from .models import ParsedName, Release, SearchRequest
@@ -25,17 +32,20 @@ from .parser import normalize_title, parse, titles_match
 
 log = logging.getLogger(__name__)
 
-__all__ = ["evaluate", "pick_best", "rank_releases", "parse_for_request"]
+__all__ = ["evaluate", "pick_best", "rank_releases", "parse_for_request", "indexer_priority", "priority_points",
+           "clamp_priority"]
 
 MB = 1024 * 1024
 GB = 1024 * MB
 
-RESOLUTION_WEIGHT = 100000
-LANGUAGE_MAX = 40000
-MULTI_BONUS = 8000
-SOURCE_WEIGHT = 1000
-PREFER_WORD_BONUS = 1500
-PREFER_WORD_MAX = 4500
+RESOLUTION_WEIGHT = 1000000
+LANGUAGE_MAX = 400000
+MULTI_BONUS = 80000
+SOURCE_WEIGHT = 10000
+PREFER_WORD_BONUS = 15000
+PREFER_WORD_MAX = 45000
+PRIORITY_MIN, PRIORITY_MAX, PRIORITY_DEFAULT = 1, 50, 25
+PRIORITY_STEP = 200  # (PRIORITY_MAX - priority) * PRIORITY_STEP, max 9800 < SOURCE_WEIGHT
 SEEDERS_MAX = 800
 UNKNOWN_SEEDERS_POINTS = 150  # e.g. Internet Archive webseeds: reliable but unknown count
 
@@ -168,6 +178,37 @@ def _size_points(size: int, max_bytes: float) -> int:
     return 100
 
 
+def clamp_priority(value: object) -> int:
+    """Indexer priority as stored in the database -> 1..50 (invalid / missing = 25)."""
+    try:
+        p = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return PRIORITY_DEFAULT
+    return max(PRIORITY_MIN, min(PRIORITY_MAX, p))
+
+
+def indexer_priority(indexer: Optional[str], priorities: Optional[Mapping[str, int]]) -> Optional[int]:
+    """Priority of the indexer named *indexer* (None when no mapping is given)."""
+    if priorities is None:
+        return None
+    name = (indexer or "").strip()
+    if name in priorities:
+        return clamp_priority(priorities[name])
+    low = name.casefold()
+    for key, value in priorities.items():
+        if (key or "").strip().casefold() == low:
+            return clamp_priority(value)
+    return PRIORITY_DEFAULT
+
+
+def priority_points(indexer: Optional[str], priorities: Optional[Mapping[str, int]]) -> int:
+    """Score bonus of an indexer priority: (50 - priority) x 200, 0 without mapping."""
+    prio = indexer_priority(indexer, priorities)
+    if prio is None:
+        return 0
+    return (PRIORITY_MAX - prio) * PRIORITY_STEP
+
+
 def _check_structure(p: ParsedName, request: SearchRequest) -> str:
     """Return a rejection reason, or "" if the release structure fits the request."""
     kind = request.kind
@@ -203,8 +244,11 @@ def _check_structure(p: ParsedName, request: SearchRequest) -> str:
     return "type de recherche inconnu: %s" % kind
 
 
-def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig) -> Tuple[Optional[int], str]:
-    """Return (score, reason). score None = rejected, reason in French."""
+def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig,
+             priorities: Optional[Mapping[str, int]] = None) -> Tuple[Optional[int], str]:
+    """Return (score, reason). score None = rejected, reason in French.
+
+    *priorities*: indexer name -> priority (1 = most preferred .. 50), adds the indexer bonus."""
     title = (release.title or "").strip()
     if not title:
         return None, "titre vide"
@@ -269,6 +313,7 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig) -> Tu
         if _has_word(tail, word):
             prefer += PREFER_WORD_BONUS
     score += min(prefer, PREFER_WORD_MAX)
+    score += priority_points(release.indexer, priorities)
     score += _seeders_points(release.seeders)
     score += _size_points(size, max_bytes)
 
@@ -282,7 +327,8 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig) -> Tu
 
 
 def rank_releases(releases: List[Release], request: SearchRequest, cfg: QualityConfig,
-                  is_blocked: Callable[[str], bool] = lambda t: False) -> List[Tuple[int, Release]]:
+                  is_blocked: Callable[[str], bool] = lambda t: False,
+                  priorities: Optional[Mapping[str, int]] = None) -> List[Tuple[int, Release]]:
     """Return accepted releases as (score, release), best first."""
     accepted: List[Tuple[int, int, int, Release]] = []
     seen = set()
@@ -299,7 +345,7 @@ def rank_releases(releases: List[Release], request: SearchRequest, cfg: QualityC
             if blocked:
                 log.debug("Refusée « %s » : release bloquée", rel.title)
                 continue
-            score, reason = evaluate(rel, request, cfg)
+            score, reason = evaluate(rel, request, cfg, priorities)
         except Exception as exc:  # never let a weird release crash the search
             log.warning("Évaluation impossible de « %s » : %s", getattr(rel, "title", "?"), exc)
             continue
@@ -315,7 +361,9 @@ def rank_releases(releases: List[Release], request: SearchRequest, cfg: QualityC
 
 
 def pick_best(releases: List[Release], request: SearchRequest, cfg: QualityConfig,
-              is_blocked: Callable[[str], bool] = lambda t: False) -> Optional[Release]:
-    """Best acceptable release, or None. Equal scores: more seeders wins, then indexer order."""
-    ranked = rank_releases(releases, request, cfg, is_blocked)
+              is_blocked: Callable[[str], bool] = lambda t: False,
+              priorities: Optional[Mapping[str, int]] = None) -> Optional[Release]:
+    """Best acceptable release, or None. Equal scores: more seeders wins, then indexer order.
+    *priorities* (indexer name -> 1..50) favours the preferred indexers (see the module docstring)."""
+    ranked = rank_releases(releases, request, cfg, is_blocked, priorities)
     return ranked[0][1] if ranked else None

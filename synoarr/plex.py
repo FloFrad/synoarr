@@ -199,6 +199,74 @@ def _parse_object(resp: Response) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _short(text: Any, limit: int = 300) -> str:
+    """Summary shortened to *limit* characters (on a word boundary when possible)."""
+    t = " ".join(str(text or "").split())
+    if len(t) <= limit:
+        return t
+    cut = t[:limit].rsplit(" ", 1)[0] or t[:limit]
+    return cut.rstrip(" ,;.") + "…"
+
+
+def _search_items(mc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Metadata items of a discover search answer.
+
+    Accepted shapes: ``MediaContainer.SearchResults[].SearchResult[].Metadata`` (current API, Metadata being a
+    dict or a list), ``MediaContainer.SearchResult[].Metadata`` and ``MediaContainer.Metadata[]`` directly.
+    """
+    out: List[Dict[str, Any]] = []
+
+    def as_list(v: Any) -> List[Any]:
+        if isinstance(v, list):
+            return v
+        return [v] if isinstance(v, dict) else []
+
+    def add_result(res: Any) -> None:
+        if not isinstance(res, dict):
+            return
+        found = False
+        for tag in _ITEM_TAGS:
+            for m in as_list(res.get(tag)):
+                if isinstance(m, dict):
+                    out.append(m)
+                    found = True
+        if not found and res.get("type") and (res.get("title") or res.get("ratingKey")):
+            out.append(res)  # the result itself is the metadata item
+
+    groups = as_list(mc.get("SearchResults"))
+    for group in groups:
+        if isinstance(group, dict):
+            for res in as_list(group.get("SearchResult")):
+                add_result(res)
+    for res in as_list(mc.get("SearchResult")):
+        add_result(res)
+    out.extend(m for m in mc.get("Metadata") or [] if isinstance(m, dict))
+    return out
+
+
+def search_candidate(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Discover metadata item -> watchlist candidate dict (None for other types / incomplete items)."""
+    itype = str(item.get("type") or "").lower()
+    if itype not in ("movie", "show"):
+        return None
+    rk = _rating_key(item)
+    title = item.get("title")
+    if not rk or not title:
+        return None
+    year = _to_int(item.get("year"))
+    if year is None and item.get("originallyAvailableAt"):
+        year = _to_int(str(item.get("originallyAvailableAt"))[:4])
+    guids = extract_guids(item)
+    thumb = str(item.get("thumb") or "")
+    # relative thumbs need the Plex token: never expose it, keep only public absolute URLs
+    poster = thumb if thumb.lower().startswith(("https://", "http://")) and "token" not in thumb.lower() else None
+    orig = item.get("originalTitle") or None
+    return {"source": "plex", "type": itype, "title": str(title), "year": year, "rating_key": rk,
+            "tmdb": guids.get("tmdb"), "imdb": guids.get("imdb"), "tvdb": guids.get("tvdb"),
+            "original_title": str(orig) if orig and orig != title else None,
+            "overview": _short(item.get("summary")), "poster_url": poster}
+
+
 # ----------------------------------------------------------------------------- client
 class PlexClient:
     def __init__(self, token: str, client_id: str, http: HttpClient):
@@ -313,6 +381,58 @@ class PlexClient:
         return WatchItem(rating_key=rk, type=itype, title=str(title), year=year, guids=extract_guids(item),
                          original_title=str(orig) if orig and orig != title else None,
                          genres=extract_genres(item))
+
+    # ------------------------------------------------------------ watchlist add/delete (discover)
+    def search(self, query: str, kind: Optional[str] = None, limit: int = 30) -> List[Dict[str, Any]]:
+        """Plex discover search (what python-plexapi's MyPlexAccount.searchDiscover does).
+
+        *kind*: None (films + séries), "movie" or "show". Returns candidate dicts (see search_candidate).
+        Raises HttpError.
+        """
+        search_types = {"movie": "movies", "show": "tv"}.get(kind or "", "movies,tv")
+        params = {"query": query, "limit": limit, "searchTypes": search_types, "searchProviders": "discover",
+                  "includeMetadata": 1, "includeGuids": 1}
+        url = self.discover_url.rstrip("/") + "/library/search"
+        try:
+            resp = self.http.get(url, params=params, headers=self._headers())
+        except HttpError as exc:
+            raise self._friendly(exc)
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for item in _search_items(parse_container(resp)):
+            cand = search_candidate(item)
+            if cand is None or cand["rating_key"] in seen:
+                continue
+            if kind in ("movie", "show") and cand["type"] != kind:
+                continue
+            seen.add(cand["rating_key"])
+            out.append(cand)
+        return out
+
+    def _provider_put(self, path: str, params: Dict[str, Any]) -> None:
+        """PUT *path* on the discover provider (metadata provider on 404). Raises HttpError."""
+        bases = [self.discover_url.rstrip("/"), self.metadata_url.rstrip("/")]
+        for i, base in enumerate(bases):
+            try:
+                self.http.request("PUT", base + path, params=params, headers=self._headers())
+                return
+            except HttpError as exc:
+                if exc.status == 404 and i == 0:
+                    log.debug("Plex: 404 sur %s, essai sur %s", redact(base + path), bases[1])
+                    continue
+                raise self._friendly(exc)
+
+    def add_to_watchlist(self, rating_key: str) -> None:
+        """Add a discover item to the Plex Watchlist (PUT /actions/addToWatchlist). Raises HttpError."""
+        if not self.token:
+            raise HttpError("Aucun jeton Plex configuré", 401)
+        self._provider_put("/actions/addToWatchlist", {"ratingKey": rating_key})
+
+    def remove_from_watchlist(self, rating_key: str) -> None:
+        """Remove an item from the Plex Watchlist (PUT /actions/removeFromWatchlist). Raises HttpError."""
+        if not self.token:
+            raise HttpError("Aucun jeton Plex configuré", 401)
+        self._provider_put("/actions/removeFromWatchlist", {"ratingKey": rating_key})
 
     # ------------------------------------------------------------ metadata
     def get_guids(self, rating_key: str) -> Dict[str, str]:

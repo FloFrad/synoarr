@@ -35,6 +35,18 @@ Interface ``App`` attendue (fournie par ``app.py``) ::
         def read_config_text(self) -> dict      # {"path", "text", "encoding", "backups", "restart_reasons"}
         def save_config_text(self, text: str) -> dict          # ConfigInvalid -> 400, BusyError -> 409
         def restore_config_backup(self) -> dict
+        # --- progression des téléchargements et « Changer de source » (onglet Watchlist) ---
+        def downloads_status(self) -> dict    # facultatif ; {"ok", "warning", "items", "failed", "active"} :
+            # items = grabs « sent » + progression Download Station (cache ~5 s), failed = échecs encore
+            # recherchés ; chaque entrée : grab_id, media_id, release_title, season, episode, indexer, status
+            # (statut DS, « introuvable », « inconnu » si DS injoignable, « failed »), progress, size, downloaded,
+            # speed_down, speed_up, seeders, leechers, peers, eta_seconds, task_id, error. Ne lève pas.
+        def start_source_search(self, media_id, season=None, episode=None) -> Tuple[Job, bool]
+            # job.result = {"request", "kind", "languages", "total", "results": [{index, title, size, seeders,
+            #               leechers, indexer, priority, score (None = rejeté), reason}]}
+        def replace_source(self, media_id, season=None, episode=None, grab_id=None, job_id=None, index=None,
+                           link=None, torrent=None, delete_old=True, blocklist_old=False,
+                           accept_rejected=False) -> dict   # {"ok", "message"} ; ValueError -> 400
 
     class IndexerManager(Protocol):   # les méthodes peuvent lever ValueError (message français) -> HTTP 400
         def list(self) -> List[dict]                 # lignes de la table indexers
@@ -43,11 +55,19 @@ Interface ``App`` attendue (fournie par ``app.py``) ::
         def add_url(self, name: str, url: str, api_key: str = "", categories: str = "") -> dict
         def test(self, indexer_id: int) -> Tuple[bool, str]
         def set_enabled(self, indexer_id: int, enabled: bool) -> None
+        def set_priority(self, indexer_id: int, priority: int) -> dict   # 1 (le plus prioritaire) à 50
+        def import_prowlarr(self, base_url: str, api_key: str) -> dict  # {"added", "updated", "skipped", "message"}
         def delete(self, indexer_id: int) -> None
 
 API ajoutée : ``GET/POST /api/jobs``, ``GET /api/jobs/<id>``, ``POST /api/jobs/<id>/grab``, ``POST /api/plex/login``,
 ``POST /api/restart``, ``GET /api/logs?lines=&level=&q=``, ``GET /api/logs/download[?n=1..3]``,
-``GET/POST /api/config``, ``POST /api/config/restore``, ``POST /api/media/<id>/language``.
+``GET/POST /api/config``, ``POST /api/config/restore``, ``POST /api/media/<id>/language``,
+``POST /api/indexers/<id>/priority`` (``{"priority": 1..50}``), ``POST /api/indexers/import-prowlarr``
+(``{"url", "api_key"}``), ``GET /api/downloads`` (progression, aussi présente
+dans ``GET /api/media`` : champ ``downloads`` de chaque élément), ``POST /api/media/<id>/sources``
+(``{"season", "episode"}`` -> tâche de recherche de toutes les sources) et ``POST /api/media/<id>/replace``
+(``{"season", "episode", "grab_id", "delete_old", "blocklist_old"}`` + ``{"job_id", "index", "accept_rejected"}``,
+``{"link"}`` (magnet ou URL .torrent) ou ``{"torrent_base64"}`` (fichier .torrent, 700 Ko max)).
 
 Les clés d'API ne sortent jamais de l'API indexers/catalogue : elles sont remplacées par "••••". Seul l'onglet
 Configuration montre le vrai fichier (c'est la configuration de l'utilisateur, derrière l'authentification).
@@ -206,6 +226,11 @@ class WebServer:
             ("POST", r"/api/indexers", self.api_indexer_add),
             ("POST", r"/api/indexers/(\d+)/test", self.api_indexer_test),
             ("POST", r"/api/indexers/(\d+)/enabled", self.api_indexer_enabled),
+            ("POST", r"/api/indexers/(\d+)/priority", self.api_indexer_priority),
+            ("POST", r"/api/indexers/import-prowlarr", self.api_indexer_import_prowlarr),
+            ("GET", r"/api/downloads", self.api_downloads),
+            ("POST", r"/api/media/(\d+)/sources", self.api_media_sources),
+            ("POST", r"/api/media/(\d+)/replace", self.api_media_replace),
             ("DELETE", r"/api/indexers/(\d+)", self.api_indexer_delete),
             ("GET", r"/api/catalog", self.api_catalog),
             ("GET", r"/api/grabs", self.api_grabs),
@@ -325,8 +350,26 @@ class WebServer:
         status["counts"] = one
         return status
 
+    def _downloads(self) -> Dict[str, Any]:
+        func = getattr(self.app, "downloads_status", None)
+        empty = {"ok": False, "warning": None, "items": [], "failed": [], "active": 0}  # type: Dict[str, Any]
+        if func is None:
+            return empty
+        try:
+            return func()
+        except Exception as exc:  # never a 500 for the progress: the list must stay usable
+            log.warning("Progression des téléchargements indisponible : %s", exc)
+            return dict(empty, warning="Progression des téléchargements indisponible : %s" % exc)
+
+    def api_downloads(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        return self._downloads()
+
     def api_media(self, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
         db = self.app.db
+        dls = self._downloads()
+        by_media = {}  # type: Dict[Any, List[Dict[str, Any]]]
+        for d in list(dls.get("items") or []) + list(dls.get("failed") or []):
+            by_media.setdefault(d.get("media_id"), []).append(d)
         summary = {}
         for r in db.query(
                 "SELECT media_id, COUNT(*) AS total, "
@@ -346,6 +389,7 @@ class WebServer:
                 m["languages"] = default_langs
             if m.get("type") == "show":
                 m["episodes"] = summary.get(m["id"], {"total": 0, "done": 0, "grabbed": 0, "wanted": 0})
+            m["downloads"] = by_media.get(m["id"], [])
             out.append(m)
         return out
 
@@ -384,8 +428,13 @@ class WebServer:
             url = str(data.get("url") or "").strip()
             if not name or not url:
                 raise HttpProblem(400, "Le nom et l'URL de l'indexer sont obligatoires")
-            row = mgr.add_url(name, url, str(data.get("api_key") or "").strip(),
-                              str(data.get("categories") or "").strip())
+            prio = data.get("priority")
+            if prio in (None, ""):
+                row = mgr.add_url(name, url, str(data.get("api_key") or "").strip(),
+                                  str(data.get("categories") or "").strip())
+            else:
+                row = mgr.add_url(name, url, str(data.get("api_key") or "").strip(),
+                                  str(data.get("categories") or "").strip(), priority=prio)
         return mask_secrets(row)
 
     def api_indexer_test(self, indexer_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
@@ -398,6 +447,56 @@ class WebServer:
             raise HttpProblem(400, "Le champ « enabled » doit valoir true ou false")
         self.app.indexer_manager.set_enabled(indexer_id, enabled)
         return {"ok": True, "enabled": enabled}
+
+    def api_indexer_priority(self, indexer_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        prio = self._body_dict(body).get("priority")
+        if isinstance(prio, bool) or not isinstance(prio, int) or not 1 <= prio <= 50:
+            raise HttpProblem(400, "Priorité invalide : nombre entier de 1 (le plus prioritaire) à 50 attendu")
+        row = self.app.indexer_manager.set_priority(indexer_id, prio) or {}
+        return {"ok": True, "priority": prio,
+                "message": "Priorité de « %s » : %d" % (row.get("name") or indexer_id, prio)}
+
+    def api_indexer_import_prowlarr(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+        url, key = data.get("url"), data.get("api_key")
+        if not isinstance(url, str) or (key is not None and not isinstance(key, str)):
+            raise HttpProblem(400, "L'adresse de Prowlarr et sa clé API sont obligatoires")
+        func = getattr(self.app.indexer_manager, "import_prowlarr", None)
+        if func is None:
+            raise HttpProblem(501, "Import Prowlarr non disponible")
+        return func(url, key or "")
+
+    def api_media_sources(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        self._media_or_404(media_id)
+        data = self._body_dict(body)
+        job, created = self.app.start_source_search(media_id, data.get("season"), data.get("episode"))
+        msg = ("« %s » lancé" % job.label) if created else ("« %s » est déjà en cours" % job.label)
+        return {"ok": True, "created": created, "message": msg, "job": job.to_dict()}
+
+    def api_media_replace(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        self._media_or_404(media_id)
+        data = self._body_dict(body)
+        torrent = None
+        raw = data.get("torrent_base64")
+        if raw not in (None, ""):
+            if not isinstance(raw, str):
+                raise HttpProblem(400, "Fichier .torrent invalide")
+            if "," in raw[:100] and raw.startswith("data:"):  # data:application/x-bittorrent;base64,....
+                raw = raw.split(",", 1)[1]
+            try:
+                torrent = base64.b64decode(raw, validate=True)
+            except (binascii.Error, ValueError):
+                raise HttpProblem(400, "Fichier .torrent invalide (encodage base64 incorrect)")
+            if not torrent:
+                raise HttpProblem(400, "Fichier .torrent vide")
+        link = data.get("link")
+        if link is not None and not isinstance(link, str):
+            raise HttpProblem(400, "Le champ « link » doit être un lien magnet ou une adresse http(s)")
+        return self.app.replace_source(
+            media_id, season=data.get("season"), episode=data.get("episode"), grab_id=data.get("grab_id"),
+            job_id=data.get("job_id"), index=data.get("index"), link=link, torrent=torrent,
+            delete_old=data.get("delete_old", True) is not False, blocklist_old=data.get("blocklist_old") is True,
+            accept_rejected=data.get("accept_rejected") is True)
 
     def api_indexer_delete(self, indexer_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         self.app.indexer_manager.delete(indexer_id)
@@ -672,7 +771,29 @@ function fdate(v){if(v==null||v==='')return 'Jamais';
   if(typeof v==='object')return Object.values(v).filter(x=>x!=null&&typeof x!=='object').map(fdate).join(' · ');
   return String(v).replace('T',' ').slice(0,19)}
 function size(n){if(!n)return '';const u=['o','Ko','Mo','Go','To'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i>2?1:0)+' '+u[i]}
-let tab=(location.hash||'#dash').slice(1), exp=new Set(), timer=null, mounted=null;
+const nv=v=>v==null?'?':v, pad=n=>String(n).padStart(2,'0');
+const spd=n=>n==null?'?':(size(n)||'0 o')+'/s';
+function eta(s){if(s==null)return '';const h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  return h>=96?'plus de 4 jours':h?h+' h '+pad(m):m?m+' min':'moins d\'une minute'}
+const DSL={waiting:'En attente',downloading:'Téléchargement',paused:'En pause',finishing:'Finalisation',finished:'Terminé',
+  hash_checking:'Vérification',seeding:'Partage (seeding)',filehosting_waiting:'En attente',extracting:'Extraction',error:'Erreur',
+  introuvable:'Absent de Download Station',inconnu:'État inconnu',unknown:'État inconnu',failed:'Échec'};
+const tgt=d=>d.season!=null?(d.episode!=null?` S${pad(d.season)}E${pad(d.episode)}`:` saison ${d.season}`):'';
+const pr=x=>x.priority!=null?` <span class="mut" title="Priorité de l'indexer (1 = le plus prioritaire)">· prio ${esc(x.priority)}</span>`:'';
+const fpct=p=>(Math.round(p*10)/10).toLocaleString('fr-FR')+' %';
+const srcBtn=(mid,s,e,g,label,rt,txt)=>`<button class="sec xs" data-src="${mid}" data-s="${s==null?'':s}" data-e="${e==null?'':e}" data-g="${g||''}" data-t="${esc(label)}" data-rt="${esc(rt||'')}">${txt||'Changer de source'}</button>`;
+function dlRow(d,wm){const st=d.status,live=d.task_id!=null,m=[];
+  if(live){m.push(`${size(d.downloaded)||'0 o'} / ${size(d.size)||'?'}`);m.push(`↓ ${spd(d.speed_down)}`);m.push(`↑ ${spd(d.speed_up)}`);
+    m.push(`${nv(d.seeders)} seeds · ${nv(d.leechers)} leechers${d.peers!=null?' · '+esc(d.peers)+' pairs':''}`);
+    if(d.eta_seconds!=null)m.push('reste '+eta(d.eta_seconds));if(d.uploaded)m.push('partagé '+size(d.uploaded))}
+  else if(d.size)m.push(size(d.size));
+  if(d.indexer)m.push(esc(d.indexer));
+  const what=(wm?(d.media_title||''):'')+tgt(d);
+  return `<div class="dl"><div class="dlh"><span class="b ds-${esc(st)}">${esc(DSL[st]||st)}</span>${live&&d.progress!=null?`<b class="pct">${fpct(d.progress)}</b>`:''}${what?`<b>${esc(what)}</b>`:''}<span class="mut small brk">${esc(d.release_title)}</span></div>
+  ${live&&d.progress!=null?`<div class="pbar${st==='error'?' ko':st==='seeding'||st==='finished'?' ok':''}"><i style="width:${Math.max(0,Math.min(100,d.progress))}%"></i></div>`:''}
+  <div class="dlm"><span class="mut small">${m.join(' · ')}</span>${d.media_id?srcBtn(d.media_id,d.season,d.episode,d.grab_id,(d.media_title||'')+tgt(d),d.release_title):''}</div>
+  ${d.error?`<div class="small o-err">${esc(d.error)}</div>`:''}</div>`}
+let tab=(location.hash||'#dash').slice(1), exp=new Set(), timer=null, mounted=null, dlActive=false;
 async function api(p,method,body){
   const o={method:method||'GET',headers:{}};
   if(body!==undefined||o.method!=='GET'){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body||{})}
@@ -684,12 +805,16 @@ async function act(fn,okMsg){try{const d=await fn();toast((d&&d.message)||okMsg|
   catch(e){toast(e.message,true)}}
 const rsBanner=r=>r&&r.length?`<div class="card warn"><b>Redémarrage nécessaire</b> pour appliquer : ${esc(r.join(', '))}. <button data-restart="1">Redémarrer maintenant</button></div>`:'';
 const V={}, S={};
-V.dash=async()=>{const [s,ev]=await Promise.all([api('status'),api('events?limit=8')]);const c=s.counts||{};
+function dlBlock(dl){if(!dl)return '';const it=dl.items||[],fl=dl.failed||[];if(dl.active)dlActive=true;
+  return `<div class="card"><h3>Téléchargements en cours${it.length?` <span class="mut small">(${it.length}${dl.active?' dont '+dl.active+' actif'+(dl.active>1?'s':''):''})</span>`:''}</h3>
+  ${dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}${it.length?it.map(d=>dlRow(d,true)).join(''):'<p class="mut">Aucun téléchargement en cours.</p>'}
+  ${fl.length?`<h4 class="mut">Échecs (toujours recherchés)</h4>${fl.map(d=>dlRow(d,true)).join('')}`:''}</div>`}
+V.dash=async()=>{const [s,ev,dl]=await Promise.all([api('status'),api('events?limit=8'),api('downloads').catch(()=>null)]);const c=s.counts||{};
   const errs=(s.last_errors||[]).map(e=>`<li>${typeof e==='object'?esc(fdate(e.ts||e.at||''))+' — '+esc(e.message||e.error||JSON.stringify(e)):esc(e)}</li>`).join('');
   return `${rsBanner(s.restart_required)}<div class="grid">
   <div class="card stat"><b>${c.movies||0}</b><span>Films suivis</span></div><div class="card stat"><b>${c.shows||0}</b><span>Séries suivies</span></div>
   <div class="card stat"><b>${(c.movies_wanted||0)+(c.episodes_wanted||0)}</b><span>Recherchés</span></div>
-  <div class="card stat"><b>${c.downloading||0}</b><span>En téléchargement</span></div></div>
+  <div class="card stat"><b>${c.downloading||0}</b><span>En téléchargement</span></div></div>${dlBlock(dl)}
   <div class="card"><div class="row"><button data-run="watchlist">Synchroniser la Watchlist</button><button data-run="process">Traiter les téléchargements</button><a class="btn sec" href="#cmd">Autres commandes…</a></div>
   <dl><dt>Dernière synchro Watchlist</dt><dd>${esc(fdate(s.last_watchlist_run))}</dd><dt>Dernier traitement</dt><dd>${esc(fdate(s.last_process_run))}</dd>
   <dt>Plex</dt><dd>${yn(s.plex_configured)}</dd><dt>Download Station</dt><dd>${yn(s.ds_configured)}</dd>
@@ -702,13 +827,14 @@ const evList=ev=>ev.length?`<ul class="ev">${ev.map(e=>`<li class="lv-${esc(e.le
 const LANGS=[['','Auto'],['en','Anglais (en)'],['fr','Français (fr)'],['en,fr','Anglais + Français']];
 const langSel=m=>{const v=m.language_override||'',o=LANGS.some(l=>l[0]===v)?LANGS:LANGS.concat([[v,v]]);
   return `<select class="lsel" data-lang="${m.id}" title="Langues recherchées" aria-label="Langues recherchées">${o.map(l=>`<option value="${esc(l[0])}"${l[0]===v?' selected':''}>${esc(l[1])}</option>`).join('')}</select>`};
-V.watch=async()=>{const ms=await api('media');const f=$('#wf')?$('#wf').value:'',q=$('#wq')?$('#wq').value.toLowerCase():'';
+V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads').catch(()=>null)]);const f=$('#wf')?$('#wf').value:'',q=$('#wq')?$('#wq').value.toLowerCase():'';
   const items=ms.filter(m=>(!f||m.type===f)&&(!q||(m.title||'').toLowerCase().includes(q)));
   const eps=await Promise.all(items.filter(m=>exp.has(m.id)).map(async m=>[m.id,await api('media/'+m.id+'/episodes').catch(()=>[])]));
   const em=Object.fromEntries(eps);
   return `<div class="row tools"><select id="wf"><option value="">Tous</option><option value="movie"${f==='movie'?' selected':''}>Films</option><option value="show"${f==='show'?' selected':''}>Séries</option></select>
-  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"></div>
-  ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored';
+  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"></div>${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
+  ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored',dls=m.downloads||[];
+  if(dls.some(d=>d.active))dlActive=true;
   return `<div class="card item${m.on_watchlist?'':' off'}"><div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
   <div class="meta">${badge(m.type)} ${badge(m.status)} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
   ${m.collection?`<span class="mut">Collection : ${esc(m.collection)}</span>`:''}
@@ -717,15 +843,31 @@ V.watch=async()=>{const ms=await api('media');const f=$('#wf')?$('#wf').value:''
   <span class="mut">langues : ${esc((m.languages||[]).join(', ')||'—')} (${m.language_override?'manuel':'auto'})</span></div>
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
+  ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
   ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}</div></div>
-  ${exp.has(m.id)?epTable(em[m.id]||[]):''}</div>`}).join(''):'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>'}`};
-function epTable(eps){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
+  ${dls.length?`<div class="dls">${dls.map(d=>dlRow(d,false)).join('')}</div>`:''}
+  ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>'}`};
+function epTable(eps,m){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
   return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}</summary>
-  <table class="eps">${by[s].map(e=>`<tr><td>E${String(e.episode).padStart(2,'0')}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}</td></tr>`).join('')}</table></details>`).join('')}
+  ${by[s].filter(e=>e.status==='wanted').length>1?`<div class="row spk">${srcBtn(m.id,+s,null,null,m.title+' saison '+s,'','Choisir un pack pour la saison '+esc(s))}</div>`:''}
+  <table class="eps">${by[s].map(e=>`<tr><td>E${pad(e.episode)}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}${e.status==='wanted'?' '+srcBtn(m.id,e.season,e.episode,null,m.title+` S${pad(e.season)}E${pad(e.episode)}`,'','Source…'):''}</td></tr>`).join('')}</table></details>`).join('')}
+const PRW={url:'http://127.0.0.1:9696',key:'',res:''};
+async function prowlarr(){const u=$('#prwu').value.trim(),k=$('#prwk').value.trim();PRW.url=u;PRW.key=k;
+  if(!u||!k){toast('Saisissez l\'adresse et la clé API de Prowlarr',true);return}
+  const b=$('#prwf button');b.disabled=true;b.textContent='Import…';
+  try{const r=await api('indexers/import-prowlarr','POST',{url:u,api_key:k});PRW.key='';
+    const li=(t,a)=>a.length?`<div class="small"><b>${t}</b><ul>${a.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:'';
+    PRW.res=`<div class="msg ok">✔ ${esc(r.message)}</div>${li('Ajoutés',r.added)}${li('Mis à jour',r.updated)}${li('Ignorés',r.skipped)}`;toast(r.message)}
+  catch(e){PRW.res=`<div class="msg ko">✖ ${esc(e.message)}</div>`;toast(e.message,true)}
+  await refresh()}
+const prioCtl=i=>{const p=Math.max(1,Math.min(50,+i.priority||25));return `<div class="prio"><label for="pr${i.id}">Priorité</label><button class="sec pb" data-pd="${i.id}" data-v="${p-1}"${p<=1?' disabled':''} title="Plus prioritaire" aria-label="Plus prioritaire">−</button><input type="number" id="pr${i.id}" class="pin" min="1" max="50" step="1" value="${p}" data-prio="${i.id}" aria-label="Priorité de ${esc(i.name)} (1 = le plus prioritaire)"><button class="sec pb" data-pd="${i.id}" data-v="${p+1}"${p>=50?' disabled':''} title="Moins prioritaire" aria-label="Moins prioritaire">+</button></div>`};
 V.idx=async()=>{const [ix,cat]=await Promise.all([api('indexers'),api('catalog')]);
-  return `<div class="card"><h3>Indexers configurés</h3>${ix.length?ix.map(i=>`<div class="item it"><div><b>${esc(i.name)}</b> ${badge(i.type)} ${i.enabled?'<span class="b b-done">Actif</span>':'<span class="b b-ignored">Désactivé</span>'}
+  return `<div class="card"><h3>Indexers configurés</h3>${ix.length?`<p class="mut small">Priorité : 1 = le plus prioritaire, 50 = le moins. Les indexers sont interrogés dans cet ordre et, à qualité égale (résolution, langue, source), la release de l'indexer le plus prioritaire est choisie.</p>`:''}${ix.length?ix.map(i=>`<div class="item it"><div><b>${esc(i.name)}</b> ${badge(i.type)} ${i.enabled?'<span class="b b-done">Actif</span>':'<span class="b b-ignored">Désactivé</span>'}
   <div class="meta mut"><span class="url">${esc(i.url)}</span>${i.api_key?' · clé '+esc(i.api_key):''}${i.categories?' · catégories '+esc(i.categories):''}</div><div class="tres" id="tr${i.id}"></div></div>
-  <div class="acts"><button data-test="${i.id}">Tester</button><button class="sec" data-en="${i.id}" data-v="${i.enabled?0:1}">${i.enabled?'Désactiver':'Activer'}</button><button class="danger" data-del="${i.id}" data-n="${esc(i.name)}">Supprimer</button></div></div>`).join(''):'<p class="mut">Aucun indexer : ajoutez-en un depuis le catalogue ou par URL.</p>'}</div>
+  <div class="acts">${prioCtl(i)}<button data-test="${i.id}">Tester</button><button class="sec" data-en="${i.id}" data-v="${i.enabled?0:1}">${i.enabled?'Désactiver':'Activer'}</button><button class="danger" data-del="${i.id}" data-n="${esc(i.name)}">Supprimer</button></div></div>`).join(''):'<p class="mut">Aucun indexer : ajoutez-en un depuis le catalogue ou par URL.</p>'}</div>
+  <div class="card"><h3>Importer depuis Prowlarr</h3><p class="mut small">Ajoute chaque indexer torrent actif de Prowlarr comme indexer Torznab (avec sa priorité). La clé API se trouve dans Prowlarr > Settings > General > API Key.</p>
+  <form id="prwf" class="row" autocomplete="off"><input id="prwu" name="url" type="text" spellcheck="false" value="${esc(PRW.url)}" placeholder="http://127.0.0.1:9696" aria-label="Adresse de Prowlarr">
+  <input id="prwk" name="api_key" type="password" autocomplete="new-password" placeholder="Clé API Prowlarr" aria-label="Clé API Prowlarr" value="${esc(PRW.key)}"><button type="submit">Importer</button></form><div id="prwr">${PRW.res}</div></div>
   <div class="card"><h3>Catalogue (sources légales)</h3>${cat.map(c=>`<div class="item it"><div><b>${esc(c.name)}</b> ${badge(c.type)}<div class="meta mut">${esc(c.description||'')}</div></div>
   <div class="acts">${c.installed?'<span class="b b-done">Installé</span>':`<button data-cat="${esc(c.id)}">Ajouter</button>`}</div></div>`).join('')||'<p class="mut">Catalogue vide.</p>'}</div>`};
 V.hist=async()=>{const [g,ev]=await Promise.all([api('grabs'),api('events?limit=100')]);
@@ -777,7 +919,7 @@ function drawSearch(j){const r=j.result;let h=`<p class="small">${esc(j.label)} 
   else if(j.status==='error')h+=con(j.output);
   else if(r){const ok=r.results.filter(x=>x.score!=null),ko=r.results.filter(x=>x.score==null);
     const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b><div class="mut small">${esc(x.reason)}</div>
-      <div class="mut small sm">${size(x.size)} · ${x.seeders==null?'?':esc(x.seeders)} seeders · ${esc(x.indexer)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${x.seeders==null?'?':esc(x.seeders)}</td><td class="hm">${esc(x.indexer)}</td>
+      <div class="mut small sm">${size(x.size)} · ${x.seeders==null?'?':esc(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${x.seeders==null?'?':esc(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td>
       <td>${x.score!=null?`<button data-grab="${x.index}" title="Envoyer à Download Station">Envoyer<span class="hm"> à Download Station</span></button>`:''}</td></tr>`;
     const tbl=a=>`<div class="tw"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>${a.map(row).join('')}</table></div>`;
     h+=`<p class="mut small">Requête : ${esc(r.request)} (${esc(r.kind==='movie'?'film':r.kind==='season'?'saison':'épisode')}) — ${r.total} résultat(s), ${ok.length} acceptable(s)</p>`;
@@ -849,24 +991,31 @@ async function refresh(){clearTimeout(timer);document.querySelectorAll('nav a').
   if(tab!=='logs')clearTimeout(logT);
   if(S[tab]){if(mounted!==tab){mounted=tab;try{await S[tab]();$('#conn').textContent=''}catch(e){mounted=null;app.innerHTML=`<p class="card msg ko">${esc(e.message)}</p>`}}return}
   mounted=null;
+  const fa=document.activeElement;if(fa&&fa.dataset&&fa.dataset.prio&&app.contains(fa)){timer=setTimeout(refresh,15000);return}
+  dlActive=false;
   try{const html=await (V[tab]||V.dash)();const ae=document.activeElement,fid=ae&&ae.id,pos=fid&&ae.selectionStart;
     app.innerHTML=html;if(fid&&$('#'+fid)){const el=$('#'+fid);el.focus();if(pos!=null&&el.setSelectionRange)el.setSelectionRange(pos,pos)}
     $('#conn').textContent='';}
   catch(e){$('#conn').textContent='⚠ '+e.message}
-  timer=setTimeout(refresh,15000)}
+  timer=setTimeout(refresh,dlActive&&(tab==='watch'||tab==='dash')?5000:15000)}
 addEventListener('hashchange',()=>{tab=(location.hash||'#dash').slice(1);mounted=null;app.innerHTML='<p class="mut">Chargement…</p>';refresh()});
 addEventListener('beforeunload',e=>{if(dirty()){e.preventDefault();e.returnValue=''}});
 document.addEventListener('keydown',e=>{if(tab==='cfg'&&(e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();cfgSave()}});
 app.addEventListener('input',e=>{const id=e.target.id;if(id==='wq'||id==='wf')refresh();
+  else if(id==='prwu')PRW.url=e.target.value;else if(id==='prwk')PRW.key=e.target.value;
   else if(id==='lq'){LG.q=e.target.value;saveLG();clearTimeout(lqT);lqT=setTimeout(()=>loadLogs(true),300)}
   else if(id==='cft'&&cfgD){cfgD.text=e.target.value;markDirty()}});
 app.addEventListener('change',e=>{const t=e.target,id=t.id;
   if(t.dataset.lang)act(()=>api('media/'+t.dataset.lang+'/language','POST',{languages:t.value}));
+  else if(t.dataset.prio)setPrio(t.dataset.prio,t.value);
   else if(id==='ln'||id==='lv'){LG[id==='ln'?'lines':'level']=t.value;saveLG();loadLogs(true)}
   else if(id==='la'){LG.auto=t.checked;saveLG();loadLogs()}});
-app.addEventListener('submit',e=>{if(e.target.id==='sf'){e.preventDefault();const q=$('#sq').value.trim();if(q)startJob({command:'search',query:q})}});
+app.addEventListener('submit',e=>{if(e.target.id==='prwf'){e.preventDefault();prowlarr();return}
+  if(e.target.id==='sf'){e.preventDefault();const q=$('#sq').value.trim();if(q)startJob({command:'search',query:q})}});
 app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const d=b.dataset;
   if(d.run)act(()=>api('run/'+d.run,'POST'));
+  else if(d.src)openSrc(d);
+  else if(d.pd)setPrio(d.pd,d.v);
   else if(d.cmd)startJob({command:d.cmd,force:d.cmd==='search_all'&&!!($('#force')&&$('#force').checked)});
   else if(d.plex)plexLogin();
   else if(d.restart)restart();
@@ -885,6 +1034,52 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.cat)act(()=>api('indexers','POST',{catalog_id:d.cat}),'Indexer ajouté')});
 $('#addf').addEventListener('submit',e=>{e.preventDefault();const f=e.target,v={};new FormData(f).forEach((x,k)=>v[k]=x);
   act(async()=>{const r=await api('indexers','POST',v);f.reset();return r},'Indexer ajouté')});
+function setPrio(id,v){const n=Number(v);if(!Number.isInteger(n)||n<1||n>50){toast('Priorité invalide : nombre entier de 1 (le plus prioritaire) à 50',true);refresh();return}
+  act(()=>api('indexers/'+id+'/priority','POST',{priority:n}),'Priorité mise à jour')}
+/* ---------------------------------------------------- Changer de source */
+let SRC=null;const srcm=$('#srcm');
+function openSrc(d){const num=v=>v===''||v==null?null:+v;
+  SRC={mid:+d.src,s:num(d.s),e:num(d.e),g:d.g?+d.g:null,label:d.t||'',rt:d.rt||'',job:null,res:[]};
+  $('#srch').textContent=SRC.g?'Changer de source':'Choisir une source';
+  $('#srcb').innerHTML=`<p class="small"><b>${esc(SRC.label)}</b>${SRC.rt?`<br><span class="mut brk">Source actuelle : ${esc(SRC.rt)}</span>`:''}</p>
+  ${SRC.g?`<div class="row opts"><label class="chk"><input type="checkbox" id="sdel" checked> Supprimer l'ancien téléchargement</label><label class="chk"><input type="checkbox" id="sblk"> Bloquer l'ancienne release</label></div>`:''}
+  <div id="smsg"></div>
+  <h4>Résultats des indexers</h4><div id="sres2"><p class="mut">Recherche en cours sur les indexers…</p></div>
+  <h4>Lien magnet ou URL d'un .torrent</h4><form id="slf" class="row" autocomplete="off"><input id="slink" type="text" spellcheck="false" placeholder="magnet:?xt=urn:btih:… ou https://…/fichier.torrent" aria-label="Lien magnet ou URL d'un fichier .torrent"><button type="submit">Envoyer le lien</button></form>
+  <h4>Fichier .torrent</h4><form id="sff" class="row"><input id="sfile" type="file" accept=".torrent,application/x-bittorrent" aria-label="Fichier .torrent"><button type="submit">Envoyer le fichier</button></form>`;
+  srcm.hidden=false;document.body.classList.add('noscroll');$('#srcx').focus();srcSearch()}
+function closeSrc(){SRC=null;srcm.hidden=true;document.body.classList.remove('noscroll')}
+async function srcSearch(){const S0=SRC;try{const r=await api('media/'+S0.mid+'/sources','POST',{season:S0.s,episode:S0.e});S0.job=r.job.id;let j=r.job,fails=0;
+    while(SRC===S0&&j.status==='running'){await sleep(800);try{j=await api('jobs/'+j.id);fails=0}catch(e){if(e.status===404||++fails>20)throw e}}
+    if(SRC===S0)drawSrcRes(j)}
+  catch(e){if(SRC===S0)$('#sres2').innerHTML=`<div class="msg ko">${esc(e.message)}</div>`}}
+function drawSrcRes(j){const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
+  SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
+  if(!r.results.length){el.innerHTML=`<p class="mut">Aucun résultat pour ${esc(r.request)} (langues : ${langs}). Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
+  const ok=r.results.filter(x=>x.score!=null).length;
+  el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis.</p><div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
+  ${r.results.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b><div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
+  <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir quand même':'Choisir'}</button></td></tr>`).join('')}</table></div>`}
+async function srcSend(body){const S0=SRC;if(!S0)return;const msg=$('#smsg'),btns=[...document.querySelectorAll('#srcb button')];
+  Object.assign(body,{season:S0.s,episode:S0.e,grab_id:S0.g,delete_old:!!($('#sdel')&&$('#sdel').checked),blocklist_old:!!($('#sblk')&&$('#sblk').checked)});
+  btns.forEach(b=>b.disabled=true);msg.innerHTML='<div class="msg wa">Envoi à Download Station…</div>';msg.scrollIntoView({block:'nearest'});
+  try{const r=await api('media/'+S0.mid+'/replace','POST',body);
+    if(r.ok){toast(r.message);closeSrc();refresh();return}
+    if(SRC===S0)msg.innerHTML=`<div class="msg ko">✖ ${esc(r.message)}</div>`;toast(r.message,true)}
+  catch(e){if(SRC===S0)msg.innerHTML=`<div class="msg ko">✖ ${esc(e.message)}</div>`;toast(e.message,true)}
+  btns.forEach(b=>b.disabled=false);if(SRC===S0)msg.scrollIntoView({block:'nearest'})}
+function pick(i){const x=(SRC&&SRC.res||[]).find(r=>r.index===i);if(!x)return;
+  if(x.score==null&&!confirm('Cette release a été rejetée :\n'+x.reason+'\n\nL\'envoyer quand même à Download Station ?'))return;
+  srcSend({job_id:SRC.job,index:i,accept_rejected:x.score==null})}
+async function srcFile(){const f=$('#sfile').files[0];if(!f){toast('Choisissez un fichier .torrent',true);return}
+  if(f.size>700*1024){toast('Fichier trop volumineux pour un .torrent (700 Ko maximum)',true);return}
+  try{const data=await new Promise((ok,ko)=>{const rd=new FileReader();rd.onload=()=>ok(String(rd.result));rd.onerror=()=>ko(new Error('Lecture du fichier impossible'));rd.readAsDataURL(f)});
+    srcSend({torrent_base64:data.slice(data.indexOf(',')+1)})}catch(e){toast(e.message,true)}}
+srcm.addEventListener('click',e=>{if(e.target===srcm||e.target.closest('[data-mclose]')){closeSrc();return}
+  const b=e.target.closest('button[data-pick]');if(b)pick(+b.dataset.pick)});
+srcm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='slf'){const v=$('#slink').value.trim();if(!v){toast('Collez un lien magnet ou une URL .torrent',true);return}srcSend({link:v})}
+  else if(e.target.id==='sff')srcFile()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&SRC)closeSrc()});
 const showForm=()=>{$('#addc').hidden=tab!=='idx'};addEventListener('hashchange',showForm);showForm();
 refresh();
 """
@@ -951,7 +1146,21 @@ form.add{display:grid;grid-template-columns:1fr 1fr;gap:8px}form.add .full{grid-
 .msg.ok{background:var(--okb);color:var(--ok)}.msg.ko{background:var(--kob);color:var(--ko)}.msg.wa{background:var(--wab);color:var(--wa)}
 #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:9px 16px;
 border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw;font-size:14px;z-index:5}#toast.show{opacity:1}#toast.bad{background:var(--ko);color:#fff}
-@media (max-width:600px){.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
+button.xs{font-size:12px;padding:3px 8px}h4{margin:14px 0 6px;font-size:14px}
+.dls{margin-top:10px;display:flex;flex-direction:column;gap:8px}.dl{border:1px solid var(--bd);border-radius:8px;padding:8px 10px}.card>.dl+.dl,.card>h3+.dl,.card>h4+.dl{margin-top:8px}
+.dlh{display:flex;gap:6px 8px;align-items:baseline;flex-wrap:wrap;font-size:14px}.dlh .brk{flex:1 1 220px;min-width:0}.pct{font-variant-numeric:tabular-nums}
+.dlm{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-top:4px}.dlm>span{flex:1 1 240px;min-width:0}
+.pbar{height:8px;background:var(--neb);border-radius:9px;overflow:hidden;margin-top:6px}.pbar i{display:block;height:100%;background:var(--ac);transition:width .4s}.pbar.ok i{background:var(--ok)}.pbar.ko i{background:var(--ko)}
+.ds-downloading,.ds-finishing,.ds-extracting,.ds-hash_checking{background:var(--inb);color:var(--inf)}.ds-seeding,.ds-finished{background:var(--okb);color:var(--ok)}
+.ds-error,.ds-failed,.ds-introuvable{background:var(--kob);color:var(--ko)}.ds-waiting,.ds-paused,.ds-filehosting_waiting{background:var(--wab);color:var(--wa)}
+.spk{margin:8px 0 2px}.eps td:last-child .xs{margin-top:2px}
+.prio{display:flex;align-items:center;gap:4px;font-size:13px;color:var(--mut);margin-right:4px}.prio label{margin-right:2px}.pb{padding:3px 9px;line-height:1.2}.pin{width:58px;text-align:center;padding:4px 4px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow-y:auto}
+.mbox{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:12px;width:100%;max-width:920px;padding:14px 16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+.mhd{display:flex;justify-content:space-between;align-items:center;gap:10px}.mhd h3{margin:0}.opts{margin:4px 0 6px;gap:6px 16px}
+#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.srt table td,.srt table th{padding:5px 6px}
+body.noscroll{overflow:hidden}
+@media (max-width:600px){.modal{padding:8px}.mbox{padding:12px}.srt{max-height:none}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
 </style></head><body>
 <header><div class="hd"><h1><span>syno</span>arr</h1>
 <nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
@@ -959,7 +1168,10 @@ border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;max-width
 <div class="card" id="addc" hidden><h3>Ajouter un indexer par URL</h3>
 <form class="add" id="addf" autocomplete="off"><input name="name" placeholder="Nom" required><input name="url" placeholder="URL (Torznab, RSS…)" required>
 <input name="api_key" type="password" placeholder="Clé d'API (facultatif)" autocomplete="new-password"><input name="categories" placeholder="Catégories (ex. 2000,5000)">
+<input name="priority" type="number" min="1" max="50" step="1" placeholder="Priorité 1-50 (défaut 25)" aria-label="Priorité (1 = le plus prioritaire)">
 <div class="full"><button type="submit">Ajouter</button></div></form></div></main>
+<div id="srcm" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="srch"><div class="mbox">
+<div class="mhd"><h3 id="srch">Changer de source</h3><button type="button" class="sec xs" id="srcx" data-mclose="1">Fermer</button></div><div id="srcb"></div></div></div>
 <div id="toast" role="status"></div>
 <script>""" + INDEX_JS + """</script></body></html>
 """

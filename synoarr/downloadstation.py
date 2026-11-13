@@ -15,6 +15,7 @@ import threading
 import urllib.parse
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from .bencode import magnet_info
 from .httpclient import HttpClient, HttpError, redact
 from .models import DSTask
 
@@ -92,6 +93,22 @@ def _to_int(value: Any, default: int = 0) -> int:
             return int(float(str(value)))
         except (TypeError, ValueError):
             return default
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    """int, or None when the value is missing / not a number (DSM sometimes sends strings)."""
+    if value is None or isinstance(value, bool) or value == "":
+        return None
+    marker = object()
+    n = _to_int(value, marker)  # type: ignore[arg-type]
+    return None if n is marker else max(0, n)
+
+
+def _first(d: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if d.get(k) not in (None, ""):
+            return d.get(k)
+    return None
 
 
 def normalize_destination(destination: str) -> str:
@@ -446,11 +463,27 @@ class DownloadStation:
                 and int(t.get("status")) >= 100:
             error = "erreur %s" % t.get("status")
         dest = detail.get("destination")
-        downloaded = transfer.get("size_downloaded", transfer.get("downloaded_size"))
+        downloaded = _first(transfer, "size_downloaded", "downloaded_size")
+        uri = detail.get("uri")
+        uri = str(uri) if isinstance(uri, str) and uri else None
+        info_hash = None
+        if uri and uri.lower().startswith("magnet:"):
+            try:
+                info_hash = magnet_info(uri)[1]
+            except Exception:  # never fail a listing on a strange URI
+                info_hash = None
         return DSTask(id=str(task_id), title=str(t.get("title") or t.get("name") or ""), status=status,
                       size=_to_int(t.get("size")), downloaded=_to_int(downloaded),
                       destination=str(dest) if dest else None,
-                      type=str(t["type"]) if t.get("type") is not None else None, error=error)
+                      type=str(t["type"]) if t.get("type") is not None else None, error=error,
+                      speed_down=_opt_int(_first(transfer, "speed_download", "download_speed")),
+                      speed_up=_opt_int(_first(transfer, "speed_upload", "upload_speed")),
+                      seeders=_opt_int(_first(detail, "connected_seeders", "seeders")),
+                      leechers=_opt_int(_first(detail, "connected_leechers", "leechers")),
+                      peers=_opt_int(_first(detail, "total_peers", "connected_peers", "peers")),
+                      uploaded=_opt_int(_first(transfer, "size_uploaded", "uploaded_size")),
+                      created=_opt_int(_first(detail, "create_time", "created_time")) or None,
+                      info_hash=info_hash)
 
     def delete_task(self, task_id: str) -> None:
         """Delete the task (never the downloaded files)."""

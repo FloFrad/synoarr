@@ -338,6 +338,40 @@ class DownloadStationTest(unittest.TestCase):
         self.assertEqual(t3.error, "broken_link")
         self.assertIsNone(t3.destination)
 
+    def test_list_tasks_transfer_details(self):
+        self.dsm.tasks = [
+            {"id": "dbid_7", "title": "Movie.2020.1080p", "status": "downloading", "size": "2000", "type": "bt",
+             "additional": {"detail": {"destination": "Download", "connected_seeders": 12, "connected_leechers": "3",
+                                       "total_peers": "40", "create_time": "1700000000",
+                                       "uri": "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01&dn=x"},
+                            "transfer": {"size_downloaded": "500", "size_uploaded": 100,
+                                         "speed_download": "2048", "speed_upload": 512}}},
+            {"id": "dbid_8", "title": "Old", "status": "seeding", "size": 10, "type": "bt",
+             "additional": {"detail": {"connected_seeders": "n/a", "uri": "https://tracker/x.torrent?passkey=S"},
+                            "transfer": {"size_downloaded": 10, "speed_download": None}}},
+            {"id": "dbid_9", "title": "Bare", "status": "waiting"},
+        ]
+        t7, t8, t9 = self.ds().list_tasks()
+        self.assertEqual((t7.speed_down, t7.speed_up, t7.seeders, t7.leechers, t7.peers, t7.uploaded, t7.created),
+                         (2048, 512, 12, 3, 40, 100, 1700000000))
+        self.assertEqual(t7.info_hash, "abcdef0123456789abcdef0123456789abcdef01")
+        self.assertEqual(t7.progress, 25.0)
+        self.assertIsNone(t8.seeders)  # non-numeric value tolerated
+        self.assertIsNone(t8.speed_down)
+        self.assertIsNone(t8.info_hash)
+        self.assertEqual(t8.progress, 100.0)  # seeding = complete
+        self.assertFalse(hasattr(t8, "uri"))  # the URI (may hold a passkey) is not kept
+        self.assertEqual((t9.speed_down, t9.seeders, t9.created, t9.progress), (None, None, None, 0.0))
+
+    def test_list_tasks_ds2_fields(self):
+        from synoarr.downloadstation import DownloadStation as D
+        t = D._to_task({"id": "x", "title": "T", "status": 2, "size": 100,
+                        "additional": {"detail": {"connected_seeders": 2, "total_peers": 9},
+                                       "transfer": {"downloaded_size": 50, "download_speed": 10,
+                                                    "upload_speed": 1, "uploaded_size": 5}}})
+        self.assertEqual((t.status, t.downloaded, t.speed_down, t.speed_up, t.uploaded, t.seeders, t.peers),
+                         ("downloading", 50, 10, 1, 5, 2, 9))
+
     def test_delete_task(self):
         ds = self.ds()
         ds.delete_task("dbid_2")

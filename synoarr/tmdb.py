@@ -134,6 +134,73 @@ class TmdbClient:
                 "tmdb": str(best["id"]),
                 "original_title": best.get("original_name")}
 
+    # ------------------------------------------------------------ watchlist add (candidates)
+    POSTER_BASE = "https://image.tmdb.org/t/p/w185"
+
+    def search_multi(self, query: str, kind: Optional[str] = None, year: Optional[int] = None,
+                     limit: int = 20) -> List[Dict[str, Any]]:
+        """Candidates for adding to the watchlist: /search/multi (films + séries), or /search/movie, /search/tv
+        when *kind* is "movie" / "show". Each: {"source": "tmdb", "type", "title", "original_title", "year",
+        "tmdb", "imdb": None, "tvdb": None, "rating_key": None, "overview", "poster_url"}. Never raises."""
+        query = (query or "").strip()
+        if not self.enabled or not query:
+            return []
+        if kind == "movie":
+            params = {"query": query, "include_adult": "false"}  # type: Dict[str, Any]
+            if year:
+                params["year"] = year
+            data = self._get("/search/movie", params)
+        elif kind == "show":
+            params = {"query": query, "include_adult": "false"}
+            if year:
+                params["first_air_date_year"] = year
+            data = self._get("/search/tv", params)
+        else:
+            data = self._get("/search/multi", {"query": query, "include_adult": "false"})
+        out: List[Dict[str, Any]] = []
+        for r in (data or {}).get("results") or []:
+            if not isinstance(r, dict) or r.get("id") is None:
+                continue
+            media_type = r.get("media_type") or ("movie" if kind == "movie" else "tv" if kind == "show" else "")
+            if media_type == "movie":
+                ctype, title, orig, date = "movie", r.get("title"), r.get("original_title"), r.get("release_date")
+            elif media_type == "tv":
+                ctype, title, orig, date = "show", r.get("name"), r.get("original_name"), r.get("first_air_date")
+            else:
+                continue  # person, collection...
+            title = str(title or orig or "").strip()
+            if not title:
+                continue
+            ry = _year(date)
+            if year and ry and abs(ry - year) > 1:
+                continue
+            overview = " ".join(str(r.get("overview") or "").split())
+            if len(overview) > 300:
+                overview = (overview[:300].rsplit(" ", 1)[0] or overview[:300]).rstrip(" ,;.") + "…"
+            poster = r.get("poster_path")
+            out.append({"source": "tmdb", "type": ctype, "title": title,
+                        "original_title": str(orig) if orig and orig != title else None,
+                        "year": ry, "tmdb": str(r["id"]), "imdb": None, "tvdb": None, "rating_key": None,
+                        "overview": overview,
+                        "poster_url": self.POSTER_BASE + str(poster) if poster else None})
+            if len(out) >= limit:
+                break
+        return out
+
+    def external_ids(self, tmdb_id: str, kind: str) -> Dict[str, str]:
+        """{"imdb": "tt..", "tvdb": "123"} of a movie / show (kind "movie" | "show"), {} on error."""
+        if not self.enabled or not tmdb_id:
+            return {}
+        data = self._get("/%s/%s/external_ids" % ("movie" if kind == "movie" else "tv", tmdb_id)) or {}
+        out: Dict[str, str] = {}
+        imdb = str(data.get("imdb_id") or "").strip().lower()
+        if re.match(r"^tt\d+$", imdb):
+            out["imdb"] = imdb
+        tvdb = data.get("tvdb_id")
+        if tvdb not in (None, "", 0):
+            out["tvdb"] = str(tvdb)
+        return out
+
     # ------------------------------------------------------------ episodes
     @staticmethod
     def _genres(data: Dict[str, Any]) -> Tuple[List[str], bool]:

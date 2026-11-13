@@ -121,6 +121,24 @@ class DSTask:
     destination: Optional[str] = None
     type: Optional[str] = None
     error: Optional[str] = None
+    # live transfer information (None = not reported by this DSM version)
+    speed_down: Optional[int] = None  # bytes/s
+    speed_up: Optional[int] = None  # bytes/s
+    seeders: Optional[int] = None  # connected seeders
+    leechers: Optional[int] = None  # connected leechers
+    peers: Optional[int] = None  # total peers known
+    uploaded: Optional[int] = None  # bytes
+    created: Optional[int] = None  # task creation time (epoch seconds)
+    info_hash: Optional[str] = None  # lowercase hex, from a magnet URI when available
+
+    @property
+    def progress(self) -> float:
+        """0..100 (100 once finished/seeding)."""
+        if self.is_complete:
+            return 100.0
+        if self.size and self.size > 0:
+            return max(0.0, min(100.0, 100.0 * float(self.downloaded or 0) / float(self.size)))
+        return 0.0
 
     @property
     def is_complete(self) -> bool:

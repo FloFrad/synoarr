@@ -366,9 +366,17 @@ def cmd_indexer(args: argparse.Namespace) -> int:
             rows = mgr.list()
             if not rows:
                 _out("Aucun indexer. Voir : " + _command("indexer catalog"))
+            else:
+                _out("%3s  %-25s %-17s %-8s %-5s %s" % ("id", "nom", "type", "état", "prio", "url"))
+            from .httpclient import redact
             for r in rows:
-                _out("%3d  %-25s %-17s %-8s %s" % (r["id"], r["name"], r["type"],
-                                                    "actif" if r["enabled"] else "inactif", r["url"]))
+                _out("%3d  %-25s %-17s %-8s %-5s %s" % (r["id"], r["name"], r["type"],
+                                                         "actif" if r["enabled"] else "inactif",
+                                                         r.get("priority") if r.get("priority") is not None else 25,
+                                                         redact(r["url"])))
+            if rows:
+                _out("Priorité : 1 = le plus prioritaire, 50 = le moins (modifier : %s)"
+                     % _command("indexer priority <id|nom> <1-50>"))
         elif action == "catalog":
             _out("Indexers légaux disponibles (ajout : %s) :" % _command("indexer add <id>"))
             for e in mgr.catalog():
@@ -391,8 +399,8 @@ def cmd_indexer(args: argparse.Namespace) -> int:
                 _out(KO + "Usage : indexer add-url \"Nom\" URL [--api-key CLE] [--categories 2000,5000]")
                 return 2
             row = mgr.add_url(args.target, args.url, args.api_key or "", args.categories or "",
-                              type_=args.type)
-            _out(OK + "Ajouté : %s (type %s)" % (row.get("name"), row.get("type")))
+                              type_=args.type, priority=args.priority)
+            _out(OK + "Ajouté : %s (type %s, priorité %s)" % (row.get("name"), row.get("type"), row.get("priority")))
             ok, msg = mgr.test(row["id"])
             _out((OK if ok else KO) + "Test : " + msg)
             if not ok:
@@ -408,6 +416,23 @@ def cmd_indexer(args: argparse.Namespace) -> int:
         elif action == "remove":
             mgr.delete(args.target)
             _out(OK + "Indexer %s supprimé" % args.target)
+        elif action == "import-prowlarr":
+            if not args.target:
+                _out(KO + "Usage : indexer import-prowlarr http://127.0.0.1:9696 --api-key CLE")
+                return 2
+            res = mgr.import_prowlarr(args.target, args.api_key or "")
+            _out(OK + res["message"])
+            for label, names in (("ajouté", res["added"]), ("mis à jour", res["updated"])):
+                for n in names:
+                    _out("      %s : %s" % (label, n))
+            for n in res["skipped"]:
+                _out(WARN + "ignoré : " + n)
+        elif action == "priority":
+            if not args.target or args.url is None:
+                _out(KO + "Usage : indexer priority <id|nom> <1-50>  (1 = le plus prioritaire)")
+                return 2
+            row = mgr.set_priority(args.target, args.url)
+            _out(OK + "Priorité de l'indexer %s : %s" % (row.get("name"), row.get("priority")))
     except ValueError as exc:
         _out(KO + str(exc))
         return 1
@@ -415,6 +440,9 @@ def cmd_indexer(args: argparse.Namespace) -> int:
 
 
 def cmd_watchlist(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", None) or "list"
+    if action in ("add", "remove"):
+        return _watchlist_edit(args, action)
     app = _app(args)
     if not args.no_sync:
         _sync(app)
@@ -431,8 +459,93 @@ def cmd_watchlist(args: argparse.Namespace) -> int:
             extra = "  épisodes : %d importés, %d en cours, %d recherchés / %d" % (done, grabbed, wanted, len(eps))
         _out("%3d  %-6s %-40s %-6s %-10s%s%s" % (
             m["id"], "film" if m["type"] == "movie" else "série", m["title"][:40], m["year"] or "",
-            m["status"], "" if m["on_watchlist"] else " (retiré)", extra))
+            m["status"], " (local)" if str(m["plex_key"]).startswith("local:") else
+            "" if m["on_watchlist"] else " (retiré)", extra))
     return 0
+
+
+# ---- watchlist add/delete
+def _watchlist_edit(args: argparse.Namespace, action: str) -> int:
+    app = _app(args)
+    _quiet_console(args)
+    try:
+        if action == "remove":
+            if not args.target or not str(args.target).isdigit():
+                _out(KO + "Usage : watchlist remove <id> [--keep-plex] [--delete-downloads] (id : voir « watchlist »)")
+                return 2
+            media = app.db.get_media(int(args.target))
+            res = app.remove_from_watchlist(int(args.target), remove_from_plex=not args.keep_plex,
+                                            delete_downloads=args.delete_downloads)
+            title = media["title"] if media else args.target
+            if res.get("plex_removed"):
+                _out(OK + "« %s » retiré de synoarr et de la Watchlist Plex" % title)
+            else:
+                _out(OK + "« %s » retiré de la liste de synoarr" % title)
+            if args.delete_downloads:
+                _out(OK + "%d téléchargement(s) supprimé(s) de Download Station" % res.get("downloads_deleted", 0))
+            if res.get("warning"):
+                _out(WARN + res["warning"])
+            return 0
+        # add
+        if not args.target:
+            _out(KO + "Usage : watchlist add \"Titre\" [--year 1999] [--type movie|show] [--local] [--pick N]")
+            return 2
+        if args.manual:
+            if not args.type:
+                _out(KO + "--manual nécessite --type movie ou --type show")
+                return 2
+            row = app.add_manual(args.type, args.target, args.year, imdb=args.imdb, tmdb=args.tmdb)
+        else:
+            found = app.search_titles(args.target, args.type, args.year)
+            for w in found["warnings"]:
+                _out(WARN + w)
+            results = found["results"]
+            if not results:
+                _out(KO + "Aucun résultat pour « %s ». Ajout sans recherche : watchlist add \"%s\" --manual "
+                     "--type movie|show [--year AAAA] [--imdb tt...]" % (args.target, args.target))
+                return 1
+            for i, c in enumerate(results, 1):
+                ids = ", ".join("%s %s" % (k, c[k]) for k in ("imdb", "tmdb", "tvdb") if c.get(k))
+                _out("%3d  %-6s %-45s %-6s %-5s%s%s" % (
+                    i, "film" if c["type"] == "movie" else "série", c["title"][:45], c.get("year") or "",
+                    c["source"], "  [déjà suivi]" if c.get("in_watchlist") else "", ("  (" + ids + ")") if ids else ""))
+            pick = args.pick
+            if pick is None:
+                if not sys.stdin.isatty():
+                    _out(KO + "Précisez le numéro à ajouter avec --pick N")
+                    return 2
+                try:
+                    answer = input("Numéro à ajouter (Entrée = annuler) : ").strip()
+                except EOFError:
+                    answer = ""
+                if not answer:
+                    _out("Annulé.")
+                    return 0
+                if not answer.isdigit():
+                    _out(KO + "Numéro invalide : %s" % answer)
+                    return 2
+                pick = int(answer)
+            if not 1 <= pick <= len(results):
+                _out(KO + "Numéro invalide : %s (1 à %d)" % (pick, len(results)))
+                return 2
+            row = app.add_to_watchlist(results[pick - 1], add_to_plex=not args.local)
+        local = str(row["plex_key"]).startswith("local:")
+        what = "entrée locale" if local else "Watchlist Plex"
+        verb = "déjà présent, réactivé" if row.get("already_present") else "ajouté"
+        _out(OK + "« %s »%s %s (%s, id %d)" % (row["title"], " (%s)" % row["year"] if row.get("year") else "",
+                                              verb, what, row["id"]))
+        if row.get("warning"):
+            _out(WARN + row["warning"])
+        if args.search:
+            stats = app.searcher.run_once(media_id=row["id"], force=True)
+            _out("%d recherche(s), %d envoi(s) vers Download Station" % (stats["searched"], stats["grabbed"]))
+        else:
+            _out("      Rechercher maintenant : " + _command("search --media %d" % row["id"]))
+        return 0
+    except ValueError as exc:
+        _out(KO + str(exc))
+        return 1
+# ---- end watchlist add/delete
 
 
 def _sync(app) -> None:
@@ -584,17 +697,37 @@ def build_parser() -> argparse.ArgumentParser:
         .set_defaults(func=cmd_plex_login)
 
     pi = sub.add_parser("indexer", parents=[common], help="gérer les indexers")
-    pi.add_argument("action", choices=["list", "catalog", "add", "add-url", "test", "enable", "disable", "remove"])
-    pi.add_argument("target", nargs="?", help="id du catalogue, nom ou numéro de l'indexer")
-    pi.add_argument("url", nargs="?", help="URL (pour add-url)")
+    pi.add_argument("action", choices=["list", "catalog", "add", "add-url", "test", "enable", "disable", "remove",
+                                       "priority", "import-prowlarr"])
+    pi.add_argument("target", nargs="?", help="id du catalogue, nom ou numéro de l'indexer (import-prowlarr : "
+                                              "adresse de Prowlarr, ex. http://127.0.0.1:9696)")
+    pi.add_argument("url", nargs="?", help="URL (pour add-url) ou priorité 1-50 (pour priority)")
+    pi.add_argument("--priority", default=None,
+                    help="priorité pour add-url : 1 (le plus prioritaire) à 50, défaut 25")
     pi.add_argument("--api-key", default="")
     pi.add_argument("--categories", default="", help="catégories Torznab, ex. 2000,5000")
     pi.add_argument("--type", choices=["torznab", "rss", "internet_archive"], default=None,
                     help="forcer le type (détecté automatiquement sinon)")
     pi.set_defaults(func=cmd_indexer)
 
-    pw = sub.add_parser("watchlist", parents=[common], help="synchroniser et afficher la Watchlist Plex")
-    pw.add_argument("--no-sync", action="store_true")
+    pw = sub.add_parser("watchlist", parents=[common],
+                        help="afficher la Watchlist (list), ajouter (add \"Titre\") ou retirer (remove ID)")
+    pw.add_argument("action", nargs="?", choices=["list", "add", "remove"], default="list")
+    pw.add_argument("target", nargs="?", help="titre à rechercher (add) ou id de l'élément (remove)")
+    pw.add_argument("--no-sync", action="store_true", help="list : ne pas relire la Watchlist Plex")
+    pw.add_argument("--year", type=int, default=None, help="add : année")
+    pw.add_argument("--type", choices=["movie", "show"], default=None, help="add : film (movie) ou série (show)")
+    pw.add_argument("--local", action="store_true",
+                    help="add : entrée locale à synoarr, sans l'ajouter à la Watchlist Plex")
+    pw.add_argument("--pick", type=int, default=None, help="add : numéro du résultat à ajouter (sans question)")
+    pw.add_argument("--manual", action="store_true", help="add : ajout sans recherche (entrée locale, --type requis)")
+    pw.add_argument("--imdb", default=None, help="add --manual : identifiant IMDb (tt...)")
+    pw.add_argument("--tmdb", default=None, help="add --manual : identifiant TMDb")
+    pw.add_argument("--search", action="store_true", help="add : lancer la recherche aussitôt après l'ajout")
+    pw.add_argument("--keep-plex", action="store_true",
+                    help="remove : laisser l'élément dans la Watchlist Plex (il est alors masqué)")
+    pw.add_argument("--delete-downloads", action="store_true",
+                    help="remove : supprimer aussi ses téléchargements en cours dans Download Station")
     pw.set_defaults(func=cmd_watchlist)
 
     ps = sub.add_parser("search", parents=[common],

@@ -319,3 +319,51 @@ class PickBestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IndexerPriorityTests(unittest.TestCase):
+    """Indexer priority (1 = most preferred .. 50) breaks ties but never beats resolution / language / source."""
+
+    def setUp(self):
+        self.cfg = QualityConfig(languages=["en", "fr"], prefer_words=[])
+        self.prios = {"Favori": 1, "Moyen": 25, "Dernier": 50}
+
+    @staticmethod
+    def on(indexer, title, seeders=50, size=4 * GB):
+        return Release(title=title, indexer=indexer, download_url="http://x/%s.torrent" % title,
+                       seeders=seeders, size=size)
+
+    def test_constants_keep_the_level_order(self):
+        from synoarr import quality as q
+        self.assertGreater((q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP, q.SEEDERS_MAX + 200)
+        self.assertLess((q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP, q.SOURCE_WEIGHT)
+        self.assertLess((q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP, q.PREFER_WORD_BONUS)
+
+    def test_equal_quality_prefers_the_priority_indexer_over_seeders(self):
+        a = self.on("Dernier", "Dune.2021.1080p.BluRay.x264-AAA", seeders=5000)
+        b = self.on("Favori", "Dune.2021.1080p.BluRay.x264-BBB", seeders=3)
+        self.assertEqual(pick_best([a, b], MOVIE, self.cfg, priorities=self.prios).title, b.title)
+        # without priorities (old callers): seeders decide, no bonus
+        self.assertEqual(pick_best([a, b], MOVIE, self.cfg).title, a.title)
+        self.assertEqual(evaluate(b, MOVIE, self.cfg)[0] + 49 * 200,
+                         evaluate(b, MOVIE, self.cfg, self.prios)[0])
+
+    def test_priority_never_overrides_resolution_language_or_source(self):
+        cases = [
+            (self.on("Dernier", "Dune.2021.1080p.WEB-DL.x264-A"), self.on("Favori", "Dune.2021.720p.BluRay.x264-B")),
+            (self.on("Dernier", "Dune.2021.1080p.WEB-DL.x264-A"), self.on("Favori", "Dune.2021.FRENCH.1080p.WEB-DL-B")),
+            (self.on("Dernier", "Dune.2021.1080p.WEBRip.x264-A"), self.on("Favori", "Dune.2021.1080p.HDTV.x264-B")),
+        ]
+        for better, preferred_indexer in cases:
+            with self.subTest(better=better.title):
+                self.assertEqual(pick_best([preferred_indexer, better], MOVIE, self.cfg,
+                                           priorities=self.prios).title, better.title)
+
+    def test_unknown_indexer_counts_as_default_and_case_insensitive(self):
+        from synoarr.quality import indexer_priority, priority_points
+        self.assertEqual(indexer_priority("inconnu", self.prios), 25)
+        self.assertEqual(indexer_priority("favori", self.prios), 1)
+        self.assertIsNone(indexer_priority("Favori", None))
+        self.assertEqual(priority_points("Dernier", self.prios), 0)
+        self.assertEqual(priority_points("x", {"x": 999}), 0)  # clamped to 50
+        self.assertEqual(priority_points("x", {"x": "abc"}), 25 * 200)

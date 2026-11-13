@@ -1,11 +1,38 @@
 """Application wiring + daemon loop."""
 from __future__ import annotations
 
+# ---- watchlist add/delete : API App pour l'interface web (ValueError = saisie invalide, message français → 400)
+#
+# app.search_titles(query: str, kind: None|"movie"|"show" = None, year: int|str|None = None) -> dict
+#     {"query": str, "warnings": [str], "results": [candidat]}   (ne lève que ValueError : requête vide,
+#     type ou année invalides ; Plex/TMDb en panne → avertissement dans "warnings")
+#     candidat = {"source": "plex"|"tmdb", "type": "movie"|"show", "title", "original_title", "year",
+#                 "rating_key" (Plex, sinon None), "tmdb", "imdb", "tvdb", "overview" (≤ 300 car.),
+#                 "poster_url" (URL publique ou None), "in_watchlist": bool, "media_id": int|None}
+# app.add_to_watchlist(candidate: dict, add_to_plex: bool = True) -> dict
+#     candidate = un candidat ci-dessus tel quel, ou au minimum {"type", "title"} (+ year, imdb, tmdb, tvdb,
+#     rating_key, original_title). Avec rating_key et add_to_plex : ajout à la Watchlist Plex puis import ;
+#     sinon (ou si Plex échoue) entrée locale (plex_key "local:...", jamais retirée par la synchro).
+#     Déjà présent (même clé Plex ou même imdb/tmdb/tvdb) → ligne existante réactivée (démasquée, "ignored" →
+#     wanted/monitored). Retour : ligne de la table media + "plex_added": bool|None,
+#     "already_present": bool, "warning": str|None. Appels réseau synchrones (Plex, TMDb : quelques s).
+#     Ensuite, pour chercher tout de suite : app.search_now(row["id"]).
+# app.add_manual(type_: str, title: str, year=None, imdb=None, tmdb=None) -> dict   (idem, entrée locale)
+# app.remove_from_watchlist(media_id: int, remove_from_plex: bool = True, delete_downloads: bool = False)
+#     -> {"removed": True, "plex_removed": bool|None, "warning": str|None, "downloads_deleted": int}
+#     Entrée locale ou retirée de Plex → ligne supprimée (épisodes supprimés, historique des envois gardé).
+#     Retrait Plex refusé/impossible ou remove_from_plex=False → ligne masquée (hidden=1) + "ignored", avec un
+#     avertissement (elle reste dans la Watchlist Plex). delete_downloads : supprime les tâches Download
+#     Station des envois en cours (jamais de fichier de la bibliothèque). ValueError si id inconnu.
+# db.list_media(..., include_hidden=False) : les entrées masquées n'apparaissent plus dans les listes.
+# Une ligne media est locale si plex_key commence par "local:".
+
 import contextlib
 import datetime as _dt
 import logging
 import logging.handlers
 import os
+import re
 import shutil
 import signal
 import stat
@@ -65,6 +92,22 @@ def is_local_url(url: str) -> bool:
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
+PRIORITY_DEFAULT = 25
+
+
+def check_priority(value: Any) -> int:
+    """Priorité d'indexer saisie (1 = le plus prioritaire … 50) -> int. Lève ValueError en français."""
+    if isinstance(value, bool):
+        value = None
+    try:
+        prio = int(str(value).strip()) if not isinstance(value, int) else value
+    except (TypeError, ValueError):
+        prio = None
+    if prio is None or not 1 <= prio <= 50:
+        raise ValueError("Priorité invalide : nombre entier de 1 (le plus prioritaire) à 50 attendu")
+    return prio
+
+
 class IndexerManager:
     """CRUD on indexers (used by the CLI and the web UI)."""
 
@@ -98,18 +141,19 @@ class IndexerManager:
         return self.db.get_indexer(new_id) or {}
 
     def add_url(self, name: str, url: str, api_key: str = "", categories: str = "",
-                type_: Optional[str] = None) -> Dict[str, Any]:
+                type_: Optional[str] = None, priority: Any = None) -> Dict[str, Any]:
         name = (name or "").strip()
         url = (url or "").strip()
         if not name:
             raise ValueError("Le nom de l'indexer est obligatoire")
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("L'URL doit commencer par http:// ou https://")
+        prio = PRIORITY_DEFAULT if priority in (None, "") else check_priority(priority)
         if self.db.get_indexer(name):
             raise ValueError("Un indexer nommé « %s » existe déjà" % name)
         if not type_:
             type_ = detect_type(url, api_key, self.http)
-        new_id = self.db.add_indexer(name, type_, url, api_key or "", categories or "")
+        new_id = self.db.add_indexer(name, type_, url, api_key or "", categories or "", priority=prio)
         self.db.add_event("indexer", "Indexer ajouté : %s (%s)" % (name, type_))
         return self.db.get_indexer(new_id) or {}
 
@@ -134,6 +178,113 @@ class IndexerManager:
         row = self._row(indexer_id)
         self.db.delete_indexer(row["id"])
         self.db.add_event("indexer", "Indexer supprimé : %s" % row["name"])
+
+    def set_priority(self, indexer_id: Any, priority: Any) -> Dict[str, Any]:
+        """Priorité 1 (le plus prioritaire) à 50. Lève ValueError (message français)."""
+        prio = check_priority(priority)
+        row = self._row(indexer_id)
+        self.db.update_indexer(row["id"], priority=prio)
+        if int(row.get("priority") or 0) != prio:
+            self.db.add_event("indexer", "Priorité de l'indexer %s : %d" % (row["name"], prio))
+        return self.db.get_indexer(row["id"]) or {}
+
+    def priorities(self) -> Dict[str, int]:
+        """{nom: priorité 1..50} de tous les indexers."""
+        from .quality import clamp_priority
+        return {r["name"]: clamp_priority(r.get("priority")) for r in self.db.list_indexers()}
+
+    # ---- import Prowlarr
+    PROWLARR_DEFAULT_URL = "http://127.0.0.1:9696"
+
+    @staticmethod
+    def normalize_prowlarr_url(base_url: str) -> Tuple[str, str]:
+        """(URL de base sans / final ni requête, clé trouvée dans « ?apikey= » ou ""). Lève ValueError."""
+        import urllib.parse
+        raw = (base_url or "").strip()
+        if not raw:
+            raise ValueError("Saisissez l'adresse de Prowlarr (ex. %s)" % IndexerManager.PROWLARR_DEFAULT_URL)
+        if "://" not in raw:
+            raw = "http://" + raw
+        try:
+            parts = urllib.parse.urlsplit(raw)
+        except ValueError:
+            parts = None
+        if parts is None or parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            raise ValueError("Adresse de Prowlarr invalide (ex. %s)" % IndexerManager.PROWLARR_DEFAULT_URL)
+        key = ""
+        for k, v in urllib.parse.parse_qsl(parts.query):
+            if k.lower() == "apikey" and v.strip():
+                key = v.strip()
+        path = parts.path.rstrip("/")
+        for suffix in ("/api/v1/indexer", "/api/v1"):
+            if path.lower().endswith(suffix):
+                path = path[:-len(suffix)]
+        return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, "", "")).rstrip("/"), key
+
+    def import_prowlarr(self, base_url: str, api_key: str = "") -> Dict[str, Any]:
+        """Ajoute (ou met à jour) un indexer Torznab « <nom> (Prowlarr) » pour chaque indexer torrent actif de
+        Prowlarr (API v1). Lève ValueError (message français : clé refusée, Prowlarr injoignable...)."""
+        from .quality import clamp_priority
+        base, key_in_url = self.normalize_prowlarr_url(base_url)
+        key = (api_key or "").strip() or key_in_url
+        if not key:
+            raise ValueError("Saisissez la clé API de Prowlarr (Prowlarr > Settings > General > API Key)")
+        http = self.http if not is_local_url(base) else HttpClient(timeout=30, use_proxy=False)
+        try:
+            resp = http.get(base + "/api/v1/indexer", headers={"X-Api-Key": key, "Accept": "application/json"},
+                            raise_for_status=False, timeout=30)
+        except HttpError as exc:
+            raise ValueError("Prowlarr injoignable à %s (%s). Vérifiez l'adresse, par exemple %s si Prowlarr tourne "
+                             "sur le NAS." % (base, exc, self.PROWLARR_DEFAULT_URL))
+        if resp.status in (401, 403):
+            raise ValueError("Clé API Prowlarr refusée (Prowlarr > Settings > General > API Key)")
+        if resp.status == 404:
+            raise ValueError("Pas d'API Prowlarr à %s (HTTP 404) : vérifiez l'adresse, par exemple %s"
+                             % (base, self.PROWLARR_DEFAULT_URL))
+        if not resp.ok:
+            raise ValueError("Prowlarr a répondu HTTP %s à %s" % (resp.status, base))
+        try:
+            rows = resp.json()
+        except ValueError:
+            rows = None
+        if not isinstance(rows, list):
+            raise ValueError("Réponse inattendue de %s : ce n'est pas l'API de Prowlarr (vérifiez l'adresse, par "
+                             "exemple %s)" % (base, self.PROWLARR_DEFAULT_URL))
+        existing = self.db.list_indexers()
+        by_url = {(r["url"] or "").rstrip("/").lower(): r for r in existing}
+        added, updated, skipped = [], [], []  # type: List[str], List[str], List[str]
+        for item in rows:
+            if not isinstance(item, dict) or item.get("id") in (None, ""):
+                continue
+            pname = str(item.get("name") or "Indexer %s" % item.get("id")).strip()
+            if str(item.get("protocol") or "torrent").lower() != "torrent":
+                skipped.append("%s : indexer Usenet non pris en charge" % pname)
+                continue
+            if item.get("enable") is False:
+                skipped.append("%s : désactivé dans Prowlarr" % pname)
+                continue
+            name = "%s (Prowlarr)" % pname
+            url = "%s/%s/api" % (base, item["id"])
+            prio = clamp_priority(item.get("priority"))
+            row = by_url.get(url.lower()) or self.db.get_indexer(name)
+            if row is not None and row.get("type") == "torznab":
+                self.db.update_indexer(row["id"], url=url, api_key=key, priority=prio)
+                updated.append(row["name"])
+                continue
+            if row is not None:
+                skipped.append("%s : un indexer nommé « %s » existe déjà" % (pname, row["name"]))
+                continue
+            new_id = self.db.add_indexer(name, "torznab", url, key, "", priority=prio)
+            by_url[url.lower()] = self.db.get_indexer(new_id) or {}
+            added.append(name)
+        parts = ["%d ajouté(s)" % len(added), "%d mis à jour" % len(updated)]
+        if skipped:
+            parts.append("%d ignoré(s)" % len(skipped))
+        message = "Import Prowlarr : " + ", ".join(parts)
+        if not rows:
+            message = "Aucun indexer configuré dans Prowlarr"
+        self.db.add_event("indexer", message)
+        return {"ok": True, "added": added, "updated": updated, "skipped": skipped, "message": message}
 
     def active(self) -> List[Any]:
         out = []
@@ -225,6 +376,8 @@ COMMANDS = {
     "plex_login": "Connexion Plex",
 }
 MAX_JOBS = 20
+# statuts Download Station d'un téléchargement qui avance (rafraîchissement rapide de l'interface)
+ACTIVE_DS_STATUSES = ("waiting", "downloading", "finishing", "hash_checking", "filehosting_waiting", "extracting")
 CONFIG_BACKUPS = 5
 PLEX_LINK_URL = "https://plex.tv/link"
 
@@ -269,6 +422,94 @@ def _web_hint(command: str) -> str:
         "indexer add internet_archive": "onglet Indexers, section Catalogue",
         "run": "« Rechercher tout » (onglet Commandes)",
     }.get(command, command)
+
+
+# ---- watchlist add/delete: input checks and candidate merge
+_IMDB_RE = re.compile(r"^tt\d+$", re.I)
+
+
+def _check_kind(kind: Any, allow_none: bool = False) -> Optional[str]:
+    k = str(kind or "").strip().lower()
+    k = {"film": "movie", "movies": "movie", "serie": "show", "série": "show", "tv": "show",
+         "series": "show", "séries": "show"}.get(k, k)
+    if not k and allow_none:
+        return None
+    if k not in ("movie", "show"):
+        raise ValueError("Type invalide : %s (film « movie » ou série « show »)" % (kind or "vide"))
+    return k
+
+
+def _check_year(year: Any) -> Optional[int]:
+    if year in (None, ""):
+        return None
+    try:
+        y = int(str(year).strip())
+    except (TypeError, ValueError):
+        raise ValueError("Année invalide : %s" % year)
+    if not 1870 <= y <= 2200:
+        raise ValueError("Année invalide : %s" % year)
+    return y
+
+
+def _clean_fields(data: Any) -> Dict[str, Any]:
+    """Validated copy of a candidate / manual entry. Raises ValueError (French message)."""
+    if not isinstance(data, dict):
+        raise ValueError("Entrée invalide : un objet {type, title, ...} est attendu")
+    title = " ".join(str(data.get("title") or "").split())
+    if not title:
+        raise ValueError("Le titre est obligatoire")
+    out = {"type": _check_kind(data.get("type")), "title": title[:300],
+           "year": _check_year(data.get("year"))}  # type: Dict[str, Any]
+    imdb = str(data.get("imdb") or "").strip().lower()
+    if imdb:
+        if imdb.isdigit():
+            imdb = "tt" + imdb
+        if not _IMDB_RE.match(imdb):
+            raise ValueError("Identifiant IMDb invalide : %s (ex. tt0133093)" % data.get("imdb"))
+    out["imdb"] = imdb or None
+    for key, name in (("tmdb", "TMDb"), ("tvdb", "TVDB")):
+        val = str(data.get(key) or "").strip()
+        if val and not val.isdigit():
+            raise ValueError("Identifiant %s invalide : %s" % (name, val))
+        out[key] = val or None
+    rk = str(data.get("rating_key") or "").strip()
+    if rk and (rk.startswith("local:") or not re.match(r"^[A-Za-z0-9_.-]{1,100}$", rk)):
+        raise ValueError("Identifiant Plex invalide : %s" % rk)
+    out["rating_key"] = rk or None
+    orig = " ".join(str(data.get("original_title") or "").split())
+    out["original_title"] = orig if orig and orig != title else None
+    return out
+
+
+def _merge_candidates(plex: List[Dict[str, Any]], tmdb: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Plex candidates first (they can join the Plex Watchlist); a TMDb result describing the same title
+    (same tmdb/imdb id, or same type + title + year when Plex gave no id) only completes it."""
+    from .parser import normalize_title
+    out = [dict(c) for c in plex]
+    for t in tmdb:
+        match = None
+        for c in out:
+            if c.get("source") != "plex" or c.get("type") != t.get("type"):
+                continue
+            if (t.get("tmdb") and c.get("tmdb") == t.get("tmdb")) or \
+                    (t.get("imdb") and c.get("imdb") == t.get("imdb")):
+                match = c
+                break
+            if not c.get("tmdb") and not c.get("imdb"):
+                names = {normalize_title(c.get("title") or ""), normalize_title(c.get("original_title") or "")}
+                same_title = normalize_title(t.get("title") or "") in names or \
+                    (t.get("original_title") and normalize_title(t["original_title"]) in names)
+                if same_title and (not c.get("year") or not t.get("year") or abs(c["year"] - t["year"]) <= 1):
+                    match = c
+                    break
+        if match is None:
+            out.append(dict(t))
+            continue
+        for key in ("tmdb", "imdb", "tvdb", "year", "overview", "poster_url", "original_title"):
+            if not match.get(key) and t.get(key):
+                match[key] = t[key]
+    return out
+# ---- end watchlist add/delete helpers
 
 
 class App:
@@ -613,10 +854,12 @@ class App:
             job.emit("warn", "Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
         report = self.searcher.search_report(req)
         job.private["releases"] = [rel for rel, _score, _reason in report]
+        prios = self.indexer_manager.priorities()
         results = []
         for i, (rel, score, reason) in enumerate(report[:200]):
             results.append({"index": i, "title": rel.title, "size": rel.size or 0, "seeders": rel.seeders,
-                            "leechers": rel.leechers, "indexer": rel.indexer, "score": score, "reason": reason})
+                            "leechers": rel.leechers, "indexer": rel.indexer, "priority": prios.get(rel.indexer),
+                            "score": score, "reason": reason})
         accepted = sum(1 for _r, score, _x in report if score is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(report), accepted))
         return {"query": query, "request": req.describe(), "kind": req.kind, "total": len(report),
@@ -672,6 +915,288 @@ class App:
         if media is not None:
             msg += " (associé à « %s »)" % media["title"]
         return {"ok": True, "message": msg, "media_id": media["id"] if media else None}
+
+    # ------------------------------------- téléchargements en cours / changer de source (onglet Watchlist)
+    DOWNLOADS_CACHE_SECONDS = 5.0     # l'interface se rafraîchit toutes les 5 à 15 s : DSM n'est pas sollicité plus
+    DOWNLOADS_ERROR_CACHE_SECONDS = 30.0
+    _dl_lock = threading.Lock()
+    _dl_cache = None  # type: Optional[Tuple[Any, float, Optional[List[Any]], Optional[str]]]
+
+    def invalidate_downloads(self) -> None:
+        self._dl_cache = None
+
+    def _ds_tasks(self, force: bool = False) -> Tuple[Optional[List[Any]], Optional[str]]:
+        """(tâches Download Station, avertissement) avec un cache court. tâches None = DS indisponible."""
+        if self.ds is None:
+            return None, "Download Station n'est pas configuré : progression des téléchargements indisponible"
+        with self._dl_lock:
+            cache = self._dl_cache
+            if cache is not None and cache[0] is self.ds and not force:
+                ttl = self.DOWNLOADS_CACHE_SECONDS if cache[3] is None else self.DOWNLOADS_ERROR_CACHE_SECONDS
+                if time.time() - cache[1] < ttl:
+                    return cache[2], cache[3]
+            ds = self.ds
+            try:
+                tasks = list(ds.list_tasks() or [])  # type: Optional[List[Any]]
+                warning = None  # type: Optional[str]
+            except Exception as exc:
+                log.debug("Download Station injoignable pour la progression : %s", exc)
+                tasks, warning = None, "Download Station injoignable : %s" % exc
+            self._dl_cache = (ds, time.time(), tasks, warning)
+            return tasks, warning
+
+    @staticmethod
+    def _download_entry(g: Dict[str, Any], task: Any, medias: Dict[int, Dict[str, Any]],
+                        ds_known: bool) -> Dict[str, Any]:
+        media = medias.get(g.get("media_id") or -1) or {}
+        d = {"grab_id": g["id"], "media_id": g.get("media_id"), "media_title": media.get("title"),
+             "media_type": media.get("type"), "release_title": g.get("release_title"), "season": g.get("season"),
+             "episode": g.get("episode"), "indexer": g.get("indexer"), "grab_status": g.get("status"),
+             "created_at": g.get("created_at"), "status": "inconnu", "active": False, "progress": None,
+             "size": g.get("size") or 0, "downloaded": None, "uploaded": None, "speed_down": None,
+             "speed_up": None, "seeders": None, "leechers": None, "peers": None, "eta_seconds": None,
+             "task_id": None, "error": g.get("message") if g.get("status") == "failed" else None}
+        if g.get("status") == "failed":
+            d["status"] = "failed"
+            return d
+        if task is None:
+            if ds_known:
+                d["status"] = "introuvable"
+            return d
+        size = int(task.size or 0) or int(g.get("size") or 0)
+        downloaded = int(task.downloaded or 0)
+        speed = task.speed_down
+        eta = None
+        if speed and speed > 0 and size > downloaded and task.status == "downloading":
+            eta = int((size - downloaded) / speed)
+        d.update({"status": task.status, "progress": round(task.progress, 1), "size": size,
+                  "downloaded": downloaded, "uploaded": task.uploaded, "speed_down": speed,
+                  "speed_up": task.speed_up, "seeders": task.seeders, "leechers": task.leechers,
+                  "peers": task.peers, "eta_seconds": eta, "task_id": task.id, "error": task.error,
+                  "active": task.status in ACTIVE_DS_STATUSES})
+        return d
+
+    def _relevant_failed(self, sent: List[Dict[str, Any]], medias: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Derniers échecs encore utiles à afficher (élément toujours recherché, aucun autre envoi en cours)."""
+        out, seen = [], set()
+        wanted_eps = {}  # type: Dict[int, List[Dict[str, Any]]]
+        for g in self.db.list_grabs(status="failed", limit=200):
+            media = medias.get(g.get("media_id") or -1)
+            key = (g.get("media_id"), g.get("season"), g.get("episode"))
+            if media is None or key in seen:
+                continue
+            seen.add(key)
+            covered = any(s.get("media_id") == media["id"] and (
+                media["type"] == "movie" or (s.get("season") == g.get("season") and
+                                             (s.get("episode") is None or s.get("episode") == g.get("episode"))))
+                for s in sent)
+            if covered or media.get("status") == "ignored":
+                continue
+            if media["type"] == "movie":
+                if media.get("status") != "wanted":
+                    continue
+            else:
+                if g.get("season") is None:
+                    continue
+                if media["id"] not in wanted_eps:
+                    wanted_eps[media["id"]] = self.db.list_episodes(media["id"])
+                eps = [e for e in wanted_eps[media["id"]] if e["season"] == g["season"]
+                       and (g.get("episode") is None or e["episode"] == g["episode"])]
+                if eps and not any(e["status"] == "wanted" for e in eps):
+                    continue
+            out.append(g)
+        return out
+
+    def downloads_status(self, force: bool = False) -> Dict[str, Any]:
+        """Téléchargements envoyés (grabs « sent ») avec leur progression Download Station, plus les échecs
+        récents encore recherchés. Ne lève pas : DS injoignable -> statut « inconnu » + un avertissement."""
+        from .searcher import TaskIndex
+        tasks, warning = self._ds_tasks(force)
+        index = TaskIndex(tasks) if tasks is not None else None
+        medias = {m["id"]: m for m in self.db.list_media()}
+        sent = self.db.list_grabs(status="sent", limit=500)
+        items = [self._download_entry(g, index.find(g) if index is not None else None, medias, index is not None)
+                 for g in sent]
+        failed = [self._download_entry(g, None, medias, False) for g in self._relevant_failed(sent, medias)]
+        return {"ok": warning is None, "warning": warning, "items": items, "failed": failed,
+                "active": sum(1 for d in items if d["active"]), "updated_at": now_iso()}
+
+    @staticmethod
+    def _target_label(media: Dict[str, Any], season: Optional[int], episode: Optional[int]) -> str:
+        label = media["title"]
+        if season is not None and episode is not None:
+            label += " S%02dE%02d" % (season, episode)
+        elif season is not None:
+            label += " saison %d" % season
+        return label
+
+    def _source_target(self, media_id: Any, season: Any, episode: Any) -> Tuple[Dict[str, Any], Optional[int],
+                                                                                Optional[int]]:
+        try:
+            media = self.db.get_media(int(media_id))
+        except (TypeError, ValueError):
+            media = None
+        if media is None:
+            raise ValueError("Élément de la Watchlist introuvable : %s" % media_id)
+        if media["type"] == "movie":
+            return media, None, None
+        values = []
+        for name, v in (("saison", season), ("épisode", episode)):
+            if v in (None, ""):
+                values.append(None)
+                continue
+            try:
+                n = int(v) if not isinstance(v, bool) else -1
+            except (TypeError, ValueError):
+                n = -1
+            if n < 0 or n > 10000:
+                raise ValueError("Numéro de %s invalide : %s" % (name, v))
+            values.append(n)
+        if values[0] is None:
+            raise ValueError("Précisez la saison (et l'épisode) de la série")
+        return media, values[0], values[1]
+
+    def start_source_search(self, media_id: Any, season: Any = None, episode: Any = None) -> Tuple[Job, bool]:
+        """Recherche de toutes les sources (acceptées ET rejetées) pour exactement ce film / cette saison / cet
+        épisode, dans une tâche (GET /api/jobs/<id>). Lève ValueError."""
+        media, season, episode = self._source_target(media_id, season, episode)
+        req = self.searcher.request_for(media, season, episode)
+        target = (media["id"], season, episode)
+
+        def prepare(job: Job) -> None:
+            job.private["target"] = target
+        return self._start_job("sources", "Sources : %s" % self._target_label(media, season, episode),
+                               "sources:%s:%s:%s" % target, self._cmd_sources, (target, req), True, prepare)
+
+    def _cmd_sources(self, job: Job, target: Tuple[int, Optional[int], Optional[int]], req: Any) -> Dict[str, Any]:
+        job.emit("info", "Recherche : %s (langues : %s)" % (req.describe(), ", ".join(req.languages) or "—"))
+        if not self.db.list_indexers(enabled_only=True):
+            job.emit("warn", "Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
+        report = self.searcher.search_report(req)[:300]
+        prios = self.indexer_manager.priorities()
+        job.private["releases"] = [rel for rel, _s, _r in report]
+        job.private["verdicts"] = [(score, reason) for _rel, score, reason in report]
+        results = []
+        for i, (rel, score, reason) in enumerate(report):
+            results.append({"index": i, "title": rel.title, "size": rel.size or 0, "seeders": rel.seeders,
+                            "leechers": rel.leechers, "indexer": rel.indexer, "priority": prios.get(rel.indexer),
+                            "score": score, "reason": reason, "magnet": bool(rel.magnet),
+                            "torrent": bool(rel.download_url)})
+        accepted = sum(1 for r in results if r["score"] is not None)
+        job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(results), accepted))
+        return {"media_id": target[0], "season": target[1], "episode": target[2], "request": req.describe(),
+                "kind": req.kind, "languages": list(req.languages), "total": len(results), "results": results}
+
+    def replace_source(self, media_id: Any, season: Any = None, episode: Any = None, grab_id: Any = None,
+                       job_id: Any = None, index: Any = None, link: Optional[str] = None,
+                       torrent: Optional[bytes] = None, delete_old: bool = True, blocklist_old: bool = False,
+                       accept_rejected: bool = False) -> Dict[str, Any]:
+        """Envoie une autre source pour un film / une saison / un épisode : résultat de start_source_search
+        (*job_id* + *index*), lien magnet ou URL .torrent (*link*) ou fichier .torrent (*torrent*). L'ancien
+        téléchargement (*grab_id*) passe en échec « remplacé manuellement », sa tâche Download Station est
+        supprimée si *delete_old* et sa release bloquée si *blocklist_old*. Lève ValueError (saisie
+        invalide) ; renvoie {"ok": False, "message"} si l'envoi échoue (l'ancien téléchargement est conservé)."""
+        from . import bencode
+        old = None
+        if grab_id not in (None, ""):
+            try:
+                old = self.db.query_one("SELECT * FROM grabs WHERE id = ?", (int(grab_id),))
+            except (TypeError, ValueError):
+                old = None
+            if old is None or str(old.get("media_id")) != str(media_id):
+                raise ValueError("Téléchargement introuvable pour cet élément (n° %s)" % grab_id)
+            season, episode = old.get("season"), old.get("episode")
+        media, season, episode = self._source_target(media_id, season, episode)
+        chosen = [x for x in (job_id not in (None, ""), bool((link or "").strip()), torrent is not None) if x]
+        if len(chosen) != 1:
+            raise ValueError("Choisissez une seule source : un résultat de la recherche, un lien ou un fichier .torrent")
+        label = self._target_label(media, season, episode)
+        release = None
+        if job_id not in (None, ""):
+            try:
+                job = self.get_job(int(job_id))
+            except (TypeError, ValueError):
+                job = None
+            releases = job.private.get("releases") if job is not None and job.command == "sources" else None
+            if not releases:
+                raise ValueError("Résultats de recherche introuvables : relancez la recherche")
+            if job.private.get("target") != (media["id"], season, episode):
+                raise ValueError("Ces résultats concernent un autre élément : relancez la recherche")
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(releases):
+                raise ValueError("Résultat introuvable (n° %s)" % index)
+            release = releases[index]
+            score, reason = job.private["verdicts"][index]
+            if score is None and not accept_rejected:
+                raise ValueError("Cette release a été rejetée (%s) : confirmez pour l'envoyer quand même" % reason)
+        elif torrent is None:
+            release = self.searcher.release_from_link(link or "", label)
+        else:
+            try:
+                bencode.torrent_info(torrent)
+            except (ValueError, TypeError):
+                raise ValueError("Fichier .torrent invalide (illisible ou ce n'est pas un torrent)")
+        if self.cfg.general.dry_run:
+            if release is not None:
+                self.searcher.grab(release, media, season, episode)  # journalise « [dry-run] »
+            else:
+                self.searcher.grab_torrent_bytes(torrent or b"", media, season, episode)
+            return {"ok": False, "dry_run": True,
+                    "message": "Mode simulation (dry_run) actif : rien n'a été envoyé ni supprimé"}
+        if self.ds is None:
+            raise ValueError("Download Station n'est pas configuré ([downloadstation] username/password)")
+        old_active = old is not None and old.get("status") == "sent"
+        old_task = None
+        if old_active and delete_old:
+            from .searcher import TaskIndex
+            tasks, _warning = self._ds_tasks(force=True)
+            old_task = TaskIndex(tasks).find(old) if tasks is not None else None
+        if old_active:  # libère l'info hash de l'ancien envoi (renvoi du même torrent possible)
+            self.db.set_grab_status(old["id"], "failed", "remplacé manuellement")
+        errors = []  # type: List[str]
+        last_id = (self.db.query_one("SELECT MAX(id) AS m FROM grabs") or {}).get("m") or 0
+        try:
+            if release is not None:
+                ok = self.searcher.grab(release, media, season, episode, error_out=errors)
+            else:
+                ok = self.searcher.grab_torrent_bytes(torrent or b"", media, season, episode, error_out=errors)
+        except BaseException:
+            if old_active:
+                self.db.set_grab_status(old["id"], "sent", old.get("message"))
+            raise
+        if not ok:
+            if old_active:
+                self.db.set_grab_status(old["id"], "sent", old.get("message"))
+            self.invalidate_downloads()
+            return {"ok": False, "message": "Échec de l'envoi à Download Station : %s" % (
+                errors[0] if errors else "voir le journal")}
+        new = self.db.query_one("SELECT * FROM grabs WHERE id > ? ORDER BY id DESC LIMIT 1", (last_id,)) or {}
+        notes = []
+        if old_active and delete_old:
+            if old_task is None:
+                notes.append("ancienne tâche introuvable dans Download Station")
+            else:
+                try:
+                    self.ds.delete_task(old_task.id)
+                    notes.append("ancienne tâche supprimée de Download Station")
+                except Exception as exc:
+                    log.warning("Suppression de la tâche %s impossible : %s", old_task.id, exc)
+                    notes.append("suppression de l'ancienne tâche impossible : %s" % exc)
+        if old is not None and blocklist_old:
+            self.db.block_release(old["release_title"], "remplacé manuellement")
+            notes.append("ancienne release bloquée")
+        if media["type"] == "movie":
+            self.db.execute("UPDATE media SET status = 'grabbed', updated_at = ? WHERE id = ? "
+                            "AND status IN ('wanted', 'grabbed')", (now_iso(), media["id"]))
+        else:
+            self.db.set_episode_status(media["id"], season, episode, "grabbed", only_if=["wanted"])
+        title = new.get("release_title") or (release.title if release is not None else "fichier .torrent")
+        self.db.add_event("grab", "%s pour %s : %s" % (
+            "Source remplacée manuellement" if old is not None else "Source choisie manuellement", label, title))
+        self.invalidate_downloads()
+        msg = "Envoyé à Download Station : %s (%s)" % (title, label)
+        if notes:
+            msg += " — " + ", ".join(notes)
+        return {"ok": True, "message": msg, "grab_id": new.get("id"), "notes": notes}
 
     # ----------------------------------------------------------- Plex login
     def start_plex_login(self) -> Tuple[Job, bool]:
@@ -949,6 +1474,260 @@ class App:
             if isinstance(h, logging.handlers.RotatingFileHandler):
                 return h.baseFilename
         return os.path.join(self.cfg.data_dir, "synoarr.log")
+
+    # ---- watchlist add/delete (API documented at the top of this module)
+    _SEARCH_LIMIT = 30
+
+    def search_titles(self, query: str, kind: Optional[str] = None, year: Any = None) -> Dict[str, Any]:
+        """Candidats à ajouter : recherche Plex discover + TMDb, fusionnés. Ne lève que ValueError (saisie)."""
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("Saisissez un titre à rechercher")
+        kind = _check_kind(kind, allow_none=True)
+        year = _check_year(year)
+        warnings = []  # type: List[str]
+        plex_cands = []  # type: List[Dict[str, Any]]
+        if self.plex is None:
+            warnings.append("Plex non configuré : résultats TMDb uniquement (ajout en entrée locale)")
+        else:
+            try:
+                plex_cands = self.plex.search(query, kind)
+            except Exception as exc:
+                log.warning("Recherche Plex impossible pour « %s » : %s", query, exc)
+                warnings.append("Recherche Plex impossible : %s" % exc)
+        if year:
+            plex_cands = [c for c in plex_cands if not c.get("year") or abs(int(c["year"]) - year) <= 1]
+        tmdb_cands = []  # type: List[Dict[str, Any]]
+        if self.tmdb is not None and self.tmdb.enabled:
+            try:
+                tmdb_cands = self.tmdb.search_multi(query, kind, year)
+            except Exception as exc:  # pragma: no cover - search_multi never raises
+                warnings.append("Recherche TMDb impossible : %s" % exc)
+        elif not plex_cands and self.plex is None:
+            warnings.append("Ni Plex ni TMDb ([tmdb] api_key) ne sont configurés : utilisez l'ajout manuel")
+        results = _merge_candidates(plex_cands, tmdb_cands)[:self._SEARCH_LIMIT]
+        for c in results:
+            existing = self._find_existing(c)
+            visible = bool(existing) and not existing.get("hidden") and bool(existing.get("on_watchlist"))
+            c["in_watchlist"] = visible
+            c["media_id"] = existing["id"] if visible else None
+        return {"query": query, "results": results, "warnings": warnings}
+
+    def _find_existing(self, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        row = None
+        if fields.get("rating_key"):
+            row = self.db.get_media_by_key(str(fields["rating_key"]))
+        if row is None:
+            row = self.db.find_media_by_ids(fields.get("type"), fields.get("imdb"), fields.get("tmdb"),
+                                            fields.get("tvdb"))
+        return row
+
+    def add_to_watchlist(self, candidate: Dict[str, Any], add_to_plex: bool = True) -> Dict[str, Any]:
+        """Ajoute un candidat (search_titles) ou des champs saisis. Retourne la ligne media + "plex_added",
+        "already_present", "warning". Lève ValueError (saisie invalide)."""
+        f = _clean_fields(candidate)
+        warning = None  # type: Optional[str]
+        plex_added = None  # type: Optional[bool]
+        rk = f.get("rating_key")
+        label = "%s%s" % (f["title"], " (%s)" % f["year"] if f.get("year") else "")
+
+        def plex_add(key: str) -> Optional[str]:
+            """None when added to the Plex Watchlist, else a French warning."""
+            if self.plex is None:
+                return "Plex non configuré : « %s » est suivi en entrée locale (hors Watchlist Plex)" % label
+            try:
+                self.plex.add_to_watchlist(key)
+                return None
+            except Exception as exc:
+                log.warning("Ajout de « %s » à la Watchlist Plex impossible : %s", label, exc)
+                return ("Ajout à la Watchlist Plex impossible (%s) : « %s » est suivi en entrée locale"
+                        % (exc, label))
+
+        if f.get("tmdb") and not f.get("imdb") and self.tmdb is not None and self.tmdb.enabled:
+            # IMDb/TVDB ids: better indexer searches and no duplicate of an entry known by its IMDb id
+            try:
+                for k, v in self.tmdb.external_ids(f["tmdb"], f["type"]).items():
+                    if not f.get(k):
+                        f[k] = v
+            except Exception as exc:  # pragma: no cover - never raises
+                log.debug("Identifiants TMDb indisponibles : %s", exc)
+        existing = self._find_existing(f)
+        if existing is not None:
+            is_local = str(existing["plex_key"]).startswith("local:")
+            plex_key = rk or (None if is_local else existing["plex_key"])
+            changed = bool(existing.get("hidden")) or existing["status"] == "ignored"
+            if existing.get("hidden"):
+                self.db.set_media_hidden(existing["id"], False)  # still in the Plex Watchlist (or local)
+            elif not existing.get("on_watchlist") or (is_local and rk and add_to_plex):
+                changed = True
+                # off the Plex Watchlist, or a local entry that can now join it
+                if plex_key and add_to_plex:
+                    warning = plex_add(plex_key)
+                    plex_added = warning is None
+                if plex_added:
+                    self.db.set_media_key(existing["id"], plex_key)
+                elif not is_local:
+                    self.db.set_media_key(existing["id"], self._local_key(f))
+                else:
+                    self.db.execute("UPDATE media SET on_watchlist = 1 WHERE id = ?", (existing["id"],))
+            if existing["status"] == "ignored":
+                self.db.set_media_status(existing["id"], "wanted" if existing["type"] == "movie" else "monitored")
+            if changed:
+                self.db.add_event("watchlist", "Réactivé : %s" % label)
+            row = self.db.get_media(existing["id"]) or existing
+            row.update({"plex_added": plex_added, "already_present": True, "warning": warning})
+            return row
+
+        media = None  # type: Optional[Dict[str, Any]]
+        if rk and add_to_plex:
+            warning = plex_add(rk)
+            plex_added = warning is None
+            if plex_added:
+                from .models import WatchItem
+                guids = {k: f[k] for k in ("imdb", "tmdb", "tvdb") if f.get(k)}
+                item = WatchItem(rating_key=rk, type=f["type"], title=f["title"], year=f.get("year"), guids=guids,
+                                 original_title=f.get("original_title"))
+                try:
+                    media = self.searcher.sync_plex_item(item)
+                except Exception as exc:
+                    log.warning("Import de « %s » incomplet (%s) : la prochaine synchronisation le terminera",
+                                label, exc)
+                if media is None:
+                    mid = self.db.upsert_media(rk, f["type"], f["title"], f.get("year"), f.get("imdb"),
+                                               f.get("tmdb"), f.get("tvdb"), f.get("original_title"))
+                    media = self.db.get_media(mid)
+                self.db.add_event("watchlist", "Ajouté à la Watchlist Plex : %s" % label)
+        if media is None:
+            media = self._add_local(f, label)
+        assert media is not None
+        row = self.db.get_media(media["id"]) or media
+        row.update({"plex_added": plex_added, "already_present": False, "warning": warning})
+        return row
+
+    def _local_key(self, f: Dict[str, Any]) -> str:
+        """plex_key of a local entry: "local:tmdb:<type>:<id>", "local:imdb:<tt>" or "local:<uuid>"."""
+        key = None
+        if f.get("tmdb"):
+            key = "local:tmdb:%s:%s" % (f["type"], f["tmdb"])
+        elif f.get("imdb"):
+            key = "local:imdb:%s" % f["imdb"]
+        if key is None or self.db.get_media_by_key(key) is not None:
+            key = "local:" + uuid.uuid4().hex
+        return key
+
+    def _add_local(self, f: Dict[str, Any], label: str) -> Optional[Dict[str, Any]]:
+        key = self._local_key(f)
+        mid = self.db.upsert_media(key, f["type"], f["title"], f.get("year"), f.get("imdb"), f.get("tmdb"),
+                                   f.get("tvdb"), f.get("original_title"))
+        self.db.add_event("watchlist", "Ajouté manuellement (entrée locale) : %s" % label)
+        media = self.db.get_media(mid)
+        if media is not None:
+            try:
+                self.searcher.sync_local_item(media)
+            except Exception as exc:
+                log.warning("Détails de « %s » indisponibles pour l'instant (%s)", label, exc)
+        return media
+
+    def add_manual(self, type_: str, title: str, year: Any = None, imdb: Optional[str] = None,
+                   tmdb: Optional[str] = None) -> Dict[str, Any]:
+        """Entrée locale saisie à la main (sans recherche). Lève ValueError."""
+        return self.add_to_watchlist({"type": type_, "title": title, "year": year, "imdb": imdb, "tmdb": tmdb},
+                                     add_to_plex=False)
+
+    def remove_from_watchlist(self, media_id: Any, remove_from_plex: bool = True,
+                              delete_downloads: bool = False) -> Dict[str, Any]:
+        """Retire une entrée. Retourne {"removed", "plex_removed", "warning", "downloads_deleted"}.
+        Lève ValueError si l'entrée n'existe pas."""
+        try:
+            media = self.db.get_media(int(media_id))
+        except (TypeError, ValueError):
+            media = None
+        if media is None:
+            raise ValueError("Élément introuvable : %s" % media_id)
+        label = "%s%s" % (media["title"], " (%s)" % media["year"] if media.get("year") else "")
+        warnings = []  # type: List[str]
+        deleted = 0
+        if delete_downloads:
+            deleted, ds_warning = self._delete_media_downloads(media)
+            if ds_warning:
+                warnings.append(ds_warning)
+        is_local = str(media["plex_key"]).startswith("local:")
+        plex_removed = None  # type: Optional[bool]
+        keep_hidden = False
+        if not is_local and media.get("on_watchlist"):
+            if not remove_from_plex:
+                keep_hidden = True
+                warnings.append("« %s » reste dans votre Watchlist Plex : il est masqué et ignoré par synoarr "
+                                "(retirez-le aussi de la Watchlist Plex pour l'oublier définitivement)" % label)
+            elif self.plex is None:
+                keep_hidden = True
+                plex_removed = False
+                warnings.append("Plex non configuré : « %s » reste dans votre Watchlist Plex, il est masqué et "
+                                "ignoré par synoarr" % label)
+            else:
+                try:
+                    self.plex.remove_from_watchlist(media["plex_key"])
+                    plex_removed = True
+                except Exception as exc:
+                    log.warning("Retrait de « %s » de la Watchlist Plex impossible : %s", label, exc)
+                    plex_removed = False
+                    keep_hidden = True
+                    warnings.append("Retrait de la Watchlist Plex impossible (%s) : « %s » y reste, il est masqué "
+                                    "et ignoré par synoarr (retirez-le de la Watchlist Plex depuis Plex)"
+                                    % (exc, label))
+        if keep_hidden:
+            self.db.set_media_status(media["id"], "ignored")
+            self.db.set_media_hidden(media["id"], True)
+        else:
+            self.db.delete_media(media["id"])
+        self.db.add_event("watchlist", "Retiré de la Watchlist : %s%s" % (
+            label, " (retiré de Plex)" if plex_removed else ""))
+        return {"removed": True, "plex_removed": plex_removed, "warning": " ; ".join(warnings) or None,
+                "downloads_deleted": deleted}
+
+    def _delete_media_downloads(self, media: Dict[str, Any]) -> Tuple[int, Optional[str]]:
+        """Supprime les tâches Download Station des envois en cours de *media* (jamais de fichier de la
+        bibliothèque). Retourne (nombre de tâches supprimées, avertissement)."""
+        from .parser import normalize_title
+        from .searcher import _fold, _strip_torrent_ext
+        grabs = self.db.query("SELECT * FROM grabs WHERE media_id = ? AND status = 'sent'", (media["id"],))
+        if not grabs:
+            return 0, None
+        if self.ds is None:
+            return 0, "Download Station non configuré : téléchargements en cours non supprimés"
+        try:
+            tasks = self.ds.list_tasks()
+        except Exception as exc:
+            return 0, "Download Station injoignable (%s) : téléchargements en cours non supprimés" % exc
+        by_title, by_norm = {}, {}  # type: Dict[str, Any], Dict[str, Any]
+        for t in tasks:
+            by_title.setdefault(_fold(t.title or ""), t)
+            by_norm.setdefault(normalize_title(_strip_torrent_ext(t.title or "")), t)
+        deleted, failed = 0, []  # type: int, List[str]
+        done_ids = set()
+        for g in grabs:
+            keys = [k for k in (g.get("torrent_name"), g.get("release_title")) if k]
+            task = next((by_title[_fold(k)] for k in keys if _fold(k) in by_title), None)
+            if task is None:
+                task = next((by_norm[normalize_title(_strip_torrent_ext(k))] for k in keys
+                             if normalize_title(_strip_torrent_ext(k)) in by_norm), None)
+            if task is None:
+                continue  # no task (finished and removed?): the organizer may still import it
+            if task.id not in done_ids:
+                try:
+                    self.ds.delete_task(task.id)
+                except Exception as exc:
+                    failed.append("%s (%s)" % (g["release_title"], exc))
+                    continue
+                done_ids.add(task.id)
+                deleted += 1
+            self.db.set_grab_status(g["id"], "failed", "supprimé avec l'entrée")
+        if deleted:
+            self.db.add_event("download", "%d téléchargement(s) supprimé(s) de Download Station avec %s"
+                              % (deleted, media["title"]))
+        warning = ("Suppression impossible dans Download Station : %s" % ", ".join(failed)) if failed else None
+        return deleted, warning
+    # ---- end watchlist add/delete
 
     # --------------------------------------------------------------- daemon
     def stop(self, *_args: Any) -> None:

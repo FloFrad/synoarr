@@ -148,10 +148,12 @@ class World:
                         name = content.split(b"4:name", 1)[1]
                         length, rest = name.split(b":", 1)
                         title = rest[:int(length)].decode()
-                        tid = "dbid_%d" % (len(self.tasks) + 1)
-                        self.tasks[tid] = {"id": tid, "title": title, "status": "downloading", "size": 1000,
-                                           "type": "bt", "additional": {"detail": {"destination": dest},
-                                                                        "transfer": {"size_downloaded": 0}}}
+                        self._new_task(title, dest)
+                if json.loads(params.get("type", '""')) == "url":
+                    from synoarr.bencode import magnet_info
+                    for uri in json.loads(params.get("url", "[]")):
+                        dn, _h = magnet_info(uri)
+                        self._new_task(dn or (_h or uri), dest, uri=uri)
             return 200, {}, {"success": True, "data": {"list_id": [], "task_id": list(self.tasks)[-1:]}}
         if api == "SYNO.DownloadStation.Task" and method == "list":
             with self.lock:
@@ -167,6 +169,19 @@ class World:
         if api == "SYNO.DownloadStation.Info":
             return 200, {}, {"success": True, "data": {"version": 4000, "version_string": "4.0.0"}}
         return 200, {}, {"success": False, "error": {"code": 103}}
+
+    def _new_task(self, title, dest, uri=None):
+        """Download Station task as listed by SYNO.DownloadStation.Task (additional=detail,transfer)."""
+        tid = "dbid_%d" % (len(self.tasks) + len(self.deleted) + 1)
+        detail = {"destination": dest, "connected_seeders": 7, "connected_leechers": 2, "total_peers": 31,
+                  "create_time": 1700000000}
+        if uri:
+            detail["uri"] = uri
+        self.tasks[tid] = {"id": tid, "title": title, "status": "downloading", "size": 1000, "type": "bt",
+                           "additional": {"detail": detail,
+                                          "transfer": {"size_downloaded": 250, "size_uploaded": 10,
+                                                       "speed_download": 50, "speed_upload": 5}}}
+        return tid
 
     def handler(self, req):
         if req.path.startswith("/webapi/"):

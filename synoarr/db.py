@@ -257,13 +257,16 @@ class Database:
     def get_media_by_key(self, plex_key: str) -> Optional[Dict[str, Any]]:
         return self.query_one("SELECT * FROM media WHERE plex_key = ?", (plex_key,))
 
-    def list_media(self, type_: Optional[str] = None, on_watchlist_only: bool = False) -> List[Dict[str, Any]]:
+    def list_media(self, type_: Optional[str] = None, on_watchlist_only: bool = False,
+                   include_hidden: bool = False) -> List[Dict[str, Any]]:
         sql, params = "SELECT * FROM media WHERE 1=1", []  # type: str, List[Any]
         if type_:
             sql += " AND type = ?"
             params.append(type_)
         if on_watchlist_only:
             sql += " AND on_watchlist = 1"
+        if not include_hidden:
+            sql += " AND COALESCE(hidden, 0) = 0"
         return self.query(sql + " ORDER BY added_at DESC", params)
 
     # columns added after 1.0 (ALTER TABLE keeps existing databases working)
@@ -272,6 +275,7 @@ class Database:
         ("genres", "TEXT"),            # comma separated genres from Plex/TMDb
         ("is_animation", "INTEGER"),   # 1 = animated (languages_animation applies), NULL = unknown
         ("language_override", "TEXT"), # manual languages for this item, e.g. "fr" or "en,fr"
+        ("hidden", "INTEGER"),         # 1 = removed by the user but still in the Plex Watchlist (kept hidden)
     )
 
     def _migrate(self) -> None:
@@ -324,12 +328,59 @@ class Database:
         self.execute("UPDATE media SET last_search_at = ? WHERE id = ?", (now_iso(), media_id))
 
     def mark_off_watchlist(self, keep_keys: Iterable[str]) -> None:
+        """Plex items missing from *keep_keys* leave the watchlist. Local entries ("local:...") are never
+        touched: they are not in the Plex Watchlist."""
         keys = list(keep_keys)
+        local = " AND plex_key NOT LIKE 'local:%'"
         if keys:
             placeholders = ",".join("?" * len(keys))
-            self.execute("UPDATE media SET on_watchlist = 0 WHERE plex_key NOT IN (%s)" % placeholders, keys)
+            self.execute("UPDATE media SET on_watchlist = 0 WHERE plex_key NOT IN (%s)%s" % (placeholders, local),
+                         keys)
         else:
-            self.execute("UPDATE media SET on_watchlist = 0")
+            self.execute("UPDATE media SET on_watchlist = 0 WHERE 1=1" + local)
+
+    # ---- watchlist add/delete
+    def find_media_by_ids(self, type_: Optional[str], imdb: Optional[str] = None, tmdb: Optional[str] = None,
+                          tvdb: Optional[str] = None, include_hidden: bool = True) -> Optional[Dict[str, Any]]:
+        """Media row sharing one external id (imdb, then tmdb, then tvdb) with the same type, or None."""
+        for col, value in (("imdb", imdb), ("tmdb", tmdb), ("tvdb", tvdb)):
+            if not value:
+                continue
+            sql = "SELECT * FROM media WHERE %s = ?" % col
+            params = [str(value)]  # type: List[Any]
+            if type_:
+                sql += " AND type = ?"
+                params.append(type_)
+            if not include_hidden:
+                sql += " AND COALESCE(hidden, 0) = 0"
+            row = self.query_one(sql + " ORDER BY id LIMIT 1", params)
+            if row:
+                return row
+        return None
+
+    def list_local_media(self) -> List[Dict[str, Any]]:
+        """Entries added by hand in synoarr (not in the Plex Watchlist), visible ones only."""
+        return self.query("SELECT * FROM media WHERE plex_key LIKE 'local:%' AND COALESCE(hidden, 0) = 0 "
+                          "ORDER BY id")
+
+    def set_media_hidden(self, media_id: int, hidden: bool) -> None:
+        self.execute("UPDATE media SET hidden = ?, updated_at = ? WHERE id = ?",
+                     (1 if hidden else None, now_iso(), media_id))
+
+    def set_media_key(self, media_id: int, plex_key: str) -> None:
+        self.execute("UPDATE media SET plex_key = ?, on_watchlist = 1, updated_at = ? WHERE id = ?",
+                     (plex_key, now_iso(), media_id))
+
+    def delete_media(self, media_id: int) -> int:
+        """Delete a media row: its episodes go with it (ON DELETE CASCADE), its grabs stay in the history
+        with media_id NULL (ON DELETE SET NULL)."""
+        return self.execute("DELETE FROM media WHERE id = ?", (media_id,))
+
+    def purge_hidden_off_watchlist(self) -> int:
+        """Hidden Plex entries that the Plex Watchlist no longer returns are deleted for good."""
+        return self.execute("DELETE FROM media WHERE COALESCE(hidden, 0) = 1 AND on_watchlist = 0 "
+                            "AND plex_key NOT LIKE 'local:%'")
+    # ---- end watchlist add/delete
 
     # ------------------------------------------------------------ episodes
     def upsert_episode(self, media_id: int, season: int, episode: int, title: Optional[str],

@@ -473,3 +473,117 @@ class LanguageAndCollectionTests(SearcherTestBase):
         self.assertTrue(self.searcher._movie_in_library("Aliens", 1986))
         self.assertTrue(self.searcher._movie_in_library("Heat", 1995))
         self.assertFalse(self.searcher._movie_in_library("Alien", 1979))
+
+
+class ManualSourceTests(SearcherTestBase):
+    MAGNET = "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01&dn=Heat.1995.1080p.BluRay-MAN"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.m = self.media("m1")
+
+    def test_release_from_link_validation(self) -> None:
+        r = Searcher.release_from_link(self.MAGNET, "Heat")
+        self.assertEqual((r.title, r.indexer, r.info_hash), ("Heat.1995.1080p.BluRay-MAN", "manuel",
+                                                             "abcdef0123456789abcdef0123456789abcdef01"))
+        r = Searcher.release_from_link("magnet:?xt=urn:btih:" + "a" * 40, "Heat")
+        self.assertEqual(r.title, "Heat (lien manuel)")
+        r = Searcher.release_from_link("https://site.example/dl/Heat%201995.torrent?passkey=SECRET", "Heat")
+        self.assertEqual((r.title, r.download_url is not None), ("Heat 1995", True))
+        self.assertNotIn("SECRET", r.title)
+        r = Searcher.release_from_link("http://site.example/get?id=4", "Heat")
+        self.assertEqual(r.title, "Heat (lien manuel)")
+        for bad in ("", "magnet:?dn=x&xt=urn:btih:" + "a" * 40, "magnet:?xt=urn:btih:zz", "ftp://x/y.torrent",
+                    "https://", "javascript:alert(1)", "http://a b/c"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    Searcher.release_from_link(bad)
+
+    def test_grab_manual_magnet_and_url(self) -> None:
+        rel = Searcher.release_from_link(self.MAGNET, "Heat")
+        self.assertTrue(self.searcher.grab(rel, self.m, None, None))
+        self.assertEqual(self.ds.added, [self.MAGNET])
+        g = self.db.list_grabs()[0]
+        self.assertEqual((g["indexer"], g["info_hash"], g["media_id"]),
+                         ("manuel", "abcdef0123456789abcdef0123456789abcdef01", self.m["id"]))
+        errors = []  # type: List[str]
+        self.assertFalse(self.searcher.grab(rel, self.m, None, None, error_out=errors))
+        self.assertIn("déjà été envoyé", errors[0])
+        url = Searcher.release_from_link("http://idx/dl/Heat.1995.720p.WEB-DL.torrent", "Heat")
+        self.assertTrue(self.searcher.grab(url, self.m, None, None))
+        self.assertEqual(self.ds.added[-1], "Heat.1995.720p.WEB-DL")
+
+    def test_broken_manual_link_is_not_blocklisted(self) -> None:
+        url = Searcher.release_from_link("http://idx/dl/x.torrent", "Heat")
+        self.http.status["http://idx/dl/x.torrent"] = 404
+        errors = []  # type: List[str]
+        self.assertFalse(self.searcher.grab(url, self.m, None, None, error_out=errors))
+        self.assertIn("404", errors[0])
+        self.assertFalse(self.db.is_blocked(url.title))
+
+    def test_grab_torrent_bytes(self) -> None:
+        data = torrent("Heat.1995.1080p.BluRay.x264-UP")
+        errors = []  # type: List[str]
+        self.assertTrue(self.searcher.grab_torrent_bytes(data, self.m, None, None, error_out=errors), errors)
+        self.assertEqual(self.ds.added, ["Heat.1995.1080p.BluRay.x264-UP"])
+        g = self.db.list_grabs()[0]
+        self.assertEqual((g["release_title"], g["torrent_name"], g["indexer"], g["size"]),
+                         ("Heat.1995.1080p.BluRay.x264-UP", "Heat.1995.1080p.BluRay.x264-UP", "manuel", 1000))
+        self.assertFalse(self.searcher.grab_torrent_bytes(data, self.m, None, None, error_out=errors))
+        self.assertIn("déjà", errors[-1])
+        with self.assertRaises(ValueError):
+            self.searcher.grab_torrent_bytes(b"<html>nope</html>", self.m, None, None)
+        self.ds.fail_add = DownloadStationError("Dossier de destination introuvable")
+        self.assertFalse(self.searcher.grab_torrent_bytes(torrent("Other"), self.m, None, None, error_out=errors))
+        self.assertIn("destination", errors[-1])
+
+    def test_grab_torrent_bytes_dry_run(self) -> None:
+        self.cfg.general.dry_run = True
+        errors = []  # type: List[str]
+        self.assertFalse(self.searcher.grab_torrent_bytes(torrent("Heat.1995"), self.m, None, None, errors))
+        self.assertIn("simulation", errors[0])
+        self.assertEqual(self.ds.added, [])
+
+    def test_request_for(self) -> None:
+        req = self.searcher.request_for(self.m)
+        self.assertEqual((req.kind, req.title, req.year, req.languages), ("movie", "Heat", 1995, ["en", "fr"]))
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-10))])
+        self.searcher.sync_watchlist()
+        show = self.media("s1")
+        self.assertEqual(self.searcher.request_for(show, 1, None).kind, "season")
+        req = self.searcher.request_for(show, 1, 2)
+        self.assertEqual((req.kind, req.season, req.episode), ("episode", 1, 2))
+        with self.assertRaises(ValueError):
+            self.searcher.request_for(show)
+
+    def test_indexer_priority_used_by_the_search(self) -> None:
+        other = FakeIndexer()
+        other.name = "favori"
+        other.priority = 1  # type: ignore[attr-defined]
+        self.idx.priority = 50  # type: ignore[attr-defined]
+        self.idx.add("Heat.1995.1080p.BluRay.x264-MANY", seeders=5000)
+        other.add("Heat.1995.1080p.BluRay.x264-PRIO", seeders=2)
+        self.searcher.indexers_provider = lambda: [self.idx, other]
+        self.searcher.run_once(force=True)
+        self.assertEqual(self.db.list_grabs()[0]["release_title"], "Heat.1995.1080p.BluRay.x264-PRIO")
+        report = self.searcher.search_report(self.searcher.request_for(self.m))
+        self.assertEqual(report[0][0].indexer, "favori")
+
+
+class TaskIndexTests(unittest.TestCase):
+    def test_matching_order(self) -> None:
+        from synoarr.searcher import TaskIndex
+        tasks = [DSTask(id="1", title="Amélie.2001.1080p", status="downloading"),
+                 DSTask(id="2", title="abcdef0123456789abcdef0123456789abcdef01", status="downloading",
+                        info_hash="abcdef0123456789abcdef0123456789abcdef01"),
+                 DSTask(id="3", title="The.Show.S01E01.720p.torrent", status="error")]
+        idx = TaskIndex(tasks)
+        nfd = "Amélie.2001.1080p"
+        self.assertEqual(idx.find({"torrent_name": nfd, "release_title": "x"}).id, "1")
+        self.assertEqual(idx.find({"torrent_name": "Lien manuel", "release_title": "Lien manuel",
+                                   "info_hash": "ABCDEF0123456789ABCDEF0123456789ABCDEF01"}).id, "2")
+        self.assertEqual(idx.find({"torrent_name": None, "release_title": "The Show S01E01 720p"}).id, "3")
+        self.assertIsNone(idx.find({"torrent_name": "", "release_title": "Nothing"}))
+        self.assertIsNone(TaskIndex([DSTask(id="9", title="", status="x")]).find({"release_title": "..."}))
