@@ -1813,24 +1813,24 @@ class App:
             warnings.append("Ni Plex ni TMDb ([tmdb] api_key) ne sont configurés : utilisez l'ajout manuel")
         results = _merge_candidates(plex_cands, tmdb_cands)[:self._SEARCH_LIMIT]
         for c in results:
-            existing = self._find_existing(c)
+            existing = self._find_existing(c, by_title=False)  # ids only: fast (add_to_watchlist also matches titles)
             visible = bool(existing) and not existing.get("hidden") and bool(existing.get("on_watchlist"))
             c["in_watchlist"] = visible
             c["media_id"] = existing["id"] if visible else None
         return {"query": query, "results": results, "warnings": warnings}
 
-    def _find_existing(self, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _find_existing(self, fields: Dict[str, Any], by_title: bool = True) -> Optional[Dict[str, Any]]:
         row = None
         if fields.get("rating_key"):
             row = self.db.get_media_by_key(str(fields["rating_key"]))
         if row is None:
             row = self.db.find_media_by_ids(fields.get("type"), fields.get("imdb"), fields.get("tmdb"),
                                             fields.get("tvdb"))
-        if row is None:
+        if row is None and by_title:
             row = self._find_by_title(fields)
         return row
 
-    def _find_by_title(self, fields: Dict[str, Any], exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    def _find_by_title(self, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Ligne de même type et même titre (titre original compris) qu'un ajout sans correspondance d'id,
         lignes masquées comprises : évite un doublon (et donc un second téléchargement) quand « Dune (2021) »
         venu de Plex est ajouté à la main. Années ±1 si les deux sont connues ; une seule connue : un film
@@ -1844,8 +1844,6 @@ class App:
         year = _to_year(fields.get("year"))
         best = None  # type: Optional[Tuple[Tuple[int, int, int], Dict[str, Any]]]
         for row in self.db.list_media(type_, include_hidden=True):
-            if exclude_id is not None and row["id"] == exclude_id:
-                continue
             if any(fields.get(k) and row.get(k) and str(fields[k]) != str(row[k]) for k in ("imdb", "tmdb", "tvdb")):
                 continue
             alts = [row["original_title"]] if row.get("original_title") else []
