@@ -1,0 +1,77 @@
+# synoarr
+
+Remplaçant léger de **Prowlarr + Radarr + Sonarr + Filebot**, pensé pour un NAS **Synology** :
+
+- **Indexers** torrent légaux : catalogue intégré (Internet Archive) ou n'importe quelle URL **Torznab** / **RSS**.
+- **Watchlist Plex** : chaque film ou série ajouté est recherché automatiquement (épisodes manquants, saisons
+  complètes, nouveaux épisodes).
+- **Download Station** : le meilleur torrent (1080p → 720p, anglais ou français) est envoyé directement.
+- **Renommage façon Filebot** : le dossier `Download` est surveillé, les fichiers terminés sont renommés au format
+  Plex puis déplacés dans `Vidéos/Films` et `Vidéos/Séries`.
+- **Une seule mini interface web** (port 8778) + une ligne de commande complète.
+
+Aucune dépendance : **Python 3.8+ seul** (déjà présent dans DSM 7). Docker possible mais pas obligatoire.
+
+```
+Watchlist Plex ──► recherche indexers ──► Download Station ──► dossier Download
+                                                                     │
+                     Vidéos/Films, Vidéos/Séries ◄── renommage Plex ◄┘
+```
+
+## Installation
+
+Suivez le guide pas à pas : **[docs/INSTALLATION.md](docs/INSTALLATION.md)** (20 à 30 minutes).
+
+Résumé :
+
+```bash
+cd /volume1/docker && wget -O synoarr.tar.gz https://github.com/VOTRE-COMPTE/synoarr/archive/refs/heads/main.tar.gz && tar xzf synoarr.tar.gz && mv synoarr-main synoarr && cd synoarr
+```
+
+```bash
+sudo python3 synoarr.py init
+```
+
+```bash
+sudo python3 synoarr.py plex-login
+```
+
+```bash
+sudo python3 synoarr.py indexer add internet_archive
+```
+
+```bash
+sudo python3 synoarr.py check
+```
+
+```bash
+sudo sh scripts/start.sh
+```
+
+## Format des noms
+
+| Type | Résultat |
+|---|---|
+| Film | `Films/Night of the Living Dead (1968)/Night of the Living Dead (1968).mkv` |
+| Épisode | `Séries/The Office/Season 02/The Office - S02E05.mkv` |
+| Sous-titres | `... - S02E05.fr.srt` |
+
+Modifiable dans `config.ini` (`[naming]`), syntaxe proche de Filebot : `{title}`, `{year}`, `{show}`,
+`{season:02d}`, `{episode:02d}`, `{episode_title}`…
+
+## Développement
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Architecture et contrats internes : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Avertissement
+
+synoarr est un outil d'automatisation générique. Utilisez-le uniquement avec des sources dont vous avez le droit
+de télécharger le contenu (domaine public, licences libres, contenus dont vous détenez les droits).
+
+## Licence
+
+MIT

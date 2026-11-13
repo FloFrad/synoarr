@@ -82,6 +82,11 @@ def _strip_extension(name: str) -> Tuple[str, Optional[str]]:
     if "." in base:
         stem, ext = base.rsplit(".", 1)
         if ext.lower() in KNOWN_EXTENSIONS:
+            # ".TS" is also the telesync tag ("Dune.2021.720p.TS"): only an extension after a group tag
+            # ("...x264-GRP.ts") or when the name has no resolution marker at all
+            if ext.lower() == "ts" and _RE_RESOLUTION.search(stem.replace(".", " ")) and \
+                    not re.search(r"-[A-Za-z0-9]+$", stem):
+                return base, None
             return stem, ext.lower()
     return base, None
 

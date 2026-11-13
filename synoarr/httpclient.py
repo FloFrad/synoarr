@@ -211,6 +211,11 @@ class HttpClient:
             except Exception:  # pragma: no cover - defensive
                 pass
             hdrs = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
+            location = hdrs.get("location", "")
+            if exc.code in (301, 302, 303, 307, 308) and location and \
+                    not location.lower().startswith(("http://", "https://", "/")):
+                # urllib refuses redirects to magnet: & co. -> hand the location to the caller
+                return Response(exc.code, hdrs, content, url, redirect_location=location)
             resp = Response(exc.code, hdrs, content, url)
             if raise_for_status:
                 raise HttpError("HTTP %s pour %s" % (exc.code, redact(url)), exc.code, content, url)

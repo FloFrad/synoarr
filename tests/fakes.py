@@ -52,7 +52,10 @@ class FakeRequest:
             if not part or part == b"--":
                 continue
             head, _, content = part.partition(b"\r\n\r\n")
-            disp = head.decode("utf-8", "replace")
+            disp = ""
+            for line in head.decode("utf-8", "replace").split("\r\n"):
+                if line.lower().startswith("content-disposition"):
+                    disp = line
             name, filename = "", ""
             for item in disp.split(";"):
                 item = item.strip()
@@ -115,7 +118,8 @@ class FakeServer:
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
         self._server.daemon_threads = True
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        kwargs={"poll_interval": 0.05}, daemon=True)
 
     @property
     def url(self) -> str:

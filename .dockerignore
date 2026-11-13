@@ -1,0 +1,7 @@
+.git
+data
+config
+tests
+docs
+*.pid
+__pycache__
