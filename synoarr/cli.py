@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from . import __version__
 from .config import Config, ConfigError, load_config
@@ -154,42 +154,57 @@ def cmd_check(args: argparse.Namespace) -> int:
         if "introuvable" in str(exc):
             _out("      Créez-le avec : " + _command("init"))
         return 2
+    return check_report(cfg, lambda level, msg: _out(_PREFIX[level] + msg))
+
+
+_PREFIX = {"ok": OK, "err": KO, "warn": WARN, "info": ""}
+
+
+def check_report(cfg: Config, emit: Callable[[str, str], None], app: Any = None,
+                 hint: Optional[Callable[[str], str]] = None) -> int:
+    """Vérification complète (commande ``check`` et interface web).
+
+    *emit(level, message)* reçoit chaque ligne, level ∈ "ok" | "err" | "warn" | "info".
+    *app* : App déjà construite (interface web, démon) ; None = en créer une (CLI).
+    *hint(commande)* : comment l'utilisateur lance une commande (CLI : « sudo python3 synoarr.py … »).
+    Retourne le code de sortie de la commande (0 = tout est prêt, 1 = problème(s))."""
+    hint = hint or _cli_hint
     errors = 0
-    _out("synoarr %s — vérification de %s" % (__version__, cfg.path))
-    _out("Python %s" % sys.version.split()[0])
+    emit("info", "synoarr %s — vérification de %s" % (__version__, cfg.path))
+    emit("info", "Python %s" % sys.version.split()[0])
     for p in cfg.validate():
-        _out(KO + p)
+        emit("err", p)
         errors += 1
 
     # data folder (database, log): the most common first-run problem is a root-owned folder
     problem = _check_data_dir(cfg)
     if problem:
-        _out(KO + problem)
-        hint = _sudo_hint()
-        if hint:
-            _out(hint)
-        _out("")
-        _out("Impossible de poursuivre la vérification sans base de données.")
+        emit("err", problem)
+        sudo = _sudo_hint() if app is None else ""
+        if sudo:
+            emit("info", sudo)
+        emit("info", "")
+        emit("info", "Impossible de poursuivre la vérification sans base de données.")
         return 1
-    _out(OK + "Dossier de données : %s" % cfg.data_dir)
+    emit("ok", "Dossier de données : %s" % cfg.data_dir)
 
     # folders
     pc = cfg.paths
     if os.path.isdir(pc.download_dir) and os.access(pc.download_dir, os.R_OK | os.W_OK):
-        _out(OK + "Dossier des téléchargements : %s" % pc.download_dir)
+        emit("ok", "Dossier des téléchargements : %s" % pc.download_dir)
     else:
-        _out(KO + "Dossier des téléchargements introuvable ou non accessible en écriture : %s" % pc.download_dir)
+        emit("err", "Dossier des téléchargements introuvable ou non accessible en écriture : %s" % pc.download_dir)
         errors += 1
     dest = cfg.downloadstation.destination
     norm_dl = os.path.normpath(pc.download_dir).replace("\\", "/")
     if dest and not norm_dl.lower().endswith("/" + dest.lower()):
-        _out(WARN + "[downloadstation] destination = %r mais [paths] download_dir = %r : download_dir doit être "
+        emit("warn", "[downloadstation] destination = %r mais [paths] download_dir = %r : download_dir doit être "
              "le chemin du dossier où Download Station enregistre (ex. destination = Download ↔ download_dir = "
              "/volume1/Download)" % (dest, pc.download_dir))
     for label, d in (("Films", pc.movies_dir), ("Séries", pc.series_dir)):
         share = _share_problem(d)
         if share:  # never create a share root: a typo ("Videos" for "Vidéos") would create a hidden folder
-            _out(KO + share)
+            emit("err", share)
             errors += 1
             continue
         try:
@@ -197,76 +212,85 @@ def cmd_check(args: argparse.Namespace) -> int:
             fd, probe = tempfile.mkstemp(prefix=".synoarr-probe-", dir=d)
             os.close(fd)
             os.remove(probe)
-            _out(OK + "Dossier %s accessible en écriture : %s" % (label, d))
+            emit("ok", "Dossier %s accessible en écriture : %s" % (label, d))
         except OSError as exc:
-            _out(KO + "Dossier %s non accessible en écriture : %s (%s)" % (label, d, exc))
+            emit("err", "Dossier %s non accessible en écriture : %s (%s)" % (label, d, exc))
             errors += 1
     if pc.action == "hardlink":
         try:
             if os.stat(pc.download_dir).st_dev != os.stat(pc.movies_dir).st_dev:
-                _out(WARN + "action = hardlink mais téléchargements et vidéos sont sur des volumes différents : "
+                emit("warn", "action = hardlink mais téléchargements et vidéos sont sur des volumes différents : "
                      "une copie sera faite à la place")
         except OSError:
             pass
 
-    from .app import App, setup_logging
-    cfg.general.log_level = "WARNING"
-    setup_logging(cfg, console=True)
-    app = App(cfg)
+    if app is None:
+        from .app import App, setup_logging
+        cfg.general.log_level = "WARNING"
+        setup_logging(cfg, console=True)
+        app = App(cfg)
 
     # Download Station
     if app.ds is None:
-        _out(KO + "Download Station : [downloadstation] username/password non renseignés")
+        emit("err", "Download Station : [downloadstation] username/password non renseignés")
         errors += 1
     elif not cfg.downloadstation.password:
-        _out(KO + "Download Station : [downloadstation] password est vide")
+        emit("err", "Download Station : [downloadstation] password est vide")
         errors += 1
     else:
         ok, msg = _safe_test(app.ds.test)
-        _out((OK if ok else KO) + "Download Station : " + msg)
+        emit("ok" if ok else "err", "Download Station : " + msg)
         errors += 0 if ok else 1
 
     # Plex
     if app.plex is None:
-        _out(KO + "Plex : aucun jeton. Lancez : " + _command("plex-login"))
+        emit("err", "Plex : aucun jeton. Lancez : " + hint("plex-login"))
         errors += 1
     else:
         ok, msg = _safe_test(app.plex.test)
-        _out((OK if ok else KO) + "Plex : " + msg)
+        emit("ok" if ok else "err", "Plex : " + msg)
         errors += 0 if ok else 1
         if ok:
             try:
                 items = app.plex.watchlist()
-                _out(OK + "Watchlist Plex : %d élément(s)" % len(items))
+                emit("ok", "Watchlist Plex : %d élément(s)" % len(items))
             except Exception as exc:
-                _out(KO + "Watchlist Plex illisible : %s" % exc)
+                emit("err", "Watchlist Plex illisible : %s" % exc)
                 errors += 1
     if cfg.plex.server_url:
-        _out("      Rafraîchissement Plex après import : %s" % cfg.plex.server_url)
+        emit("info", "      Rafraîchissement Plex après import : %s" % cfg.plex.server_url)
 
     # TMDb
-    _out((OK + "TMDb : clé configurée") if app.tmdb.enabled else
-         (WARN + "TMDb : pas de clé (facultatif, améliore le renommage des fichiers inconnus)"))
+    if app.tmdb.enabled:
+        emit("ok", "TMDb : clé configurée")
+    else:
+        emit("warn", "TMDb : pas de clé (facultatif, améliore le renommage des fichiers inconnus)")
 
     # Indexers
     rows = app.indexer_manager.list()
     if not rows:
-        _out(KO + "Aucun indexer. Exemple : " + _command("indexer add internet_archive"))
+        emit("err", "Aucun indexer. Exemple : " + hint("indexer add internet_archive"))
         errors += 1
     for row in rows:
         if not row["enabled"]:
-            _out("      Indexer %s : désactivé" % row["name"])
+            emit("info", "      Indexer %s : désactivé" % row["name"])
             continue
         ok, msg = app.indexer_manager.test(row["id"])
-        _out((OK if ok else KO) + "Indexer %s (%s) : %s" % (row["name"], row["type"], msg))
+        emit("ok" if ok else "err", "Indexer %s (%s) : %s" % (row["name"], row["type"], msg))
         errors += 0 if ok else 1
 
-    _out("")
+    emit("info", "")
     if errors:
-        _out("%d problème(s) à corriger avant de lancer synoarr." % errors)
+        emit("info", "%d problème(s) à corriger avant de lancer synoarr." % errors)
         return 1
-    _out("Tout est prêt. Lancez : " + ("docker restart synoarr" if _in_docker() else "scripts/start.sh (ou " + _command("run") + ")"))
+    emit("info", "Tout est prêt. Lancez : " + hint("run"))
     return 0
+
+
+def _cli_hint(command: str) -> str:
+    if command == "run":
+        return "docker restart synoarr" if _in_docker() else "scripts/start.sh (ou " + _command("run") + ")"
+    return _command(command)
 
 
 def _safe_test(func) -> "tuple":

@@ -2,19 +2,39 @@
 
 Une seule page HTML embarquée (vanilla JS, CSS inline, aucun CDN) et une API JSON sous ``/api``.
 
+Onglets : Tableau de bord, Watchlist, Indexers, Historique, Commandes (toutes les commandes de la CLI, en
+tâches d'arrière-plan suivies par ``GET /api/jobs/<id>``), Journal (``data/synoarr.log``) et Configuration
+(éditeur de ``config.ini`` brut, validé avant remplacement). Tout passe par l'auth Basic et la protection CSRF.
+
 Interface ``App`` attendue (fournie par ``app.py``) ::
 
     class App(Protocol):
         cfg: Config
-        db: Database
+        db: Database                                 # + set_language_override(media_id, "fr" | None)
+        searcher: Searcher                           # facultatif : languages_for(media) -> List[str]
         def run_watchlist_now(self) -> bool          # lance en arrière-plan, retourne tout de suite
                                                      # (False = déjà en cours)
         def run_process_now(self) -> bool            # idem (traitement des téléchargements)
         def search_now(self, media_id: int) -> None  # recherche d'un élément de la Watchlist, en arrière-plan
         def set_media_status(self, media_id: int, status: str) -> None  # "ignored" | "wanted" | "monitored"
         def status(self) -> dict  # JSON : version, started_at, last_watchlist_run, last_process_run,
-                                  #        last_errors (list), dry_run, plex_configured, ds_configured
+                                  #        last_errors (list), dry_run, plex_configured, ds_configured,
+                                  #        restart_required (list), jobs_running (list)
         indexer_manager: IndexerManager
+        # --- onglet Commandes (Job : id, command, label, running, result, to_dict()) ---
+        def start_command(self, command: str, force: bool = False, query: str = "") -> Tuple[Job, bool]
+            # command ∈ sync | search_all | process | dry_run | check | test_indexers | search | plex_login
+            # (tâche, créée) ; créée=False si la même commande tourne déjà. ValueError -> 400
+        def get_job(self, job_id: int) -> Optional[Job]
+        def list_jobs(self) -> List[Job]                       # 20 dernières, la plus récente d'abord
+        def grab_search_result(self, job_id: int, index: int) -> dict   # {"ok", "message"}
+        def start_plex_login(self) -> Tuple[Job, bool]         # job.result = {"code", "url", "linked"}
+        def restart(self) -> None                              # os.execv après la réponse
+        # --- onglets Journal et Configuration ---
+        def log_file(self) -> str
+        def read_config_text(self) -> dict      # {"path", "text", "encoding", "backups", "restart_reasons"}
+        def save_config_text(self, text: str) -> dict          # ConfigInvalid -> 400, BusyError -> 409
+        def restore_config_backup(self) -> dict
 
     class IndexerManager(Protocol):   # les méthodes peuvent lever ValueError (message français) -> HTTP 400
         def list(self) -> List[dict]                 # lignes de la table indexers
@@ -25,7 +45,12 @@ Interface ``App`` attendue (fournie par ``app.py``) ::
         def set_enabled(self, indexer_id: int, enabled: bool) -> None
         def delete(self, indexer_id: int) -> None
 
-Les clés d'API ne sortent jamais de l'API : elles sont remplacées par "••••".
+API ajoutée : ``GET/POST /api/jobs``, ``GET /api/jobs/<id>``, ``POST /api/jobs/<id>/grab``, ``POST /api/plex/login``,
+``POST /api/restart``, ``GET /api/logs?lines=&level=&q=``, ``GET /api/logs/download[?n=1..3]``,
+``GET/POST /api/config``, ``POST /api/config/restore``, ``POST /api/media/<id>/language``.
+
+Les clés d'API ne sortent jamais de l'API indexers/catalogue : elles sont remplacées par "••••". Seul l'onglet
+Configuration montre le vrai fichier (c'est la configuration de l'utilisateur, derrière l'authentification).
 """
 from __future__ import annotations
 
@@ -35,6 +60,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import socket
 import threading
@@ -42,6 +68,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
+from .app import BusyError, ConfigInvalid
 from .httpclient import HttpError, redact
 
 log = logging.getLogger(__name__)
@@ -54,10 +81,63 @@ _SECRET_KEYS = ("api_key", "apikey", "password", "passwd", "token", "passkey")
 class HttpProblem(Exception):
     """Erreur renvoyée telle quelle au client : ``{"error": message}``."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, extra: Optional[Dict[str, Any]] = None):
         Exception.__init__(self, message)
         self.status = status
         self.message = message
+        self.extra = extra or {}
+
+
+class RawResponse(object):
+    """Réponse non JSON (téléchargement du journal)."""
+
+    def __init__(self, data: bytes, ctype: str, headers: Optional[Dict[str, str]] = None):
+        self.data = data
+        self.ctype = ctype
+        self.headers = headers or {}
+
+
+LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_LOG_LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d (DEBUG|INFO|WARNING|ERROR|CRITICAL)\b")
+_LANG_LIST = re.compile(r"^[a-z]{2,6}(,[a-z]{2,6})*\Z")
+
+
+def tail_log(path: str, lines: int = 300, level: str = "DEBUG", text: str = "",
+             max_bytes: int = 1024 * 1024) -> Dict[str, Any]:
+    """Dernières *lines* entrées du journal (niveau minimal *level*, contenant *text*), lues depuis la fin du
+    fichier par blocs croissants (au plus *max_bytes*) : un journal de 2 Mo n'est pas relu en entier à chaque
+    rafraîchissement. Les lignes de suite (traceback) restent attachées à leur entrée."""
+    min_level = LOG_LEVELS.get((level or "DEBUG").upper(), 10)
+    needle = (text or "").strip().lower()
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {"path": path, "exists": False, "size": 0, "lines": [], "matched": 0, "partial": False}
+    chunk = min(max_bytes, max(64 * 1024, lines * 400))
+    while True:
+        start = max(0, size - chunk)
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            data = fh.read(size - start)
+        if start > 0:  # première ligne coupée
+            data = data[data.find(b"\n") + 1:] if b"\n" in data else b""
+        records = []  # type: List[List[str]]
+        for line in data.decode("utf-8", "replace").splitlines():
+            m = _LOG_LINE.match(line)
+            if m:
+                records.append([m.group(1), line])
+            elif records:
+                records[-1][1] += "\n" + line
+            elif line.strip():
+                records.append(["INFO", line])
+        matched = [r for r in records if LOG_LEVELS.get(r[0], 20) >= min_level
+                   and (not needle or needle in r[1].lower())]
+        if len(matched) >= lines or start == 0 or chunk >= max_bytes:
+            break
+        chunk = min(max_bytes, chunk * 4)
+    out = matched[-lines:]
+    return {"path": path, "exists": True, "size": size, "lines": [{"level": lv, "text": tx} for lv, tx in out],
+            "matched": len(matched), "partial": start > 0}
 
 
 def _redact_url(url: Any) -> Any:
@@ -112,6 +192,18 @@ class WebServer:
             ("GET", r"/api/events", self.api_events),
             ("POST", r"/api/run/watchlist", self.api_run_watchlist),
             ("POST", r"/api/run/process", self.api_run_process),
+            ("POST", r"/api/media/(\d+)/language", self.api_media_language),
+            ("GET", r"/api/jobs", self.api_jobs),
+            ("POST", r"/api/jobs", self.api_job_start),
+            ("GET", r"/api/jobs/(\d+)", self.api_job),
+            ("POST", r"/api/jobs/(\d+)/grab", self.api_job_grab),
+            ("POST", r"/api/plex/login", self.api_plex_login),
+            ("POST", r"/api/restart", self.api_restart),
+            ("GET", r"/api/logs", self.api_logs),
+            ("GET", r"/api/logs/download", self.api_logs_download),
+            ("GET", r"/api/config", self.api_config),
+            ("POST", r"/api/config", self.api_config_save),
+            ("POST", r"/api/config/restore", self.api_config_restore),
         ]  # type: List[Tuple[str, str, Any]]
         self._compiled = [(m, re.compile(p + r"/?\Z"), f) for m, p, f in self._routes]
 
@@ -224,8 +316,14 @@ class WebServer:
                 "FROM episodes GROUP BY media_id"):
             summary[r["media_id"]] = {k: int(r[k] or 0) for k in ("total", "done", "grabbed", "wanted")}
         out = []
+        languages_for = getattr(getattr(self.app, "searcher", None), "languages_for", None)
+        default_langs = list(getattr(getattr(self.app.cfg, "quality", None), "languages", []) or [])
         for m in db.list_media():
             m = dict(m)
+            try:
+                m["languages"] = list(languages_for(m)) if languages_for else default_langs
+            except Exception:  # pragma: no cover - never break the list for one item
+                m["languages"] = default_langs
             if m.get("type") == "show":
                 m["episodes"] = summary.get(m["id"], {"total": 0, "done": 0, "grabbed": 0, "wanted": 0})
             out.append(m)
@@ -303,6 +401,120 @@ class WebServer:
             return {"ok": True, "message": "Un traitement des téléchargements est déjà en cours"}
         return {"ok": True, "message": "Traitement des téléchargements lancé"}
 
+    def api_media_language(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        media = self._media_or_404(media_id)
+        raw = self._body_dict(body).get("languages")
+        if raw is None:
+            raw = ""
+        if not isinstance(raw, str):
+            raise HttpProblem(400, "Le champ « languages » doit être une chaîne (ex. \"fr\" ou \"en,fr\")")
+        value = ",".join(x.strip().lower() for x in raw.replace(";", ",").split(",") if x.strip())
+        if value and not _LANG_LIST.match(value):
+            raise HttpProblem(400, "Langues invalides : codes de 2 à 6 lettres séparés par des virgules (ex. en,fr)")
+        self.app.db.set_language_override(media_id, value or None)
+        label = value or "automatique"
+        return {"ok": True, "languages": value, "message": "Langues de « %s » : %s" % (media["title"], label)}
+
+    # ------------------------------------------------------------- commandes
+    @staticmethod
+    def _job_summary(job: Any) -> Dict[str, Any]:
+        d = job.to_dict()
+        d.pop("output", None)
+        d.pop("result", None)
+        return d
+
+    def _job_or_404(self, job_id: int) -> Any:
+        job = self.app.get_job(job_id)
+        if job is None:
+            raise HttpProblem(404, "Tâche introuvable (id %d) : synoarr a peut-être redémarré" % job_id)
+        return job
+
+    def api_jobs(self, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
+        return [self._job_summary(j) for j in self.app.list_jobs()]
+
+    def api_job(self, job_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        return self._job_or_404(job_id).to_dict()
+
+    def api_job_start(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+        command = str(data.get("command") or "")
+        job, created = self.app.start_command(command, force=bool(data.get("force")),
+                                              query=str(data.get("query") or ""))
+        msg = ("« %s » lancé" % job.label) if created else ("« %s » est déjà en cours" % job.label)
+        return {"ok": True, "created": created, "message": msg, "job": job.to_dict()}
+
+    def api_job_grab(self, job_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        self._job_or_404(job_id)
+        index = self._body_dict(body).get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise HttpProblem(400, "Le champ « index » (numéro du résultat) est obligatoire")
+        return self.app.grab_search_result(job_id, index)
+
+    def api_plex_login(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        try:
+            job, created = self.app.start_plex_login()
+        except HttpError as exc:
+            raise HttpProblem(502, "plex.tv injoignable : %s. Vérifiez la connexion Internet du NAS." % exc)
+        result = job.result or {}
+        return {"ok": True, "created": created, "code": result.get("code"), "url": result.get("url"),
+                "message": "Saisissez le code %s sur %s" % (result.get("code"), result.get("url")),
+                "job": job.to_dict()}
+
+    def api_restart(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        running = [j.label for j in self.app.list_jobs() if j.running and j.command != "plex_login"]
+        self.app.restart()
+        msg = "Redémarrage de synoarr…"
+        if running:
+            msg += " (après la fin de : %s)" % ", ".join(running)
+        return {"ok": True, "message": msg}
+
+    def api_logs(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        try:
+            lines = max(1, min(5000, int(query.get("lines", 300))))
+        except ValueError:
+            raise HttpProblem(400, "Paramètre lines invalide")
+        level = (query.get("level") or "DEBUG").upper()
+        if level not in LOG_LEVELS:
+            raise HttpProblem(400, "Niveau invalide : DEBUG, INFO, WARNING ou ERROR")
+        return tail_log(self.app.log_file(), lines, level, query.get("q", ""))
+
+    def api_logs_download(self, query: Dict[str, str], body: Any) -> RawResponse:
+        path = self.app.log_file()
+        n = query.get("n", "")
+        if n:
+            if n not in ("1", "2", "3"):
+                raise HttpProblem(400, "Paramètre n invalide (1 à 3)")
+            path += "." + n
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            raise HttpProblem(404, "Journal introuvable : %s" % os.path.basename(path))
+        name = os.path.basename(path)
+        return RawResponse(data, "text/plain; charset=utf-8",
+                           {"Content-Disposition": 'attachment; filename="%s"' % name})
+
+    def api_config(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = dict(self.app.read_config_text())
+        data["auth_enabled"] = self.auth_enabled
+        return data
+
+    def _config_result(self, out: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(out)
+        new_web = self.app.cfg.web
+        out["auth_enabled"] = self.auth_enabled
+        out["auth_configured"] = bool(new_web.username and new_web.password)
+        return out
+
+    def api_config_save(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        text = self._body_dict(body).get("text")
+        if not isinstance(text, str):
+            raise HttpProblem(400, "Le champ « text » (contenu de config.ini) est obligatoire")
+        return self._config_result(self.app.save_config_text(text))
+
+    def api_config_restore(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        return self._config_result(self.app.restore_config_backup())
+
 
 def _make_handler(server: WebServer) -> type:
     class Handler(BaseHTTPRequestHandler):
@@ -366,11 +578,19 @@ def _make_handler(server: WebServer) -> type:
                 query = dict(urllib.parse.parse_qsl(parts.query))
                 status, payload = server.dispatch(method, path, query, body)
             except HttpProblem as exc:
-                status, payload = exc.status, {"error": exc.message}
+                status, payload = exc.status, dict(exc.extra, error=exc.message)
+            except ConfigInvalid as exc:
+                status, payload = 400, {"error": "config.ini n'a pas été modifié : la configuration contient des "
+                                                 "erreurs", "problems": exc.problems}
+            except BusyError as exc:
+                status, payload = 409, {"error": str(exc)}
             except ValueError as exc:  # erreurs métier (indexer_manager...) en français
                 status, payload = 400, {"error": str(exc)}
             except HttpError as exc:  # indexer injoignable pendant l'ajout (détection du type...)
                 status, payload = 502, {"error": "Service distant injoignable : %s" % exc}
+            if isinstance(payload, RawResponse):
+                self._send(status, payload.data, payload.ctype, payload.headers)
+                return
             self._send(status, payload)
 
         def _same_origin(self) -> bool:
@@ -416,40 +636,47 @@ INDEX_JS = r"""
 const $=s=>document.querySelector(s), app=$('#app');
 const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const LBL={wanted:'Recherché',grabbed:'En téléchargement',done:'Terminé',ignored:'Ignoré',monitored:'Suivi',skipped:'Ignoré',
-  sent:'Envoyé',imported:'Importé',failed:'Échec',movie:'Film',show:'Série',torznab:'Torznab',rss:'RSS',internet_archive:'Internet Archive'};
+  sent:'Envoyé',imported:'Importé',failed:'Échec',movie:'Film',show:'Série',torznab:'Torznab',rss:'RSS',internet_archive:'Internet Archive',
+  running:'En cours',error:'Erreur',planned:'Prévu'};
 const lbl=s=>LBL[s]||s||'';
 const badge=s=>`<span class="b b-${esc(s)}">${esc(lbl(s))}</span>`;
 const yn=v=>v?'<span class="b b-done">Oui</span>':'<span class="b b-failed">Non</span>';
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function fdate(v){if(v==null||v==='')return 'Jamais';
   if(typeof v==='number')return new Date(v*1000).toLocaleString('fr-FR');
   if(typeof v==='object')return Object.values(v).filter(x=>x!=null&&typeof x!=='object').map(fdate).join(' · ');
   return String(v).replace('T',' ').slice(0,19)}
 function size(n){if(!n)return '';const u=['o','Ko','Mo','Go','To'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i>2?1:0)+' '+u[i]}
-let tab=(location.hash||'#dash').slice(1), exp=new Set(), timer=null;
+let tab=(location.hash||'#dash').slice(1), exp=new Set(), timer=null, mounted=null;
 async function api(p,method,body){
   const o={method:method||'GET',headers:{}};
   if(body!==undefined||o.method!=='GET'){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body||{})}
   const r=await fetch('api/'+p,o);let d=null;try{d=await r.json()}catch(e){}
-  if(!r.ok)throw new Error((d&&d.error)||('Erreur HTTP '+r.status));return d}
+  if(!r.ok){const er=new Error((d&&d.error)||('Erreur HTTP '+r.status));er.status=r.status;er.data=d;throw er}return d}
 function toast(msg,bad){const t=$('#toast');t.textContent=msg;t.className='show'+(bad?' bad':'');
-  clearTimeout(t._h);t._h=setTimeout(()=>t.className='',4000)}
+  clearTimeout(t._h);t._h=setTimeout(()=>t.className='',5000)}
 async function act(fn,okMsg){try{const d=await fn();toast((d&&d.message)||okMsg||'OK',d&&d.ok===false);await refresh()}
   catch(e){toast(e.message,true)}}
-const V={};
+const rsBanner=r=>r&&r.length?`<div class="card warn"><b>Redémarrage nécessaire</b> pour appliquer : ${esc(r.join(', '))}. <button data-restart="1">Redémarrer maintenant</button></div>`:'';
+const V={}, S={};
 V.dash=async()=>{const [s,ev]=await Promise.all([api('status'),api('events?limit=8')]);const c=s.counts||{};
   const errs=(s.last_errors||[]).map(e=>`<li>${typeof e==='object'?esc(fdate(e.ts||e.at||''))+' — '+esc(e.message||e.error||JSON.stringify(e)):esc(e)}</li>`).join('');
-  return `<div class="grid">
+  return `${rsBanner(s.restart_required)}<div class="grid">
   <div class="card stat"><b>${c.movies||0}</b><span>Films suivis</span></div><div class="card stat"><b>${c.shows||0}</b><span>Séries suivies</span></div>
   <div class="card stat"><b>${(c.movies_wanted||0)+(c.episodes_wanted||0)}</b><span>Recherchés</span></div>
   <div class="card stat"><b>${c.downloading||0}</b><span>En téléchargement</span></div></div>
-  <div class="card"><div class="row"><button data-run="watchlist">Synchroniser la Watchlist</button><button data-run="process">Traiter les téléchargements</button></div>
+  <div class="card"><div class="row"><button data-run="watchlist">Synchroniser la Watchlist</button><button data-run="process">Traiter les téléchargements</button><a class="btn sec" href="#cmd">Autres commandes…</a></div>
   <dl><dt>Dernière synchro Watchlist</dt><dd>${esc(fdate(s.last_watchlist_run))}</dd><dt>Dernier traitement</dt><dd>${esc(fdate(s.last_process_run))}</dd>
   <dt>Plex</dt><dd>${yn(s.plex_configured)}</dd><dt>Download Station</dt><dd>${yn(s.ds_configured)}</dd>
   <dt>Indexers actifs</dt><dd>${c.indexers_enabled||0}</dd><dt>Mode simulation</dt><dd>${s.dry_run?'<span class="b b-grabbed">Activé</span>':'Non'}</dd>
+  ${s.jobs_running&&s.jobs_running.length?`<dt>En cours</dt><dd>${esc(s.jobs_running.join(', '))}</dd>`:''}
   <dt>Démarré le</dt><dd>${esc(fdate(s.started_at))}</dd><dt>Version</dt><dd>${esc(s.version)}</dd></dl></div>
   ${errs?`<div class="card err"><h3>Dernières erreurs</h3><ul>${errs}</ul></div>`:''}
   <div class="card"><h3>Activité récente</h3>${evList(ev)}</div>`};
 const evList=ev=>ev.length?`<ul class="ev">${ev.map(e=>`<li class="lv-${esc(e.level)}"><time>${esc(fdate(e.ts))}</time> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</li>`).join('')}</ul>`:'<p class="mut">Aucun événement.</p>';
+const LANGS=[['','Auto'],['en','Anglais (en)'],['fr','Français (fr)'],['en,fr','Anglais + Français']];
+const langSel=m=>{const v=m.language_override||'',o=LANGS.some(l=>l[0]===v)?LANGS:LANGS.concat([[v,v]]);
+  return `<select class="lsel" data-lang="${m.id}" title="Langues recherchées" aria-label="Langues recherchées">${o.map(l=>`<option value="${esc(l[0])}"${l[0]===v?' selected':''}>${esc(l[1])}</option>`).join('')}</select>`};
 V.watch=async()=>{const ms=await api('media');const f=$('#wf')?$('#wf').value:'',q=$('#wq')?$('#wq').value.toLowerCase():'';
   const items=ms.filter(m=>(!f||m.type===f)&&(!q||(m.title||'').toLowerCase().includes(q)));
   const eps=await Promise.all(items.filter(m=>exp.has(m.id)).map(async m=>[m.id,await api('media/'+m.id+'/episodes').catch(()=>[])]));
@@ -458,12 +685,14 @@ V.watch=async()=>{const ms=await api('media');const f=$('#wf')?$('#wf').value:''
   <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"></div>
   ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored';
   return `<div class="card item${m.on_watchlist?'':' off'}"><div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
-  <div class="meta">${badge(m.type)} ${badge(m.status)} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
+  <div class="meta">${badge(m.type)} ${badge(m.status)} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
+  ${m.collection?`<span class="mut">Collection : ${esc(m.collection)}</span>`:''}
   ${e?`<span class="mut">${e.done}/${e.total} épisodes · ${e.wanted} recherchés${e.grabbed?' · '+e.grabbed+' en cours':''}</span>`:''}
-  ${m.last_search_at?`<span class="mut">dernière recherche ${esc(fdate(m.last_search_at))}</span>`:''}</div>
+  ${m.last_search_at?`<span class="mut">dernière recherche ${esc(fdate(m.last_search_at))}</span>`:''}
+  <span class="mut">langues : ${esc((m.languages||[]).join(', ')||'—')} (${m.language_override?'manuel':'auto'})</span></div>
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
-  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}</div></div>
+  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}</div></div>
   ${exp.has(m.id)?epTable(em[m.id]||[]):''}</div>`}).join(''):'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>'}`};
 function epTable(eps){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
   return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}</summary>
@@ -479,16 +708,148 @@ V.hist=async()=>{const [g,ev]=await Promise.all([api('grabs'),api('events?limit=
   ${g.map(x=>`<tr><td class="nw">${esc(fdate(x.created_at))}</td><td class="brk">${esc(x.release_title)}${x.message?`<div class="mut">${esc(x.message)}</div>`:''}</td><td class="hm">${esc(x.media_title||'')}${x.season!=null?` S${String(x.season).padStart(2,'0')}${x.episode!=null?'E'+String(x.episode).padStart(2,'0'):''}`:''}</td>
   <td class="hm">${esc(x.indexer||'')}</td><td class="hm nw">${size(x.size)}</td><td>${badge(x.status)}</td></tr>`).join('')}</table></div>`:'<p class="mut">Aucun téléchargement pour le moment.</p>'}</div>
   <div class="card"><h3>Événements</h3>${evList(ev)}</div>`};
+/* ---------------------------------------------------------------- Commandes */
+const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (films et séries).'],
+  ['search_all','Rechercher tout','Synchronise puis cherche sur les indexers tout ce qui manque.'],
+  ['process','Traiter les téléchargements','Renomme et range les téléchargements terminés.'],
+  ['dry_run','Simulation du traitement','Montre ce qui serait rangé, sans rien déplacer.'],
+  ['check','Vérifier la configuration','Dossiers, Download Station, Plex, TMDb et indexers.'],
+  ['test_indexers','Tester tous les indexers','Vérifie que chaque indexer répond.']];
+const PFX={ok:'[OK]  ',err:'[ERR] ',warn:'[!]   ',info:''};
+let jobs={}, cur=null, srch=null, plexId=null;
+const polling=new Set();
+S.cmd=async()=>{app.innerHTML=`<div class="card"><h3>Commandes</h3><div class="cmds">
+  ${CMDS.map(c=>`<div class="cmd"><button data-cmd="${c[0]}">${c[1]}</button><span class="mut">${c[2]}</span>${c[0]==='search_all'?'<label class="chk"><input type="checkbox" id="force"> forcer (ignorer le délai entre deux recherches)</label>':''}</div>`).join('')}
+  <div class="cmd"><button data-plex="1">Connexion Plex</button><span class="mut">Relie synoarr à votre compte Plex (code à saisir sur plex.tv/link).</span></div>
+  <div class="cmd"><button class="danger" data-restart="1">Redémarrer synoarr</button><span class="mut">Relance le programme, après la fin des tâches en cours.</span></div>
+  </div><div id="plexbox"></div></div>
+  <div class="card"><h3>Recherche manuelle</h3><form id="sf" class="row" autocomplete="off"><input id="sq" type="search" placeholder="ex. Night of the Living Dead 1968 · Série S01E02" required maxlength="200"><button type="submit">Rechercher</button></form>
+  <p class="mut small">Rien n'est envoyé automatiquement : choisissez une release acceptable puis « Envoyer à Download Station ».</p><div id="sres"></div></div>
+  <div class="card" id="outc"><h3 id="outh">Résultat</h3><div id="out"><p class="mut">Lancez une commande : son résultat s'affichera ici.</p></div></div>
+  <div class="card"><h3>Tâches récentes</h3><div id="jl" class="mut">…</div></div>`;
+  [cur,srch,plexId].forEach(id=>{if(id&&jobs[id])draw(jobs[id])});loadJobs()};
+async function startJob(body){try{const r=await api('jobs','POST',body);toast(r.message);track(r.job);
+  const t=$(r.job.command==='search'?'#sres':'#outc');if(t&&t.getBoundingClientRect().top>innerHeight*0.6)t.scrollIntoView({behavior:'smooth',block:'start'})}catch(e){toast(e.message,true)}}
+function track(j){jobs[j.id]=j;if(j.command==='search')srch=j.id;else if(j.command==='plex_login')plexId=j.id;else cur=j.id;
+  draw(j);if(j.status==='running')poll(j.id)}
+async function poll(id){if(polling.has(id))return;polling.add(id);let fails=0;
+  try{while(fails<30){await sleep(1000);let j;try{j=await api('jobs/'+id);fails=0}catch(e){if(e.status===404)break;fails++;continue}
+    jobs[id]=j;draw(j);if(j.status!=='running'){done(j);break}}}finally{polling.delete(id)}}
+function done(j){if(j.command==='plex_login')toast(j.status==='done'?'Compte Plex connecté':(j.error||'Connexion Plex échouée'),j.status!=='done');
+  else if(j.command!=='search')toast(j.label+' : '+(j.status==='done'?'terminé':'erreur'),j.status!=='done');loadJobs()}
+function draw(j){if(tab!=='cmd')return;if(j.id===cur&&$('#out'))drawOut(j);if(j.id===srch&&$('#sres'))drawSearch(j);if(j.id===plexId&&$('#plexbox'))drawPlex(j)}
+const con=o=>`<pre class="con">${o.map(x=>`<span class="o-${esc(x.level)}">${esc(PFX[x.level]||'')}${esc(x.text)}</span>`).join('\n')}</pre>`;
+function drawOut(j){$('#outh').innerHTML=`${esc(j.label)} ${badge(j.status)} <span class="mut small">${esc(fdate(j.started_at))}</span>`;
+  const r=j.result||{};let h='';
+  if(r.actions){h+=r.dry_run?'<p class="mut small">Simulation : rien n\'a été déplacé.</p>':'';
+    h+=r.actions.length?`<div class="tw"><table class="acts-t"><tr><th>Statut</th><th>Fichier → destination</th></tr>${r.actions.map(a=>`<tr><td>${badge(a.status)}</td><td class="brk">${esc(a.src)}${a.dst?`<div class="dst">→ ${esc(a.dst)}</div>`:''}${a.message?`<div class="mut small">${esc(a.message)}</div>`:''}</td></tr>`).join('')}</table></div>`:'';
+    h+=j.output.length?`<details${r.actions.length?'':' open'}><summary>Détail</summary>${con(j.output)}</details>`:''}
+  else h+=j.output.length?con(j.output):'';
+  if(j.status==='running')h+='<p class="mut">En cours…</p>';
+  $('#out').innerHTML=h||'<p class="mut">Aucune sortie.</p>'}
+function drawSearch(j){const r=j.result;let h=`<p class="small">${esc(j.label)} ${badge(j.status)}</p>`;
+  if(j.status==='running')h+='<p class="mut">Recherche en cours sur les indexers…</p>';
+  else if(j.status==='error')h+=con(j.output);
+  else if(r){const ok=r.results.filter(x=>x.score!=null),ko=r.results.filter(x=>x.score==null);
+    const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b><div class="mut small">${esc(x.reason)}</div>
+      <div class="mut small sm">${size(x.size)} · ${x.seeders==null?'?':esc(x.seeders)} seeders · ${esc(x.indexer)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${x.seeders==null?'?':esc(x.seeders)}</td><td class="hm">${esc(x.indexer)}</td>
+      <td>${x.score!=null?`<button data-grab="${x.index}" title="Envoyer à Download Station">Envoyer<span class="hm"> à Download Station</span></button>`:''}</td></tr>`;
+    const tbl=a=>`<div class="tw"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>${a.map(row).join('')}</table></div>`;
+    h+=`<p class="mut small">Requête : ${esc(r.request)} (${esc(r.kind==='movie'?'film':r.kind==='season'?'saison':'épisode')}) — ${r.total} résultat(s), ${ok.length} acceptable(s)</p>`;
+    h+=ok.length?tbl(ok):'<p class="mut">Aucun résultat acceptable.</p>';
+    if(ko.length)h+=`<details><summary>Résultats rejetés (${ko.length})</summary>${tbl(ko)}</details>`}
+  $('#sres').innerHTML=h}
+function drawPlex(j){const r=j.result||{};let st;
+  if(j.status==='running')st='<span class="mut">En attente de la validation sur plex.tv (5 minutes max)…</span>';
+  else if(j.status==='done')st=`<span class="o-ok">✔ ${esc((j.output.slice(-1)[0]||{}).text||'Compte Plex connecté')}</span>`;
+  else st=`<span class="o-err">✖ ${esc(j.error||'Échec')}</span>`;
+  $('#plexbox').innerHTML=`<div class="plex"><div>1. Ouvrez <a href="${esc(r.url||'https://plex.tv/link')}" target="_blank" rel="noopener noreferrer">plex.tv/link</a> (connecté à votre compte Plex)</div>
+  <div>2. Saisissez le code :</div><b class="code">${esc(r.code||'····')}</b><div>${st}</div></div>`}
+async function loadJobs(){const el=$('#jl');if(!el)return;try{const l=await api('jobs');
+  el.innerHTML=l.length?l.map(j=>`<div class="jrow"><button class="lnk" data-job="${j.id}">${esc(j.label)}</button> ${badge(j.status)} <span class="mut small">${esc(fdate(j.started_at))}</span></div>`).join(''):'Aucune tâche depuis le démarrage.'}catch(e){el.textContent=e.message}}
+async function openJob(id){try{const j=await api('jobs/'+id);track(j);const t=j.command==='search'?'#sres':j.command==='plex_login'?'#plexbox':'#outc';$(t).scrollIntoView({behavior:'smooth',block:'start'})}catch(e){toast(e.message,true)}}
+async function plexLogin(){try{const r=await api('plex/login','POST');toast(r.message);track(r.job)}catch(e){toast(e.message,true)}}
+async function grab(i,b){b.disabled=true;b.textContent='Envoi…';try{const r=await api('jobs/'+srch+'/grab','POST',{index:i});toast(r.message,!r.ok);b.textContent=r.ok?'Envoyé ✔':'Échec';if(!r.ok)b.disabled=false}
+  catch(e){toast(e.message,true);b.textContent='Envoyer';b.disabled=false}}
+async function restart(){if(!confirm('Redémarrer synoarr ? Les tâches en cours seront terminées avant.'))return;let s0=null;
+  try{s0=(await api('status')).started_at}catch(e){}
+  try{const r=await api('restart','POST');toast(r.message)}catch(e){toast(e.message,true);return}
+  $('#conn').textContent='Redémarrage en cours…';const t0=Date.now();
+  const wait=async()=>{try{const s=await api('status');if(s.started_at!==s0){toast('synoarr a redémarré');setTimeout(()=>location.reload(),800);return}}catch(e){}
+    if(Date.now()-t0<600000)setTimeout(wait,2000);else $('#conn').textContent='⚠ synoarr ne répond plus : vérifiez le journal sur le NAS'};setTimeout(wait,2500)}
+/* ------------------------------------------------------------------ Journal */
+let logT=null,lqT=null;const LG={lines:'300',level:'DEBUG',q:'',auto:true};
+try{Object.assign(LG,JSON.parse(localStorage.getItem('synoarr-log')||'{}'))}catch(e){}
+const saveLG=()=>{try{localStorage.setItem('synoarr-log',JSON.stringify(LG))}catch(e){}};
+S.logs=async()=>{app.innerHTML=`<div class="card"><div class="row tools lt">
+  <select id="ln" aria-label="Nombre de lignes">${['100','300','1000'].map(n=>`<option value="${n}"${LG.lines===n?' selected':''}>${n} lignes</option>`).join('')}</select>
+  <select id="lv" aria-label="Niveau">${[['DEBUG','Tous les niveaux'],['INFO','Info et plus'],['WARNING','Avertissements'],['ERROR','Erreurs']].map(l=>`<option value="${l[0]}"${LG.level===l[0]?' selected':''}>${l[1]}</option>`).join('')}</select>
+  <input id="lq" type="search" placeholder="Filtrer le texte…" value="${esc(LG.q)}">
+  <label class="chk"><input type="checkbox" id="la"${LG.auto?' checked':''}> Actualisation auto</label>
+  <a class="btn sec" href="api/logs/download" download="synoarr.log">Télécharger le journal</a></div>
+  <div id="lst" class="mut small"></div><div id="logv" class="logv" tabindex="0"></div></div>`;loadLogs()};
+async function loadLogs(reset){clearTimeout(logT);const v=$('#logv');if(tab!=='logs'||!v)return;if(reset)delete v.dataset.init;
+  try{const d=await api(`logs?lines=${LG.lines}&level=${LG.level}&q=${encodeURIComponent(LG.q)}`);
+    const bottom=!v.dataset.init||v.scrollHeight-v.scrollTop-v.clientHeight<40;
+    v.innerHTML=d.lines.length?d.lines.map(l=>`<div class="ll lv-${esc(l.level)}">${esc(l.text)}</div>`).join(''):`<p class="mut">${d.exists?'Aucune ligne ne correspond aux filtres.':'Journal introuvable : '+esc(d.path)}</p>`;
+    v.dataset.init='1';if(bottom)v.scrollTop=v.scrollHeight;
+    $('#lst').textContent=`${d.lines.length} entrée(s) affichée(s)${d.matched>d.lines.length?' sur '+d.matched:''} · ${esc(d.path)} (${size(d.size)||'0 o'})${d.partial?' · fin du fichier seulement':''}`;$('#conn').textContent=''}
+  catch(e){$('#conn').textContent='⚠ '+e.message}
+  if(LG.auto)logT=setTimeout(loadLogs,3000)}
+/* ------------------------------------------------------------ Configuration */
+let cfgD=null;
+const dirty=()=>cfgD&&cfgD.text!==cfgD.orig;
+S.cfg=async()=>{const d=await api('config');if(!dirty())cfgD={text:d.text,orig:d.text};else cfgD.orig=d.text;
+  app.innerHTML=`${d.auth_enabled?'':`<div class="card alert"><h3>⚠ Interface web non protégée</h3><p>Aucun identifiant n'est défini dans la section <code>[web]</code> : toute personne connectée à votre réseau local peut ouvrir cette page, <b>lire la configuration avec tous les mots de passe</b> (Download Station, jeton Plex, clés d'API) et la modifier.</p>
+  <p>Renseignez <code>username</code> et <code>password</code> dans la section <code>[web]</code> ci-dessous, enregistrez, puis redémarrez synoarr.</p></div>`}
+  <div id="rsb">${rsBanner(d.restart_reasons)}</div>
+  <div class="card"><div class="cfgh"><div><h3>config.ini <span id="cfdirty" class="b b-grabbed" hidden>modifié</span></h3><div class="mut small brk">${esc(d.path)}${d.encoding!=='utf-8'?` · encodage actuel ${esc(d.encoding)} : sera enregistré en UTF-8`:''}</div></div>
+  <div class="acts"><button data-cfgsave="1">Enregistrer</button><button class="sec" data-cfgreset="1">Annuler les modifications</button><button class="sec" data-cfgrestore="1"${d.backups.length?'':' disabled'}>Restaurer la sauvegarde précédente</button></div></div>
+  <div id="cfr"></div><textarea id="cft" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="Contenu de config.ini"></textarea>
+  <p class="mut small">Le fichier est vérifié avant d'être remplacé ; en cas d'erreur rien n'est modifié. Les 5 versions précédentes sont conservées (config.ini.bak1 à .bak5)${d.backups.length?' — dernière sauvegarde : '+esc(d.backups[0].modified):''}. Ctrl+S pour enregistrer.</p></div>`;
+  $('#cft').value=cfgD.text;markDirty()};
+function markDirty(){const b=$('#cfdirty');if(b)b.hidden=!dirty()}
+function cfgResult(r){let h=`<div class="msg ok">✔ ${esc(r.message)}</div>`;
+  if(r.warnings&&r.warnings.length)h+=`<div class="msg wa"><b>Avertissements :</b><ul>${r.warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul></div>`;
+  if(r.auth_configured&&!r.auth_enabled)h+='<div class="msg wa">Les identifiants de l\'interface web seront demandés après le redémarrage.</div>';
+  return h}
+async function cfgSave(){if(!cfgD)return;const text=$('#cft').value;try{const r=await api('config','POST',{text});cfgD={text,orig:text};
+    await S.cfg();$('#cfr').innerHTML=cfgResult(r);toast(r.message)}
+  catch(e){const p=(e.data&&e.data.problems)||[];$('#cfr').innerHTML=`<div class="msg ko"><b>${esc(e.message)}</b>${p.length?`<ul>${p.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`;toast(e.message,true)}}
+async function cfgRestore(){if(!confirm('Restaurer la sauvegarde précédente de config.ini ? La version actuelle sera conservée comme sauvegarde.'))return;
+  try{const r=await api('config/restore','POST');cfgD=null;await S.cfg();$('#cfr').innerHTML=cfgResult(r);toast(r.message)}
+  catch(e){const p=(e.data&&e.data.problems)||[];$('#cfr').innerHTML=`<div class="msg ko"><b>${esc(e.message)}</b>${p.length?`<ul>${p.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`;toast(e.message,true)}}
+/* -------------------------------------------------------------------- moteur */
 async function refresh(){clearTimeout(timer);document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.hash==='#'+tab));
+  if(tab!=='logs')clearTimeout(logT);
+  if(S[tab]){if(mounted!==tab){mounted=tab;try{await S[tab]();$('#conn').textContent=''}catch(e){mounted=null;app.innerHTML=`<p class="card msg ko">${esc(e.message)}</p>`}}return}
+  mounted=null;
   try{const html=await (V[tab]||V.dash)();const ae=document.activeElement,fid=ae&&ae.id,pos=fid&&ae.selectionStart;
     app.innerHTML=html;if(fid&&$('#'+fid)){const el=$('#'+fid);el.focus();if(pos!=null&&el.setSelectionRange)el.setSelectionRange(pos,pos)}
     $('#conn').textContent='';}
   catch(e){$('#conn').textContent='⚠ '+e.message}
   timer=setTimeout(refresh,15000)}
-addEventListener('hashchange',()=>{tab=(location.hash||'#dash').slice(1);app.innerHTML='<p class="mut">Chargement…</p>';refresh()});
-app.addEventListener('input',e=>{if(e.target.id==='wq'||e.target.id==='wf')refresh()});
+addEventListener('hashchange',()=>{tab=(location.hash||'#dash').slice(1);mounted=null;app.innerHTML='<p class="mut">Chargement…</p>';refresh()});
+addEventListener('beforeunload',e=>{if(dirty()){e.preventDefault();e.returnValue=''}});
+document.addEventListener('keydown',e=>{if(tab==='cfg'&&(e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();cfgSave()}});
+app.addEventListener('input',e=>{const id=e.target.id;if(id==='wq'||id==='wf')refresh();
+  else if(id==='lq'){LG.q=e.target.value;saveLG();clearTimeout(lqT);lqT=setTimeout(()=>loadLogs(true),300)}
+  else if(id==='cft'&&cfgD){cfgD.text=e.target.value;markDirty()}});
+app.addEventListener('change',e=>{const t=e.target,id=t.id;
+  if(t.dataset.lang)act(()=>api('media/'+t.dataset.lang+'/language','POST',{languages:t.value}));
+  else if(id==='ln'||id==='lv'){LG[id==='ln'?'lines':'level']=t.value;saveLG();loadLogs(true)}
+  else if(id==='la'){LG.auto=t.checked;saveLG();loadLogs()}});
+app.addEventListener('submit',e=>{if(e.target.id==='sf'){e.preventDefault();const q=$('#sq').value.trim();if(q)startJob({command:'search',query:q})}});
 app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const d=b.dataset;
   if(d.run)act(()=>api('run/'+d.run,'POST'));
+  else if(d.cmd)startJob({command:d.cmd,force:d.cmd==='search_all'&&!!($('#force')&&$('#force').checked)});
+  else if(d.plex)plexLogin();
+  else if(d.restart)restart();
+  else if(d.grab)grab(+d.grab,b);
+  else if(d.job)openJob(+d.job);
+  else if(d.cfgsave)cfgSave();
+  else if(d.cfgreset){if(!dirty()||confirm('Abandonner les modifications non enregistrées ?')){cfgD=null;mounted=null;refresh()}}
+  else if(d.cfgrestore)cfgRestore();
   else if(d.search)act(()=>api('media/'+d.search+'/search','POST'));
   else if(d.st)act(()=>api('media/'+d.st+'/status','POST',{status:d.v}),'Statut mis à jour');
   else if(d.eps){const id=+d.eps;exp.has(id)?exp.delete(id):exp.add(id);refresh()}
@@ -508,51 +869,67 @@ INDEX_HTML = """<!doctype html>
 <title>synoarr</title><link rel="icon" href="data:,"><meta name="color-scheme" content="light dark">
 <style>
 :root{--bg:#f4f5f7;--card:#fff;--fg:#1d2330;--mut:#6b7280;--bd:#e3e6eb;--ac:#2563eb;--acf:#fff;--ok:#15803d;--okb:#dcfce7;
---ko:#b91c1c;--kob:#fee2e2;--wa:#a16207;--wab:#fef3c7;--inb:#e0e7ff;--inf:#3730a3;--neb:#eceff3}
+--ko:#b91c1c;--kob:#fee2e2;--wa:#a16207;--wab:#fef3c7;--inb:#e0e7ff;--inf:#3730a3;--neb:#eceff3;--pub:#f3e8ff;--puf:#7e22ce}
 @media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1b1f26;--fg:#e6e8eb;--mut:#9aa3af;--bd:#2c323c;--ac:#3b82f6;
---ok:#4ade80;--okb:#14321f;--ko:#f87171;--kob:#3b1717;--wa:#facc15;--wab:#3a2f0b;--inb:#1e2550;--inf:#a5b4fc;--neb:#262b33}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+--ok:#4ade80;--okb:#14321f;--ko:#f87171;--kob:#3b1717;--wa:#facc15;--wab:#3a2f0b;--inb:#1e2550;--inf:#a5b4fc;--neb:#262b33;--pub:#2e1a47;--puf:#d8b4fe}}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{background:var(--card);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:2}
 .hd{max-width:1000px;margin:auto;padding:10px 16px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 h1{font-size:18px;margin:0 8px 8px 0}h1 span{color:var(--ac)}#conn{color:var(--ko);font-size:13px;margin-bottom:8px}
-nav{display:flex;gap:2px;overflow-x:auto;flex:1 1 auto;scrollbar-width:none;align-self:flex-end}
-nav a{padding:8px 12px;color:var(--mut);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap}
+nav{display:flex;gap:2px;overflow-x:auto;flex:1 1 auto;scrollbar-width:none;align-self:flex-end}nav::-webkit-scrollbar{display:none}
+nav a{padding:8px 11px;color:var(--mut);text-decoration:none;border-bottom:2px solid transparent;white-space:nowrap}
 nav a.on{color:var(--fg);border-color:var(--ac);font-weight:600}
 main{max-width:1000px;margin:auto;padding:16px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;margin-bottom:14px}
-h3{margin:0 0 10px;font-size:15px}.mut{color:var(--mut)}
+h3{margin:0 0 10px;font-size:15px}.mut{color:var(--mut)}.small{font-size:12px}code{font-size:13px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:14px}.grid .card{margin:0}
 .stat b{display:block;font-size:26px}.stat span{color:var(--mut);font-size:13px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.tools{margin-bottom:14px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:14px 0 0}dt{color:var(--mut)}dd{margin:0}
-button{font:inherit;font-size:14px;border:1px solid var(--ac);background:var(--ac);color:var(--acf);border-radius:7px;padding:6px 12px;cursor:pointer}
-button.sec{background:transparent;color:var(--ac)}button.danger{background:transparent;color:var(--ko);border-color:var(--ko)}
+button,a.btn{font:inherit;font-size:14px;border:1px solid var(--ac);background:var(--ac);color:var(--acf);border-radius:7px;padding:6px 12px;cursor:pointer;text-decoration:none;display:inline-block}
+button.sec,a.btn.sec{background:transparent;color:var(--ac)}button.danger{background:transparent;color:var(--ko);border-color:var(--ko)}
+button.lnk{background:none;border:0;color:var(--ac);padding:0;text-align:left}
 button:disabled{opacity:.45;cursor:default}button:hover:not(:disabled){filter:brightness(1.1)}
-input,select{font:inherit;font-size:14px;padding:6px 10px;border:1px solid var(--bd);border-radius:7px;background:var(--card);color:var(--fg);min-width:0}
-#wq{flex:1}
-.b{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;background:var(--neb);color:var(--mut);white-space:nowrap}
-.b-done,.b-imported,.b-monitored{background:var(--okb);color:var(--ok)}.b-failed{background:var(--kob);color:var(--ko)}
-.b-grabbed,.b-sent{background:var(--wab);color:var(--wa)}.b-wanted{background:var(--inb);color:var(--inf)}
+input,select,textarea{font:inherit;font-size:14px;padding:6px 10px;border:1px solid var(--bd);border-radius:7px;background:var(--card);color:var(--fg);min-width:0}
+#wq,#sq,#lq{flex:1;min-width:160px}
+.b{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;background:var(--neb);color:var(--mut);white-space:nowrap;font-weight:400}
+.b-done,.b-imported,.b-monitored,.b-planned{background:var(--okb);color:var(--ok)}.b-failed,.b-error{background:var(--kob);color:var(--ko)}
+.b-grabbed,.b-sent,.b-running{background:var(--wab);color:var(--wa)}.b-wanted{background:var(--inb);color:var(--inf)}.b-anim{background:var(--pub);color:var(--puf)}
 .item{padding:10px 0;border-top:1px solid var(--bd)}.card.item{padding:12px 16px;border-top:1px solid var(--bd)}
 .card>.item:first-of-type{border-top:0}.off{opacity:.6}
 .it{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap}.it>div:first-child{flex:1;min-width:200px}
 .meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px;font-size:13px}
-.url{word-break:break-all}.acts{display:flex;gap:6px;flex-wrap:wrap}
+.url{word-break:break-all}.acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.lsel{font-size:13px;padding:5px 6px}
 .bar{height:5px;background:var(--neb);border-radius:9px;margin-top:8px;overflow:hidden;max-width:320px}.bar i{display:block;height:100%;background:var(--ok)}
 .tres{font-size:13px;margin-top:4px}.tres.ok{color:var(--ok)}.tres.ko{color:var(--ko)}
 details{margin-top:10px}summary{cursor:pointer;color:var(--mut)}
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:6px;border-top:1px solid var(--bd);vertical-align:top}
 th{color:var(--mut);font-weight:600;border-top:0}table.eps{table-layout:fixed}.eps td:first-child{width:44px}.eps td:nth-child(3){width:96px}.eps td:last-child{width:150px}.tw{overflow-x:auto}.nw{white-space:nowrap}.brk{word-break:break-word}
 .ev{list-style:none;margin:0;padding:0;font-size:13px}.ev li{padding:5px 0;border-top:1px solid var(--bd)}.ev li:first-child{border:0}
-.ev time{color:var(--mut)}.k{font-weight:600}.lv-ERROR{color:var(--ko)}.lv-WARNING{color:var(--wa)}
+.ev time{color:var(--mut)}.k{font-weight:600}.lv-ERROR,.lv-CRITICAL{color:var(--ko)}.lv-WARNING{color:var(--wa)}.lv-DEBUG{color:var(--mut)}
 .err{border-color:var(--ko)}.err ul{margin:0;padding-left:18px;color:var(--ko);font-size:13px}
+.warn{border-color:var(--wa);background:var(--wab)}.warn button{margin-left:6px}
+.alert{border:2px solid var(--ko);background:var(--kob)}.alert h3{color:var(--ko)}.alert p{margin:6px 0}
 form.add{display:grid;grid-template-columns:1fr 1fr;gap:8px}form.add .full{grid-column:1/-1}
+.cmds{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:10px}
+.cmd{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding:10px 12px;border:1px solid var(--bd);border-radius:8px}.cmd>span{font-size:13px}
+.chk{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--mut)}
+.con,.logv{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:8px 10px;overflow:auto;margin:6px 0 0;white-space:pre-wrap;word-break:break-word}
+.con{max-height:440px}.logv{height:calc(100vh - 250px);min-height:280px}.ll{white-space:pre-wrap;padding:1px 0}
+.o-ok{color:var(--ok)}.o-err{color:var(--ko)}.o-warn{color:var(--wa)}.rej{opacity:.65}.dst{color:var(--ok)}.sm,.mo{display:none}
+.plex{margin-top:12px;padding:12px 14px;border:1px dashed var(--ac);border-radius:8px;font-size:14px}.plex a{color:var(--ac)}
+.code{font:700 34px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:8px;display:block;margin:10px 0}
+.jrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:5px 0;border-top:1px solid var(--bd);font-size:14px}.jrow:first-child{border:0}
+.cfgh{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start;margin-bottom:10px}.cfgh h3{margin-bottom:2px}
+#cft{display:block;width:100%;height:62vh;min-height:320px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;overflow:auto;tab-size:4;resize:vertical}
+.msg{padding:8px 12px;border-radius:8px;margin:0 0 10px;font-size:14px}.msg ul{margin:4px 0 0;padding-left:20px}
+.msg.ok{background:var(--okb);color:var(--ok)}.msg.ko{background:var(--kob);color:var(--ko)}.msg.wa{background:var(--wab);color:var(--wa)}
 #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:9px 16px;
-border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw;font-size:14px}#toast.show{opacity:1}#toast.bad{background:var(--ko);color:#fff}
-@media (max-width:600px){.hm{display:none}nav{width:100%}nav a{padding:8px 7px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}}
+border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw;font-size:14px;z-index:5}#toast.show{opacity:1}#toast.bad{background:var(--ko);color:#fff}
+@media (max-width:600px){.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
 </style></head><body>
 <header><div class="hd"><h1><span>syno</span>arr</h1>
-<nav><a href="#dash">Tableau de bord</a><a href="#watch">Watchlist</a><a href="#idx">Indexers</a><a href="#hist">Historique</a></nav><div id="conn"></div></div></header>
+<nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
 <main><div id="app"><p class="mut">Chargement…</p></div>
 <div class="card" id="addc" hidden><h3>Ajouter un indexer par URL</h3>
 <form class="add" id="addf" autocomplete="off"><input name="name" placeholder="Nom" required><input name="url" placeholder="URL (Torznab, RSS…)" required>
