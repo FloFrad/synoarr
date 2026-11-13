@@ -232,6 +232,8 @@ class WebServer:
             ("POST", r"/api/indexers/(\d+)/test", self.api_indexer_test),
             ("POST", r"/api/indexers/(\d+)/enabled", self.api_indexer_enabled),
             ("POST", r"/api/indexers/(\d+)/priority", self.api_indexer_priority),
+            ("GET", r"/api/indexers/(\d+)", self.api_indexer_get),
+            ("POST", r"/api/indexers/(\d+)/edit", self.api_indexer_edit),
             ("POST", r"/api/indexers/import-prowlarr", self.api_indexer_import_prowlarr),
             ("GET", r"/api/prowlarr", self.api_prowlarr_status),
             ("POST", r"/api/prowlarr/sync", self.api_prowlarr_sync),
@@ -433,6 +435,33 @@ class WebServer:
 
     def api_indexers(self, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
         return [mask_secrets(r) for r in self.app.indexer_manager.list()]
+
+    def api_indexer_get(self, indexer_id: int, query: Dict[str, str], body: Any = None) -> Dict[str, Any]:
+        """One indexer for the edit form: real URL (behind authentication), API key masked."""
+        mgr = self.app.indexer_manager
+        row = mgr._row(indexer_id)
+        out = dict(row)
+        out["api_key"] = "••••" if row.get("api_key") else ""
+        out["has_api_key"] = bool(row.get("api_key"))
+        out["synced_by"] = mgr.synced_by(row)
+        return out
+
+    def api_indexer_edit(self, indexer_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+
+        def opt(key: str) -> Optional[str]:
+            v = data.get(key)
+            if v is None:
+                return None
+            if not isinstance(v, (str, int, float)):
+                raise HttpProblem(400, "Valeur invalide pour %s" % key)
+            return str(v)
+        row = self.app.indexer_manager.update(
+            indexer_id, name=opt("name"), url=opt("url"), api_key=opt("api_key"),
+            clear_api_key=bool(data.get("clear_api_key")), categories=opt("categories"), type_=opt("type"),
+            priority=data.get("priority"),
+            enabled=None if data.get("enabled") is None else bool(data.get("enabled")))
+        return {"ok": True, "message": "Indexer « %s » modifié" % row.get("name"), "indexer": mask_secrets(row)}
 
     def api_catalog(self, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
         return [mask_secrets(r) for r in self.app.indexer_manager.catalog()]
@@ -1018,7 +1047,7 @@ async function prwForget(){if(!confirm('Arrêter la synchronisation automatique 
 V.idx=async()=>{const [ix,cat,prw,jkt]=await Promise.all([api('indexers'),api('catalog'),api('prowlarr').catch(()=>null),api('jackett').catch(()=>null)]);
   return `<div class="card"><h3>Indexers configurés</h3>${ix.length?`<p class="mut small">Priorité : 1 = le plus prioritaire, 50 = le moins. Les indexers sont interrogés dans cet ordre et, à qualité égale (résolution, langue, source), la release de l'indexer le plus prioritaire est choisie.</p>`:''}${ix.length?ix.map(i=>`<div class="item it"><div><b>${esc(i.name)}</b> ${badge(i.type)} ${i.enabled?'<span class="b b-done">Actif</span>':'<span class="b b-ignored">Désactivé</span>'}
   <div class="meta mut"><span class="url">${esc(i.url)}</span>${i.api_key?' · clé '+esc(i.api_key):''}${i.categories?' · catégories '+esc(i.categories):''}</div><div class="tres" id="tr${i.id}"></div></div>
-  <div class="acts">${prioCtl(i)}<button data-test="${i.id}">Tester</button><button class="sec" data-en="${i.id}" data-v="${i.enabled?0:1}">${i.enabled?'Désactiver':'Activer'}</button><button class="danger" data-del="${i.id}" data-n="${esc(i.name)}">Supprimer</button></div></div>`).join(''):'<p class="mut">Aucun indexer : ajoutez-en un depuis le catalogue ou par URL.</p>'}</div>
+  <div class="acts">${prioCtl(i)}<button class="sec" data-iedit="${i.id}">Modifier</button><button data-test="${i.id}">Tester</button><button class="sec" data-en="${i.id}" data-v="${i.enabled?0:1}">${i.enabled?'Désactiver':'Activer'}</button><button class="danger" data-del="${i.id}" data-n="${esc(i.name)}">Supprimer</button></div></div>`).join(''):'<p class="mut">Aucun indexer : ajoutez-en un depuis le catalogue ou par URL.</p>'}</div>
   <div class="card"><h3>Importer depuis Prowlarr</h3><p class="mut small">Ajoute chaque indexer torrent actif de Prowlarr comme indexer Torznab (avec sa priorité). La clé API se trouve dans Prowlarr > Settings > General > API Key. <b>Utilisez Prowlarr OU Jackett, pas les deux.</b></p>
   <form id="prwf" class="row" autocomplete="off"><input id="prwu" name="url" type="text" spellcheck="false" value="${esc(PRW.url)}" placeholder="http://127.0.0.1:9696" aria-label="Adresse de Prowlarr">
   <input id="prwk" name="api_key" type="password" autocomplete="new-password" placeholder="Clé API Prowlarr" aria-label="Clé API Prowlarr" value="${esc(PRW.key)}"><button type="submit">Importer</button></form><div id="prwr">${PRW.res}</div>${prwState(prw)}</div>
@@ -1186,6 +1215,7 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.src)openSrc(d);
   else if(d.wadd)openAdd();
   else if(d.wdel)openDel(d);
+  else if(d.iedit)openIdxEdit(d.iedit);
   else if(d.pd)setPrio(d.pd,d.v);
   else if(d.prws)prwSync();
   else if(d.prwx)prwForget();
@@ -1283,6 +1313,28 @@ async function wAdd(i,b){const c=GM&&GM.res[i];if(!c)return;b.disabled=true;b.te
 async function wManual(){const b=$('#wmf button');b.disabled=true;
   try{const r=await api('watchlist/manual','POST',{type:$('#wmt').value,title:$('#wmn').value.trim(),year:$('#wmy').value||null,imdb:$('#wmi').value.trim(),search_now:$('#wsn').checked});$('#wmf').reset();wDone(r)}
   catch(e){toast(e.message,true);const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ko">✖ ${esc(e.message)}</div>`}b.disabled=false}
+async function openIdxEdit(id){let i;try{i=await api('indexers/'+id)}catch(e){toast(e.message,true);return}
+  const opt=(v,l)=>`<option value="${v}"${i.type===v?' selected':''}>${l}</option>`;
+  openGM('iedit','Modifier l\'indexer',`<form id="ief" data-id="${i.id}" autocomplete="off">
+  ${i.synced_by?`<div class="msg wa small">Indexer synchronisé avec ${esc(i.synced_by)} : l'URL et la clé${i.synced_by==='Prowlarr'?' et la priorité':''} sont réécrites à chaque synchronisation. Modifiez-les plutôt dans ${esc(i.synced_by)}.</div>`:''}
+  <label class="fl">Nom<input id="ien" type="text" value="${esc(i.name)}" required></label>
+  <label class="fl">Type<select id="iet">${opt('torznab','Torznab')}${opt('rss','RSS')}${opt('internet_archive','Internet Archive')}</select></label>
+  <label class="fl">URL<input id="ieu" type="text" spellcheck="false" value="${esc(i.url)}" required></label>
+  <label class="fl">Clé API<input id="iek" type="password" autocomplete="new-password" placeholder="${i.has_api_key?'inchangée (laisser vide pour la garder)':'aucune'}"></label>
+  ${i.has_api_key?'<label class="chk"><input type="checkbox" id="iekc"> Effacer la clé API</label>':''}
+  <label class="fl">Catégories Torznab<input id="iec" type="text" value="${esc(i.categories||'')}" placeholder="ex. 2000,5000 (vide = automatique)"></label>
+  <label class="fl">Priorité (1 = le plus prioritaire, 50 = le moins)<input id="iep" type="number" min="1" max="50" value="${esc(i.priority)}"></label>
+  <label class="chk"><input type="checkbox" id="iea"${i.enabled?' checked':''}> Actif</label>
+  <div id="iem"></div>
+  <div class="row"><button type="submit">Enregistrer et tester</button><button type="button" class="sec" data-gmclose="1">Annuler</button></div></form>`);
+  $('#ien').focus()}
+async function saveIdx(f){const id=f.dataset.id,m=$('#iem'),b=f.querySelector('button[type=submit]');b.disabled=true;
+  const body={name:$('#ien').value,type:$('#iet').value,url:$('#ieu').value,api_key:$('#iek').value,
+    clear_api_key:!!($('#iekc')&&$('#iekc').checked),categories:$('#iec').value,priority:$('#iep').value,enabled:$('#iea').checked};
+  try{const r=await api('indexers/'+id+'/edit','POST',body);m.innerHTML='<div class="msg wa small">Enregistré, test en cours…</div>';
+    let t;try{t=await api('indexers/'+id+'/test','POST',{})}catch(e){t={ok:false,message:e.message}}
+    closeGM();toast(r.message+' — test : '+(t.ok?'OK':'échec')+(t.message?' ('+t.message+')':''),!t.ok);await refresh()}
+  catch(e){b.disabled=false;m.innerHTML=`<div class="msg ko small">${esc(e.message)}</div>`}}
 function openDel(d){openGM('del','Supprimer de la Watchlist',`<p>Retirer « <b>${esc(d.n)}</b> » de synoarr ?</p>
   ${d.local==='1'?'<p class="mut small">Entrée locale (hors Watchlist Plex).</p>':'<label class="chk"><input type="checkbox" id="wdp" checked> Retirer aussi de la Watchlist Plex</label>'}
   <label class="chk"><input type="checkbox" id="wdd"> Supprimer aussi les téléchargements en cours${+d.dl?` (${esc(d.dl)})`:''}</label>
@@ -1294,7 +1346,7 @@ async function wDel(id,b){b.disabled=true;
   catch(e){b.disabled=false;toast(e.message,true)}}
 gm.addEventListener('click',e=>{if(e.target===gm||e.target.closest('[data-gmclose]')){closeGM();return}const b=e.target.closest('button');if(!b)return;
   if(b.dataset.wpick)wAdd(+b.dataset.wpick,b);else if(b.dataset.wdelok)wDel(b.dataset.wdelok,b)});
-gm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='wsf')wSearch();else if(e.target.id==='wmf')wManual()});
+gm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='wsf')wSearch();else if(e.target.id==='wmf')wManual();else if(e.target.id==='ief')saveIdx(e.target)});
 const showForm=()=>{$('#addc').hidden=tab!=='idx'};addEventListener('hashchange',showForm);showForm();
 refresh();
 """
@@ -1349,6 +1401,7 @@ form.add{display:grid;grid-template-columns:1fr 1fr;gap:8px}form.add .full{grid-
 .cmds{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:10px}
 .cmd{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding:10px 12px;border:1px solid var(--bd);border-radius:8px}.cmd>span{font-size:13px}
 .chk{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--mut)}
+.fl{display:block;margin:8px 0;font-size:13px;color:var(--mut)}.fl input,.fl select{display:block;width:100%;box-sizing:border-box;margin-top:4px}
 .con,.logv{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:8px 10px;overflow:auto;margin:6px 0 0;white-space:pre-wrap;word-break:break-word}
 .con{max-height:440px}.logv{height:calc(100vh - 250px);min-height:280px}.ll{white-space:pre-wrap;padding:1px 0}
 .o-ok{color:var(--ok)}.o-err{color:var(--ko)}.o-warn{color:var(--wa)}.rej{opacity:.65}.dst{color:var(--ok)}.sm,.mo{display:none}

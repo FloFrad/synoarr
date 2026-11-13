@@ -239,7 +239,7 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 |---|---|
 | Tableau de bord | état général, téléchargements en cours (progression, vitesses, sources), derniers envois |
 | Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » |
-| Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), priorité (1 = le plus prioritaire), tester, activer, supprimer |
+| Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), modifier (nom, URL, clé API, catégories, type), priorité (1 = le plus prioritaire), tester, activer, supprimer |
 | Historique | envois vers Download Station et événements |
 | Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer, mettre à jour synoarr (et revenir en arrière) |
 | Journal | dernières lignes du journal, filtres, téléchargement |
@@ -338,6 +338,7 @@ supprimés.
 | `sudo python3 synoarr.py process` | traite le dossier Download maintenant |
 | `sudo python3 synoarr.py status` | derniers envois et événements |
 | `sudo python3 synoarr.py indexer list` | liste les indexers (avec leur priorité) |
+| `sudo python3 synoarr.py indexer edit 3 --api-key CLE --priority 10` | modifie un indexer (aussi `--name`, `--url`, `--categories`, `--type`) |
 | `sudo python3 synoarr.py indexer priority <id\|nom> <1-50>` | change la priorité d'un indexer (1 = le plus prioritaire) |
 | `sudo python3 synoarr.py indexer import-prowlarr URL --api-key CLE` | importe les indexers torrent de Prowlarr |
 | `sudo python3 synoarr.py indexer prowlarr-sync` | resynchronise les indexers avec Prowlarr maintenant |

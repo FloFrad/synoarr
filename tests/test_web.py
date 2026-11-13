@@ -1658,3 +1658,43 @@ class LinkBadgeTemplateTest(unittest.TestCase):
         from synoarr.web import INDEX_JS
         # "Changer de source" window AND manual search (Commandes) rows
         self.assertEqual(INDEX_JS.count("<b>${esc(x.title)}</b>${lt(x)}"), 2)
+
+
+class IndexerEditTest(RealAppWebBase):
+    def test_edit_indexer(self) -> None:
+        mgr = self.app.indexer_manager
+        row = mgr.add_url("Fake", self.srv.url + "/torznab", api_key="SECRETKEY", type_="torznab")
+        rid = row["id"]
+        status, data, _ = self.req("/api/indexers/%d" % rid)
+        self.assertEqual(status, 200, data)
+        self.assertEqual((data["name"], data["api_key"], data["has_api_key"], data["synced_by"]),
+                         ("Fake", "••••", True, None))
+        self.assertNotIn("SECRETKEY", json.dumps(data))
+        # rename + categories + priority; an empty or masked key keeps the stored one
+        status, data, _ = self.req("/api/indexers/%d/edit" % rid, "POST",
+                                   {"name": "Mon indexer", "categories": "2000, 5000", "priority": 7,
+                                    "api_key": "", "url": self.srv.url + "/torznab", "type": "torznab",
+                                    "enabled": True})
+        self.assertEqual(status, 200, data)
+        db_row = self.app.db.get_indexer(rid)
+        self.assertEqual((db_row["name"], db_row["categories"], db_row["priority"], db_row["api_key"]),
+                         ("Mon indexer", "2000,5000", 7, "SECRETKEY"))
+        self.req("/api/indexers/%d/edit" % rid, "POST", {"api_key": "••••"})
+        self.assertEqual(self.app.db.get_indexer(rid)["api_key"], "SECRETKEY")
+        self.req("/api/indexers/%d/edit" % rid, "POST", {"api_key": "NEWKEY"})
+        self.assertEqual(self.app.db.get_indexer(rid)["api_key"], "NEWKEY")
+        self.req("/api/indexers/%d/edit" % rid, "POST", {"clear_api_key": True})
+        self.assertEqual(self.app.db.get_indexer(rid)["api_key"], "")
+        # validation errors
+        mgr.add_url("Autre", self.srv.url + "/torznab?x=1", type_="torznab")
+        for body, msg in (({"name": "Autre"}, "existe déjà"), ({"url": "ftp://x"}, "http"),
+                          ({"categories": "films"}, "Catégories"), ({"type": "zip"}, "Type inconnu"),
+                          ({"priority": 99}, "1"), ({"name": "  "}, "obligatoire")):
+            status, data, _ = self.req("/api/indexers/%d/edit" % rid, "POST", body)
+            self.assertEqual(status, 400, body)
+            self.assertIn(msg, data["error"])
+        self.assertEqual(self.req("/api/indexers/9999")[0], 400)
+
+    def test_synced_indexer_is_flagged(self) -> None:
+        row = self.app.indexer_manager.add_url("YTS (Prowlarr)", "http://127.0.0.1:9696/1/api", type_="torznab")
+        self.assertEqual(self.req("/api/indexers/%d" % row["id"])[1]["synced_by"], "Prowlarr")

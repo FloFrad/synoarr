@@ -437,6 +437,19 @@ def cmd_indexer(args: argparse.Namespace) -> int:
             res = mgr.sync_prowlarr(app.cfg) or {}
             _out((KO if res.get("ok") is False else OK) + str(res.get("message")))
             return 1 if res.get("ok") is False else 0
+        elif action == "edit":
+            if not args.target:
+                _out(KO + "Usage : indexer edit <numéro|nom> [--name N] [--url U] [--api-key K] [--categories C] "
+                          "[--type T] [--priority P]")
+                return 2
+            row = mgr.update(args.target, name=args.name, url=args.url_opt or args.url or None,
+                             api_key=args.api_key or None,
+                             categories=args.categories if args.categories != "" else None,
+                             type_=args.type, priority=args.priority)
+            _out(OK + "Indexer modifié : %s" % row.get("name"))
+            ok, msg = mgr.test(row["id"])
+            _out((OK if ok else KO) + "Test : " + msg)
+            return 0 if ok else 1
         elif action == "import-jackett":
             if not args.target:
                 _out(KO + "Usage : indexer import-jackett http://127.0.0.1:9117 --api-key CLE")
@@ -772,13 +785,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     pi = sub.add_parser("indexer", parents=[common], help="gérer les indexers")
     pi.add_argument("action", choices=["list", "catalog", "add", "add-url", "test", "enable", "disable", "remove",
-                                       "priority", "import-prowlarr", "prowlarr-sync", "prowlarr-forget", "import-jackett", "jackett-sync", "jackett-forget"])
+                                       "priority", "import-prowlarr", "prowlarr-sync", "prowlarr-forget", "import-jackett", "jackett-sync", "jackett-forget", "edit"])
     pi.add_argument("target", nargs="?", help="id du catalogue, nom ou numéro de l'indexer (import-prowlarr : "
                                               "adresse de Prowlarr, ex. http://127.0.0.1:9696)")
     pi.add_argument("url", nargs="?", help="URL (pour add-url) ou priorité 1-50 (pour priority)")
     pi.add_argument("--priority", default=None,
                     help="priorité pour add-url : 1 (le plus prioritaire) à 50, défaut 25")
     pi.add_argument("--api-key", default="")
+    pi.add_argument("--name", default=None, help="nouveau nom (indexer edit)")
+    pi.add_argument("--url", dest="url_opt", default=None, help="nouvelle URL (indexer edit)")
     pi.add_argument("--categories", default="", help="catégories Torznab, ex. 2000,5000")
     pi.add_argument("--type", choices=["torznab", "rss", "internet_archive"], default=None,
                     help="forcer le type (détecté automatiquement sinon)")

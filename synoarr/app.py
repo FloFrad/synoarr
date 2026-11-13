@@ -172,6 +172,61 @@ class IndexerManager:
         except Exception as exc:
             return False, str(exc)
 
+    INDEXER_TYPES = ("torznab", "rss", "internet_archive")
+
+    def update(self, indexer_id: Any, name: Optional[str] = None, url: Optional[str] = None,
+               api_key: Optional[str] = None, clear_api_key: bool = False, categories: Optional[str] = None,
+               type_: Optional[str] = None, priority: Any = None, enabled: Optional[bool] = None) -> Dict[str, Any]:
+        """Modifie un indexer. Champ None = inchangé ; api_key "" = clé conservée (clear_api_key pour l'effacer).
+        Lève ValueError (message français)."""
+        row = self._row(indexer_id)
+        fields = {}  # type: Dict[str, Any]
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Le nom de l'indexer est obligatoire")
+            other = self.db.get_indexer(name)
+            if other is not None and other["id"] != row["id"]:
+                raise ValueError("Un indexer nommé « %s » existe déjà" % name)
+            fields["name"] = name
+        if url is not None:
+            url = url.strip()
+            if not url.lower().startswith(("http://", "https://")):
+                raise ValueError("L'URL doit commencer par http:// ou https://")
+            fields["url"] = url
+        if clear_api_key:
+            fields["api_key"] = ""
+        elif api_key is not None and api_key.strip() and set(api_key.strip()) != {"•"}:
+            fields["api_key"] = api_key.strip()
+        if categories is not None:
+            cats = [c.strip() for c in categories.replace(";", ",").split(",") if c.strip()]
+            if any(not c.isdigit() for c in cats):
+                raise ValueError("Catégories : des nombres séparés par des virgules (ex. 2000,5000)")
+            fields["categories"] = ",".join(cats)
+        if type_ is not None and type_ != "":
+            if type_ not in self.INDEXER_TYPES:
+                raise ValueError("Type inconnu : %s (torznab, rss ou internet_archive)" % type_)
+            fields["type"] = type_
+        if priority is not None and priority != "":
+            fields["priority"] = check_priority(priority)
+        if enabled is not None:
+            fields["enabled"] = 1 if enabled else 0
+        if fields:
+            self.db.update_indexer(row["id"], **fields)
+            changed = ", ".join(sorted(k if k != "api_key" else "clé API" for k in fields))
+            self.db.add_event("indexer", "Indexer modifié : %s (%s)" % (fields.get("name", row["name"]), changed))
+        return self.db.get_indexer(row["id"]) or {}
+
+    @staticmethod
+    def synced_by(row: Dict[str, Any]) -> Optional[str]:
+        """"Prowlarr" / "Jackett" when the indexer is kept in sync (URL/key overwritten by each sync)."""
+        name = row.get("name") or ""
+        if name.endswith(" (Prowlarr)"):
+            return "Prowlarr"
+        if name.endswith(" (Jackett)") or "/api/v2.0/indexers/" in (row.get("url") or ""):
+            return "Jackett"
+        return None
+
     def set_enabled(self, indexer_id: Any, enabled: bool) -> None:
         row = self._row(indexer_id)
         self.db.update_indexer(row["id"], enabled=1 if enabled else 0)
