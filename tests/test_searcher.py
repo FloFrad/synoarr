@@ -504,7 +504,8 @@ class ManualSourceTests(SearcherTestBase):
     def test_grab_manual_magnet_and_url(self) -> None:
         rel = Searcher.release_from_link(self.MAGNET, "Heat")
         self.assertTrue(self.searcher.grab(rel, self.m, None, None))
-        self.assertEqual(self.ds.added, [self.MAGNET])
+        self.assertEqual(len(self.ds.added), 1)
+        self.assertTrue(self.ds.added[0].startswith(self.MAGNET + "&tr="))  # public trackers appended
         g = self.db.list_grabs()[0]
         self.assertEqual((g["indexer"], g["info_hash"], g["media_id"]),
                          ("manuel", "abcdef0123456789abcdef0123456789abcdef01", self.m["id"]))
@@ -587,3 +588,38 @@ class TaskIndexTests(unittest.TestCase):
         self.assertEqual(idx.find({"torrent_name": None, "release_title": "The Show S01E01 720p"}).id, "3")
         self.assertIsNone(idx.find({"torrent_name": "", "release_title": "Nothing"}))
         self.assertIsNone(TaskIndex([DSTask(id="9", title="", status="x")]).find({"release_title": "..."}))
+
+
+class StalledMagnetTests(SearcherTestBase):
+    def test_magnet_gets_trackers_and_stalled_download_is_replaced(self) -> None:
+        import time as _time
+        from synoarr.models import Release
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        media = self.media("m1")
+        rel = Release(title="Heat.1995.1080p.BluRay.x264-GRP", indexer="idx",
+                      magnet="magnet:?xt=urn:btih:%s&dn=Heat" % ("a" * 40))
+        self.assertTrue(self.searcher.grab(rel, media, None, None))
+        sent = self.ds.added[-1]
+        self.assertIn("tr=udp%3A%2F%2Ftracker.opentrackr.org", sent)
+        # Download Station: still waiting, no peer, created 7 h ago -> abandoned after stalled_hours (6)
+        self.ds.tasks = [DSTask(id="m1", title="Heat", status="waiting", info_hash="a" * 40,
+                                created=int(_time.time() - 7 * 3600), peers=0, seeders=0)]
+        self.db.execute("UPDATE grabs SET created_at = datetime('now', 'localtime', '-7 hours')")
+        self.db.set_media_status(media["id"], "grabbed")
+        self.searcher.check_failed_downloads()
+        grab = self.db.list_grabs()[0]
+        self.assertEqual(grab["status"], "failed")
+        self.assertIn("aucune source", grab["message"])
+        self.assertTrue(self.db.is_blocked("Heat.1995.1080p.BluRay.x264-GRP"))
+        self.assertEqual(self.ds.deleted, ["m1"])
+        self.assertEqual(self.media("m1")["status"], "wanted")
+
+    def test_recent_or_active_download_is_not_stalled(self) -> None:
+        import time as _time
+        task = DSTask(id="x", title="X", status="waiting", created=int(_time.time() - 3600), peers=0)
+        self.assertFalse(self.searcher._is_stalled(task, {"created_at": None}, 6))
+        task = DSTask(id="x", title="X", status="waiting", created=int(_time.time() - 9 * 3600), peers=3)
+        self.assertFalse(self.searcher._is_stalled(task, {"created_at": None}, 6))
+        task = DSTask(id="x", title="X", status="downloading", created=int(_time.time() - 9 * 3600))
+        self.assertFalse(self.searcher._is_stalled(task, {"created_at": None}, 6))

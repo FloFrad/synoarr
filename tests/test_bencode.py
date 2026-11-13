@@ -118,3 +118,18 @@ class MagnetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AddTrackersTests(unittest.TestCase):
+    def test_add_trackers(self):
+        from synoarr.bencode import add_trackers
+        m = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Name"
+        out = add_trackers(m, ["udp://t1:1/announce", "udp://t2:2/announce"])
+        self.assertTrue(out.startswith(m + "&tr="))
+        self.assertEqual(out.count("&tr="), 2)
+        rich = m + "&tr=udp%3A%2F%2Fa%3A1&tr=udp://b:2"
+        self.assertEqual(add_trackers(rich, ["udp://t1:1/announce"]), rich)  # already 2 trackers
+        self.assertEqual(add_trackers(m, []), m)
+        self.assertEqual(add_trackers("http://x/y.torrent", ["udp://t"]), "http://x/y.torrent")
+        one = m + "&tr=udp%3A%2F%2Ft1%3A1%2Fannounce"
+        self.assertEqual(add_trackers(one, ["udp://t1:1/announce", "udp://t2:2/announce"]).count("&tr="), 2)

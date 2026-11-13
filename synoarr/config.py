@@ -49,6 +49,20 @@ class DownloadStationConfig:
     password: str = ""
     destination: str = "Download"  # shared folder (+ optional subfolder) where Download Station saves files
     verify_ssl: bool = False  # DSM usually uses a self-signed certificate
+    # Open trackers added to magnet links that carry fewer than 2 trackers: a magnet without tracker can only be
+    # resolved through DHT, and stays "En attente" forever when DHT is off or blocked.
+    extra_trackers: List[str] = field(default_factory=lambda: [
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://open.stealth.si:80/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://explodie.org:6969/announce",
+        "udp://tracker.openbittorrent.com:6969/announce",
+    ])
+    # A download still waiting without any source after this many hours is abandoned: the release is blocklisted
+    # and another one is searched (0 = never)
+    stalled_hours: float = 6.0
 
 
 @dataclass

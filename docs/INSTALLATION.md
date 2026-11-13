@@ -358,6 +358,7 @@ Journal : `data/synoarr.log` (consultable dans File Station).
 | `Plex : aucun jeton` | `sudo python3 synoarr.py plex-login` |
 | Rien n'est trouvé | `sudo python3 synoarr.py search "Titre Année"` montre pourquoi chaque résultat est rejeté |
 | L'interface web ne s'ouvre pas | port 8778 bloqué par le pare-feu (étape 1.6), ou port déjà utilisé : changez `[web] port` |
+| Téléchargements « En attente » sans fin dans Download Station | Commandes → « Diagnostic Download Station » (ou `sudo python3 synoarr.py ds-diag`). Le plus souvent : Download Station > Paramètres > BitTorrent → cocher « Activer le réseau DHT », et autoriser le port BT (16881 par défaut, TCP+UDP) dans le pare-feu DSM / la box. synoarr ajoute des trackers publics aux liens magnet et remplace un téléchargement sans source après 6 h (`[downloadstation] stalled_hours`) |
 | synoarr ne démarre pas | lisez `data/console.log` et `data/synoarr.log` |
 
 ## Mise à jour

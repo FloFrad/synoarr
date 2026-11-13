@@ -233,3 +233,28 @@ def magnet_info(magnet: str) -> Tuple[Optional[str], Optional[str]]:
             if v.lower().startswith("urn:btih:"):
                 info_hash = _normalize_btih(v[9:])
     return name, info_hash
+
+
+def add_trackers(magnet: str, trackers: Any, minimum: int = 2) -> str:
+    """Append *trackers* to a magnet link that has fewer than *minimum* trackers (no duplicates).
+    A tracker-less magnet can only be resolved through DHT."""
+    import urllib.parse
+    if not magnet or not magnet.lower().startswith("magnet:?") or not trackers:
+        return magnet
+    query = magnet.split("?", 1)[1]
+    existing = []
+    for part in query.split("&"):
+        k, _, v = part.partition("=")
+        if k.lower() == "tr" and v:
+            existing.append(urllib.parse.unquote_plus(v).strip().lower())
+    if len(existing) >= minimum:
+        return magnet
+    extra = []
+    for t in trackers:
+        t = str(t).strip()
+        if t and t.lower() not in existing:
+            existing.append(t.lower())
+            extra.append("tr=" + urllib.parse.quote(t, safe=""))
+    if not extra:
+        return magnet
+    return magnet + ("&" if not magnet.endswith("&") else "") + "&".join(extra)

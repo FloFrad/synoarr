@@ -1117,9 +1117,10 @@ class App:
             len(tasks), ", ".join("%s %d" % kv for kv in sorted(counts.items())) or "aucune"))
         cfg = d.get("config") or {}
         if cfg:
-            job.emit("info", "Réglages : téléchargements BT simultanés max = %s, HTTP max = %s, dossier par défaut = %s"
-                     % (cfg.get("bt_max_download", "?"), cfg.get("http_max_download", "?"),
-                        cfg.get("default_destination", "?")))
+            scalars = ["%s=%s" % (k, v) for k, v in sorted(cfg.items())
+                       if isinstance(v, (int, float, bool)) and "pass" not in k.lower()]
+            if scalars:
+                job.emit("info", "Réglages Download Station : " + ", ".join(scalars[:25]))
         sched = d.get("schedule") or {}
         if sched.get("enabled"):
             job.emit("warn", "La planification de Download Station est ACTIVÉE : en dehors des plages autorisées, "
@@ -1149,7 +1150,20 @@ class App:
                 (" — " + " ; ".join(hint)) if hint else ""))
         for t in [t for t in tasks if str(t["status"]) in ("error", "10")][:20]:
             job.emit("err", "Erreur : %s — %s" % (t.get("title"), json.dumps(t.get("status_extra"), ensure_ascii=False)))
-        if waiting and not sched.get("enabled") and not (max_bt and active >= max_bt):
+        magnets = [t for t in waiting if t.get("is_magnet") and not t.get("size")]
+        if magnets and len(magnets) == len(waiting) and not active:
+            job.emit("warn", "Toutes les tâches en attente sont des liens magnet qui n'ont trouvé AUCUN pair : "
+                             "Download Station n'arrive pas à joindre le réseau BitTorrent.")
+            job.emit("info", "1) Download Station > Paramètres > BitTorrent : cochez « Activer le réseau DHT » "
+                             "(indispensable pour un magnet sans tracker) et notez le port BT (16881 par défaut).")
+            job.emit("info", "2) Panneau de configuration > Sécurité > Pare-feu : autorisez ce port (TCP et UDP) ; "
+                             "sur la box, redirigez-le vers le NAS (conseillé). Un VPN sur le NAS peut aussi bloquer.")
+            job.emit("info", "3) synoarr ajoute désormais des trackers publics aux liens magnet qui n'en ont pas "
+                             "assez ([downloadstation] extra_trackers) : utilisez « Changer de source » (ou "
+                             "supprimez ces tâches) pour renvoyer ces téléchargements. Sans source après "
+                             "%g h, synoarr abandonne la release et en cherche une autre ([downloadstation] "
+                             "stalled_hours)." % float(getattr(self.cfg.downloadstation, "stalled_hours", 0) or 0))
+        elif waiting and not sched.get("enabled") and not (max_bt and active >= max_bt):
             job.emit("info", "Pistes : 1) Download Station > Paramètres > BT : port TCP/UDP ouvert et non bloqué par le "
                              "pare-feu DSM ; 2) testez le même .torrent ajouté à la main dans Download Station ; "
                              "3) « Changer de source » dans la Watchlist pour une release avec plus de seeds.")

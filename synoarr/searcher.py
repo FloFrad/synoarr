@@ -5,6 +5,7 @@ import datetime as _dt
 import logging
 import os
 import re
+import time
 import threading
 import unicodedata
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
@@ -699,7 +700,8 @@ class Searcher:
         name, info_hash = bencode.magnet_info(magnet)
         if self._hash_already_grabbed(info_hash):
             raise _AlreadyGrabbed()
-        self.ds.add_url(magnet)
+        trackers = getattr(self.cfg.downloadstation, "extra_trackers", None) or []
+        self.ds.add_url(bencode.add_trackers(magnet, trackers))
         return name, info_hash
 
     # ================================================================ failed downloads
@@ -716,12 +718,18 @@ class Searcher:
             log.debug("Download Station indisponible pour vérifier les erreurs : %s", exc)
             return
         index = TaskIndex(tasks)
+        stalled_h = float(getattr(self.cfg.downloadstation, "stalled_hours", 0) or 0)
         for g in sent:
             task = index.find(g)
-            if task is None or task.status != "error":
+            if task is None:
                 continue
-            reason = task.error or "erreur Download Station"
-            log.warning("Téléchargement en erreur : %s (%s) → nouvelle recherche", g["release_title"], reason)
+            if task.status == "error":
+                reason = task.error or "erreur Download Station"
+            elif stalled_h > 0 and self._is_stalled(task, g, stalled_h):
+                reason = "aucune source après %g h (lien magnet sans métadonnées ou sans pair)" % stalled_h
+            else:
+                continue
+            log.warning("Téléchargement en échec : %s (%s) → nouvelle recherche", g["release_title"], reason)
             self.db.set_grab_status(g["id"], "failed", reason)
             self.db.block_release(g["release_title"], reason)
             self.db.add_event("download", "Échec du téléchargement %s : %s" % (g["release_title"], reason), "ERROR")
@@ -739,6 +747,24 @@ class Searcher:
                     self.db.reset_grab_episodes(g)
                     self.db.execute("UPDATE episodes SET last_search_at = NULL WHERE media_id = ? AND season = ?",
                                     (media["id"], g["season"]))
+
+    @staticmethod
+    def _is_stalled(task: Any, grab: Dict[str, Any], hours: float) -> bool:
+        """Still "waiting" with nothing downloaded and no peer, long after it was sent."""
+        if task.status not in ("waiting", "unknown"):
+            return False
+        if (getattr(task, "downloaded", 0) or 0) > 0:
+            return False
+        if (getattr(task, "peers", None) or 0) > 0 or (getattr(task, "seeders", None) or 0) > 0:
+            return False
+        started = getattr(task, "created", None)
+        sent_at = parse_iso(grab.get("created_at"))
+        ages = []
+        if started:
+            ages.append(time.time() - float(started))
+        if sent_at is not None:
+            ages.append((_dt.datetime.now() - sent_at).total_seconds())
+        return bool(ages) and min(ages) >= hours * 3600
 
     # ================================================================ manual sources (« Changer de source »)
     def request_for(self, media: Dict[str, Any], season: Optional[int] = None,
