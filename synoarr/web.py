@@ -68,6 +68,11 @@ dans ``GET /api/media`` : champ ``downloads`` de chaque élément), ``POST /api/
 (``{"season", "episode"}`` -> tâche de recherche de toutes les sources) et ``POST /api/media/<id>/replace``
 (``{"season", "episode", "grab_id", "delete_old", "blocklist_old"}`` + ``{"job_id", "index", "accept_rejected"}``,
 ``{"link"}`` (magnet ou URL .torrent) ou ``{"torrent_base64"}`` (fichier .torrent, 700 Ko max)).
+Watchlist (API App en tête de app.py) : ``GET /api/watchlist/search?q=&kind=&year=`` (app.search_titles),
+``POST /api/watchlist/add`` (``{"candidate", "add_to_plex", "search_now"}``), ``POST /api/watchlist/manual``
+(``{"type", "title", "year", "imdb", "tmdb", "search_now"}``), ``DELETE /api/media/<id>`` ou
+``POST /api/media/<id>/remove`` (``{"remove_from_plex", "delete_downloads"}``). Les entrées masquées (hidden)
+n'apparaissent ni dans /api/media ni dans les compteurs du tableau de bord.
 
 Les clés d'API ne sortent jamais de l'API indexers/catalogue : elles sont remplacées par "••••". Seul l'onglet
 Configuration montre le vrai fichier (c'est la configuration de l'utilisateur, derrière l'authentification).
@@ -231,6 +236,11 @@ class WebServer:
             ("GET", r"/api/downloads", self.api_downloads),
             ("POST", r"/api/media/(\d+)/sources", self.api_media_sources),
             ("POST", r"/api/media/(\d+)/replace", self.api_media_replace),
+            ("GET", r"/api/watchlist/search", self.api_watchlist_search),
+            ("POST", r"/api/watchlist/add", self.api_watchlist_add),
+            ("POST", r"/api/watchlist/manual", self.api_watchlist_manual),
+            ("DELETE", r"/api/media/(\d+)", self.api_media_remove),
+            ("POST", r"/api/media/(\d+)/remove", self.api_media_remove),
             ("DELETE", r"/api/indexers/(\d+)", self.api_indexer_delete),
             ("GET", r"/api/catalog", self.api_catalog),
             ("GET", r"/api/grabs", self.api_grabs),
@@ -340,10 +350,12 @@ class WebServer:
         db = self.app.db
         one = db.query_one(
             "SELECT "
-            "(SELECT COUNT(*) FROM media WHERE type='movie' AND on_watchlist=1) AS movies, "
-            "(SELECT COUNT(*) FROM media WHERE type='show' AND on_watchlist=1) AS shows, "
-            "(SELECT COUNT(*) FROM media WHERE type='movie' AND status='wanted' AND on_watchlist=1) AS movies_wanted, "
+            "(SELECT COUNT(*) FROM media WHERE type='movie' AND on_watchlist=1 AND COALESCE(hidden,0)=0) AS movies, "
+            "(SELECT COUNT(*) FROM media WHERE type='show' AND on_watchlist=1 AND COALESCE(hidden,0)=0) AS shows, "
+            "(SELECT COUNT(*) FROM media WHERE type='movie' AND status='wanted' AND on_watchlist=1 "
+            " AND COALESCE(hidden,0)=0) AS movies_wanted, "
             "(SELECT COUNT(*) FROM episodes e JOIN media m ON m.id=e.media_id WHERE e.status='wanted' "
+            " AND COALESCE(m.hidden,0)=0 "
             " AND m.status='monitored' AND m.on_watchlist=1) AS episodes_wanted, "
             "(SELECT COUNT(*) FROM grabs WHERE status='sent') AS downloading, "
             "(SELECT COUNT(*) FROM indexers WHERE enabled=1) AS indexers_enabled") or {}
@@ -497,6 +509,69 @@ class WebServer:
             job_id=data.get("job_id"), index=data.get("index"), link=link, torrent=torrent,
             delete_old=data.get("delete_old", True) is not False, blocklist_old=data.get("blocklist_old") is True,
             accept_rejected=data.get("accept_rejected") is True)
+
+    # ------------------------------------------------- ajout / suppression dans la Watchlist
+    def _app_func(self, name: str) -> Any:
+        func = getattr(self.app, name, None)
+        if func is None:
+            raise HttpProblem(501, "Fonction non disponible : %s" % name)
+        return func
+
+    def api_watchlist_search(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        q = (query.get("q") or "").strip()
+        if len(q) > 200:
+            raise HttpProblem(400, "Recherche trop longue (200 caractères maximum)")
+        return self._app_func("search_titles")(q, query.get("kind") or None, query.get("year") or None)
+
+    def _added(self, row: Dict[str, Any], search_now: bool) -> Dict[str, Any]:
+        label = "%s%s" % (row.get("title"), " (%s)" % row["year"] if row.get("year") else "")
+        if row.get("already_present"):
+            msg = "« %s » est déjà dans la liste" % label
+        elif row.get("plex_added"):
+            msg = "« %s » ajouté à la Watchlist Plex" % label
+        else:
+            msg = "« %s » ajouté (entrée locale, hors Watchlist Plex)" % label
+        started = False
+        if search_now and row.get("id") and row.get("status") in ("wanted", "monitored"):
+            self.app.search_now(int(row["id"]))
+            started = True
+            msg += " — recherche lancée"
+        media = {k: row.get(k) for k in ("id", "type", "title", "year", "status", "plex_key", "imdb", "tmdb", "tvdb")}
+        return {"ok": True, "message": msg, "warning": row.get("warning"), "already_present":
+                bool(row.get("already_present")), "plex_added": row.get("plex_added"), "search_started": started,
+                "media": media}
+
+    def api_watchlist_add(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+        cand = data.get("candidate")
+        if not isinstance(cand, dict):
+            raise HttpProblem(400, "Le champ « candidate » (résultat de la recherche) est obligatoire")
+        row = self._app_func("add_to_watchlist")(cand, data.get("add_to_plex", True) is not False)
+        return self._added(row, data.get("search_now", True) is not False)
+
+    def api_watchlist_manual(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+        for k in ("type", "title", "imdb", "tmdb"):
+            if data.get(k) is not None and not isinstance(data.get(k), str):
+                raise HttpProblem(400, "Champ « %s » invalide" % k)
+        row = self._app_func("add_manual")(data.get("type") or "", data.get("title") or "", data.get("year"),
+                                           (data.get("imdb") or "").strip() or None,
+                                           (data.get("tmdb") or "").strip() or None)
+        return self._added(row, data.get("search_now", True) is not False)
+
+    def api_media_remove(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        media = self._media_or_404(media_id)
+        data = self._body_dict(body)
+        res = dict(self._app_func("remove_from_watchlist")(
+            media_id, remove_from_plex=data.get("remove_from_plex", True) is not False,
+            delete_downloads=data.get("delete_downloads") is True) or {})
+        msg = "« %s » retiré de la liste" % media["title"]
+        if res.get("plex_removed"):
+            msg += " et de la Watchlist Plex"
+        if res.get("downloads_deleted"):
+            msg += " — %d téléchargement(s) supprimé(s) de Download Station" % res["downloads_deleted"]
+        res.update({"ok": True, "message": msg})
+        return res
 
     def api_indexer_delete(self, indexer_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         self.app.indexer_manager.delete(indexer_id)
@@ -832,11 +907,11 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   const eps=await Promise.all(items.filter(m=>exp.has(m.id)).map(async m=>[m.id,await api('media/'+m.id+'/episodes').catch(()=>[])]));
   const em=Object.fromEntries(eps);
   return `<div class="row tools"><select id="wf"><option value="">Tous</option><option value="movie"${f==='movie'?' selected':''}>Films</option><option value="show"${f==='show'?' selected':''}>Séries</option></select>
-  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"></div>${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
+  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"><button data-wadd="1">+ Ajouter</button></div>${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
   ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored',dls=m.downloads||[];
   if(dls.some(d=>d.active))dlActive=true;
   return `<div class="card item${m.on_watchlist?'':' off'}"><div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
-  <div class="meta">${badge(m.type)} ${badge(m.status)} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
+  <div class="meta">${badge(m.type)} ${badge(m.status)} ${String(m.plex_key||'').startsWith('local:')?'<span class="b b-local" title="Entrée locale, hors Watchlist Plex">local</span>':''} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
   ${m.collection?`<span class="mut">Collection : ${esc(m.collection)}</span>`:''}
   ${e?`<span class="mut">${e.done}/${e.total} épisodes · ${e.wanted} recherchés${e.grabbed?' · '+e.grabbed+' en cours':''}</span>`:''}
   ${m.last_search_at?`<span class="mut">dernière recherche ${esc(fdate(m.last_search_at))}</span>`:''}
@@ -844,7 +919,7 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
   ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
-  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}</div></div>
+  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div>
   ${dls.length?`<div class="dls">${dls.map(d=>dlRow(d,false)).join('')}</div>`:''}
   ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>'}`};
 function epTable(eps,m){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
@@ -1015,6 +1090,8 @@ app.addEventListener('submit',e=>{if(e.target.id==='prwf'){e.preventDefault();pr
 app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const d=b.dataset;
   if(d.run)act(()=>api('run/'+d.run,'POST'));
   else if(d.src)openSrc(d);
+  else if(d.wadd)openAdd();
+  else if(d.wdel)openDel(d);
   else if(d.pd)setPrio(d.pd,d.v);
   else if(d.cmd)startJob({command:d.cmd,force:d.cmd==='search_all'&&!!($('#force')&&$('#force').checked)});
   else if(d.plex)plexLogin();
@@ -1048,7 +1125,7 @@ function openSrc(d){const num=v=>v===''||v==null?null:+v;
   <h4>Lien magnet ou URL d'un .torrent</h4><form id="slf" class="row" autocomplete="off"><input id="slink" type="text" spellcheck="false" placeholder="magnet:?xt=urn:btih:… ou https://…/fichier.torrent" aria-label="Lien magnet ou URL d'un fichier .torrent"><button type="submit">Envoyer le lien</button></form>
   <h4>Fichier .torrent</h4><form id="sff" class="row"><input id="sfile" type="file" accept=".torrent,application/x-bittorrent" aria-label="Fichier .torrent"><button type="submit">Envoyer le fichier</button></form>`;
   srcm.hidden=false;document.body.classList.add('noscroll');$('#srcx').focus();srcSearch()}
-function closeSrc(){SRC=null;srcm.hidden=true;document.body.classList.remove('noscroll')}
+function closeSrc(){SRC=null;srcm.hidden=true;if(!GM)document.body.classList.remove('noscroll')}
 async function srcSearch(){const S0=SRC;try{const r=await api('media/'+S0.mid+'/sources','POST',{season:S0.s,episode:S0.e});S0.job=r.job.id;let j=r.job,fails=0;
     while(SRC===S0&&j.status==='running'){await sleep(800);try{j=await api('jobs/'+j.id);fails=0}catch(e){if(e.status===404||++fails>20)throw e}}
     if(SRC===S0)drawSrcRes(j)}
@@ -1059,7 +1136,7 @@ function drawSrcRes(j){const r=j.result,el=$('#sres2');if(j.status==='error'||!r
   const ok=r.results.filter(x=>x.score!=null).length;
   el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis.</p><div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
   ${r.results.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b><div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
-  <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir quand même':'Choisir'}</button></td></tr>`).join('')}</table></div>`}
+  <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir<span class="hm"> quand même</span>':'Choisir'}</button></td></tr>`).join('')}</table></div>`}
 async function srcSend(body){const S0=SRC;if(!S0)return;const msg=$('#smsg'),btns=[...document.querySelectorAll('#srcb button')];
   Object.assign(body,{season:S0.s,episode:S0.e,grab_id:S0.g,delete_old:!!($('#sdel')&&$('#sdel').checked),blocklist_old:!!($('#sblk')&&$('#sblk').checked)});
   btns.forEach(b=>b.disabled=true);msg.innerHTML='<div class="msg wa">Envoi à Download Station…</div>';msg.scrollIntoView({block:'nearest'});
@@ -1079,7 +1156,46 @@ srcm.addEventListener('click',e=>{if(e.target===srcm||e.target.closest('[data-mc
   const b=e.target.closest('button[data-pick]');if(b)pick(+b.dataset.pick)});
 srcm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='slf'){const v=$('#slink').value.trim();if(!v){toast('Collez un lien magnet ou une URL .torrent',true);return}srcSend({link:v})}
   else if(e.target.id==='sff')srcFile()});
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&SRC)closeSrc()});
+document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if(SRC)closeSrc();else if(GM)closeGM()});
+/* ------------------------------------------- Watchlist : ajouter / supprimer */
+let GM=null;const gm=$('#gm');
+function openGM(kind,title,html){GM={kind,res:[]};$('#gmh').textContent=title;$('#gmb').innerHTML=html;gm.hidden=false;document.body.classList.add('noscroll')}
+function closeGM(){GM=null;gm.hidden=true;if(!SRC)document.body.classList.remove('noscroll')}
+function openAdd(){openGM('add','Ajouter à la Watchlist',`<form id="wsf" class="row" autocomplete="off"><input id="wsq" type="search" placeholder="Titre du film ou de la série" required maxlength="200" aria-label="Titre">
+  <select id="wsk" aria-label="Type"><option value="">Tous</option><option value="movie">Film</option><option value="show">Série</option></select><input id="wsy" class="yr" type="number" min="1870" max="2100" placeholder="Année" aria-label="Année (facultatif)"><button type="submit">Rechercher</button></form>
+  <div class="row opts"><label class="chk"><input type="checkbox" id="wsp" checked> Ajouter aussi à la Watchlist Plex</label><label class="chk"><input type="checkbox" id="wsn" checked> Rechercher un téléchargement tout de suite</label></div>
+  <div id="wsm"></div><div id="wsr"><p class="mut small">Recherche dans Plex (Découvrir) et TMDb si une clé est configurée.</p></div>
+  <details><summary>Ajout manuel (sans recherche)</summary><form id="wmf" class="add" autocomplete="off"><select id="wmt" aria-label="Type"><option value="movie">Film</option><option value="show">Série</option></select>
+  <input id="wmn" placeholder="Titre" required maxlength="200" aria-label="Titre"><input id="wmy" type="number" min="1870" max="2100" placeholder="Année (facultatif)" aria-label="Année"><input id="wmi" placeholder="IMDb, ex. tt0133093 (facultatif)" aria-label="Identifiant IMDb">
+  <div class="full"><button type="submit">Ajouter</button></div></form></details>`);$('#wsq').focus()}
+async function wSearch(){const q=$('#wsq').value.trim();if(!q)return;const r0=$('#wsr');r0.innerHTML='<p class="mut">Recherche…</p>';
+  try{const r=await api(`watchlist/search?q=${encodeURIComponent(q)}&kind=${$('#wsk').value}&year=${encodeURIComponent($('#wsy').value)}`);if(!GM)return;GM.res=r.results;
+    const w=(r.warnings||[]).map(x=>`<div class="msg wa">${esc(x)}</div>`).join('');
+    r0.innerHTML=w+(r.results.length?`<div class="cands">${r.results.map((c,i)=>`<div class="cand">${c.poster_url&&/^https:\/\//.test(c.poster_url)?`<img src="${esc(c.poster_url)}" alt="" loading="lazy" referrerpolicy="no-referrer">`:'<div class="noimg" aria-hidden="true">?</div>'}
+      <div class="cb"><div><b>${esc(c.title)}</b> ${c.year?`<span class="mut">(${esc(c.year)})</span>`:''}</div><div class="meta">${badge(c.type)} <span class="b">${c.source==='plex'?'Plex':'TMDb'}</span>${c.in_watchlist?' <span class="b b-done">déjà dans la liste</span>':''}</div>
+      ${c.original_title&&c.original_title!==c.title?`<div class="mut small">${esc(c.original_title)}</div>`:''}${c.overview?`<p class="small ov">${esc(c.overview)}</p>`:''}
+      <div><button class="xs" data-wpick="${i}"${c.in_watchlist?' disabled':''}>${c.in_watchlist?'Déjà suivi':'Ajouter'}</button></div></div></div>`).join('')}</div>`:`<p class="mut">Aucun résultat pour « ${esc(q)} » : essayez l'ajout manuel ci-dessous.</p>`)}
+  catch(e){if(GM)r0.innerHTML=`<div class="msg ko">${esc(e.message)}</div>`}}
+function wDone(r){const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ok">✔ ${esc(r.message)}</div>${r.warning?`<div class="msg wa">${esc(r.warning)}</div>`:''}`;
+  toast(r.message+(r.warning?' — '+r.warning:''));refresh()}
+async function wAdd(i,b){const c=GM&&GM.res[i];if(!c)return;b.disabled=true;b.textContent='Ajout…';
+  try{const r=await api('watchlist/add','POST',{candidate:c,add_to_plex:$('#wsp').checked,search_now:$('#wsn').checked});b.textContent='Ajouté ✔';wDone(r)}
+  catch(e){b.disabled=false;b.textContent='Ajouter';toast(e.message,true);const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ko">✖ ${esc(e.message)}</div>`}}
+async function wManual(){const b=$('#wmf button');b.disabled=true;
+  try{const r=await api('watchlist/manual','POST',{type:$('#wmt').value,title:$('#wmn').value.trim(),year:$('#wmy').value||null,imdb:$('#wmi').value.trim(),search_now:$('#wsn').checked});$('#wmf').reset();wDone(r)}
+  catch(e){toast(e.message,true);const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ko">✖ ${esc(e.message)}</div>`}b.disabled=false}
+function openDel(d){openGM('del','Supprimer de la Watchlist',`<p>Retirer « <b>${esc(d.n)}</b> » de synoarr ?</p>
+  ${d.local==='1'?'<p class="mut small">Entrée locale (hors Watchlist Plex).</p>':'<label class="chk"><input type="checkbox" id="wdp" checked> Retirer aussi de la Watchlist Plex</label>'}
+  <label class="chk"><input type="checkbox" id="wdd"> Supprimer aussi les téléchargements en cours${+d.dl?` (${esc(d.dl)})`:''}</label>
+  <p class="mut small">Les fichiers déjà rangés dans la bibliothèque ne sont jamais supprimés. Un téléchargement interrompu peut perdre ses données partielles.</p>
+  <div class="row"><button class="danger" data-wdelok="${esc(d.wdel)}">Supprimer</button><button class="sec" data-gmclose="1">Annuler</button></div>`);gm.querySelector('[data-wdelok]').focus()}
+async function wDel(id,b){b.disabled=true;
+  try{const r=await api('media/'+id,'DELETE',{remove_from_plex:!!($('#wdp')&&$('#wdp').checked),delete_downloads:!!($('#wdd')&&$('#wdd').checked)});
+    closeGM();toast(r.message+(r.warning?' — '+r.warning:''),false);await refresh()}
+  catch(e){b.disabled=false;toast(e.message,true)}}
+gm.addEventListener('click',e=>{if(e.target===gm||e.target.closest('[data-gmclose]')){closeGM();return}const b=e.target.closest('button');if(!b)return;
+  if(b.dataset.wpick)wAdd(+b.dataset.wpick,b);else if(b.dataset.wdelok)wDel(b.dataset.wdelok,b)});
+gm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='wsf')wSearch();else if(e.target.id==='wmf')wManual()});
 const showForm=()=>{$('#addc').hidden=tab!=='idx'};addEventListener('hashchange',showForm);showForm();
 refresh();
 """
@@ -1153,14 +1269,18 @@ button.xs{font-size:12px;padding:3px 8px}h4{margin:14px 0 6px;font-size:14px}
 .pbar{height:8px;background:var(--neb);border-radius:9px;overflow:hidden;margin-top:6px}.pbar i{display:block;height:100%;background:var(--ac);transition:width .4s}.pbar.ok i{background:var(--ok)}.pbar.ko i{background:var(--ko)}
 .ds-downloading,.ds-finishing,.ds-extracting,.ds-hash_checking{background:var(--inb);color:var(--inf)}.ds-seeding,.ds-finished{background:var(--okb);color:var(--ok)}
 .ds-error,.ds-failed,.ds-introuvable{background:var(--kob);color:var(--ko)}.ds-waiting,.ds-paused,.ds-filehosting_waiting{background:var(--wab);color:var(--wa)}
-.spk{margin:8px 0 2px}.eps td:last-child .xs{margin-top:2px}
+.spk{margin:8px 0 2px}.eps td:last-child .xs{margin-top:2px}table.eps td:last-child{width:210px}
 .prio{display:flex;align-items:center;gap:4px;font-size:13px;color:var(--mut);margin-right:4px}.prio label{margin-right:2px}.pb{padding:3px 9px;line-height:1.2}.pin{width:58px;text-align:center;padding:4px 4px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow-y:auto}
 .mbox{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:12px;width:100%;max-width:920px;padding:14px 16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .mhd{display:flex;justify-content:space-between;align-items:center;gap:10px}.mhd h3{margin:0}.opts{margin:4px 0 6px;gap:6px 16px}
 #slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.srt table td,.srt table th{padding:5px 6px}
-body.noscroll{overflow:hidden}
-@media (max-width:600px){.modal{padding:8px}.mbox{padding:12px}.srt{max-height:none}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
+body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(--pub);color:var(--puf)}
+.cands{display:flex;flex-direction:column;gap:8px;margin-top:10px}.cand{display:flex;gap:12px;border:1px solid var(--bd);border-radius:8px;padding:8px}
+.cand img,.noimg{width:62px;height:93px;object-fit:cover;border-radius:6px;flex:0 0 62px;background:var(--neb)}.noimg{display:flex;align-items:center;justify-content:center;color:var(--mut)}
+.cb{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.ov{margin:0;color:var(--mut);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.yr{width:96px}#wsq,#prwu,#prwk{flex:1;min-width:180px}#gm details{margin-top:14px}#wmf{margin-top:8px}
+@media (max-width:600px){table.eps td:last-child{width:auto}.modal{padding:8px}.mbox{padding:12px}.srt{max-height:52vh}.cand img,.noimg{width:48px;height:72px;flex-basis:48px}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
 </style></head><body>
 <header><div class="hd"><h1><span>syno</span>arr</h1>
 <nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
@@ -1172,10 +1292,12 @@ body.noscroll{overflow:hidden}
 <div class="full"><button type="submit">Ajouter</button></div></form></div></main>
 <div id="srcm" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="srch"><div class="mbox">
 <div class="mhd"><h3 id="srch">Changer de source</h3><button type="button" class="sec xs" id="srcx" data-mclose="1">Fermer</button></div><div id="srcb"></div></div></div>
+<div id="gm" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="gmh"><div class="mbox">
+<div class="mhd"><h3 id="gmh">Watchlist</h3><button type="button" class="sec xs" data-gmclose="1">Fermer</button></div><div id="gmb"></div></div></div>
 <div id="toast" role="status"></div>
 <script>""" + INDEX_JS + """</script></body></html>
 """
 
-CSP = ("default-src 'none'; script-src 'sha256-%s'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
+CSP = ("default-src 'none'; script-src 'sha256-%s'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https:; "
        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
        % base64.b64encode(hashlib.sha256(INDEX_JS.encode("utf-8")).digest()).decode("ascii"))

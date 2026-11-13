@@ -1279,3 +1279,87 @@ class WebProwlarrImportTest(RealAppWebBase):
         rc, out = WebIndexerPriorityTest.cli(self, "indexer", "import-prowlarr", self.psrv.url, "--api-key", "x")  # type: ignore[arg-type]
         self.assertEqual(rc, 1)
         self.assertIn("refusée", out)
+
+
+class WebWatchlistEditTest(RealAppWebBase):
+    """Ajout / suppression dans la Watchlist depuis l'interface (faux Plex « Découvrir »)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.puts = []  # type: List[Tuple[str, str]]
+        self.searched = []  # type: List[int]
+        orig = self.srv.handler
+
+        def handler(req: Any) -> Any:
+            if req.path == "/library/search":
+                items = [{"ratingKey": "m5", "type": "movie", "title": "Heat", "year": 1995,
+                          "summary": "Braquage à Los Angeles", "thumb": "https://metadata-static.plex.tv/heat.jpg",
+                          "Guid": [{"id": "imdb://tt0113277"}]}]
+                if "heat" not in req.query.get("query", "").lower():
+                    items = []
+                return 200, {}, {"MediaContainer": {"size": len(items), "Metadata": items}}
+            if req.method == "PUT" and req.path.startswith("/actions/"):
+                self.puts.append((req.path, req.query.get("ratingKey")))
+                return 200, {}, b""
+            return orig(req)
+        self.srv.handler = handler
+        self.app.search_now = lambda mid: self.searched.append(int(mid))  # type: ignore[assignment]
+
+    def ids(self) -> List[int]:
+        return [m["id"] for m in self.req("/api/media")[1]]
+
+    def test_search_add_and_remove(self) -> None:
+        status, data, _ = self.req("/api/watchlist/search?q=heat&kind=movie&year=1995")
+        self.assertEqual(status, 200, data)
+        cand = data["results"][0]
+        self.assertEqual((cand["title"], cand["type"], cand["in_watchlist"], cand["source"]),
+                         ("Heat", "movie", False, "plex"))
+        self.assertEqual(cand["poster_url"], "https://metadata-static.plex.tv/heat.jpg")
+        self.assertEqual(self.req("/api/watchlist/search?q=")[0], 400)
+        self.assertEqual(self.req("/api/watchlist/search?q=heat&kind=livre")[0], 400)
+        status, data, _ = self.req("/api/watchlist/add", "POST", {"candidate": cand, "add_to_plex": True,
+                                                                  "search_now": True})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["plex_added"], data)
+        self.assertIn("ajouté à la Watchlist Plex", data["message"])
+        self.assertIn("recherche lancée", data["message"])
+        mid = data["media"]["id"]
+        self.assertEqual(self.searched, [mid])
+        self.assertIn(("/actions/addToWatchlist", "m5"), self.puts)
+        self.assertIn(mid, self.ids())
+        self.assertTrue(self.req("/api/watchlist/search?q=heat")[1]["results"][0]["in_watchlist"])
+        self.assertEqual(self.req("/api/watchlist/add", "POST", {"candidate": "Heat"})[0], 400)
+        # remove (also from Plex)
+        status, data, _ = self.req("/api/media/%d" % mid, "DELETE", {"remove_from_plex": True,
+                                                                     "delete_downloads": False})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["plex_removed"], data)
+        self.assertIn("et de la Watchlist Plex", data["message"])
+        self.assertIn(("/actions/removeFromWatchlist", "m5"), self.puts)
+        self.assertNotIn(mid, self.ids())
+        self.assertEqual(self.req("/api/media/%d" % mid, "DELETE", {})[0], 404)
+
+    def test_manual_entry_and_hidden_rows(self) -> None:
+        status, data, _ = self.req("/api/watchlist/manual", "POST", {"type": "movie", "title": "Mon film",
+                                                                     "year": "2001", "search_now": False})
+        self.assertEqual(status, 200, data)
+        self.assertIn("entrée locale", data["message"])
+        self.assertTrue(data["media"]["plex_key"].startswith("local:"))
+        self.assertEqual(self.searched, [])
+        local = data["media"]["id"]
+        for body in ({"type": "livre", "title": "x"}, {"type": "movie", "title": ""},
+                     {"type": "movie", "title": "x", "year": "deux"}, {"type": 3, "title": "x"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.req("/api/watchlist/manual", "POST", body)[0], 400)
+        self.run_cmd("sync")
+        m1 = self.app.db.get_media_by_key("m1")["id"]
+        movies = self.req("/api/status")[1]["counts"]["movies"]
+        status, data, _ = self.req("/api/media/%d/remove" % m1, "POST", {"remove_from_plex": False})
+        self.assertEqual(status, 200, data)
+        self.assertIn("reste dans votre Watchlist Plex", data["warning"])
+        self.assertNotIn(m1, self.ids())
+        self.assertEqual(self.req("/api/status")[1]["counts"]["movies"], movies - 1)
+        status, data, _ = self.req("/api/media/%d" % local, "DELETE", {})
+        self.assertEqual(status, 200, data)
+        self.assertNotIn(local, self.ids())
+        self.assertEqual([p for p in self.puts if p[0].endswith("removeFromWatchlist")], [])

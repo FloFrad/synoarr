@@ -145,7 +145,26 @@ Ajouter n'importe quel indexer par son URL (flux **Torznab** ou **RSS** ; le typ
 sudo python3 synoarr.py indexer add-url "Mon indexer" "https://exemple.org/api" --api-key VOTRE_CLE
 ```
 
-Les indexers se gèrent aussi depuis l'interface web (onglet Indexers).
+**Vous utilisez déjà Prowlarr sur le NAS ?** Importez tous ses indexers torrent actifs en une fois (chacun devient
+un indexer Torznab « Nom (Prowlarr) », avec sa priorité). La clé API est dans Prowlarr > Settings > General > API Key :
+
+```bash
+sudo python3 synoarr.py indexer import-prowlarr http://127.0.0.1:9696 --api-key CLE_PROWLARR
+```
+
+Relancer l'import met à jour les indexers déjà importés (clé, priorité).
+
+**Priorité des indexers** : chaque indexer a une priorité de 1 (le plus prioritaire) à 50 (25 par défaut). Les
+indexers sont interrogés dans cet ordre et, à qualité égale (même résolution, langue et source), la release de
+l'indexer le plus prioritaire est choisie, même si une autre a plus de sources. La priorité ne fait jamais préférer
+une moins bonne résolution, une autre langue ou une moins bonne source.
+
+```bash
+sudo python3 synoarr.py indexer priority "Mon indexer" 5
+sudo python3 synoarr.py indexer add-url "Mon indexer" "https://exemple.org/api" --api-key CLE --priority 10
+```
+
+Les indexers se gèrent aussi depuis l'interface web (onglet Indexers : ajout, priorité −/+, import Prowlarr).
 
 ## Étape 6 — Tout vérifier (3 min)
 
@@ -195,13 +214,22 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 
 | Onglet | Contenu |
 |---|---|
-| Tableau de bord | état général, derniers envois |
-| Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français) |
-| Indexers | ajouter (catalogue ou URL), tester, activer, supprimer |
+| Tableau de bord | état général, téléchargements en cours (progression, vitesses, sources), derniers envois |
+| Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » |
+| Indexers | ajouter (catalogue, URL ou import Prowlarr), priorité (1 = le plus prioritaire), tester, activer, supprimer |
 | Historique | envois vers Download Station et événements |
 | Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer |
 | Journal | dernières lignes du journal, filtres, téléchargement |
 | Configuration | éditeur de `config.ini` : vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
+
+**Changer de source** : si un téléchargement ne démarre pas (pas de sources, erreur, lien mort), cliquez sur
+« Changer de source » sous ce téléchargement dans la Watchlist (ou « Choisir une source » / « Source… » pour un
+film ou un épisode encore recherché). Une fenêtre liste tous les résultats des indexers pour exactement ce film,
+cette saison ou cet épisode — y compris les résultats rejetés (une confirmation est demandée) — avec score, raison,
+taille, seeders, indexer et priorité. Vous pouvez aussi coller un lien magnet ou l'adresse d'un fichier .torrent,
+ou envoyer un fichier .torrent depuis votre ordinateur. Par défaut l'ancienne tâche Download Station est supprimée
+(case « Supprimer l'ancien téléchargement ») ; cochez « Bloquer l'ancienne release » pour qu'elle ne soit plus jamais
+choisie automatiquement. En mode simulation (`dry_run`), rien n'est envoyé ni supprimé.
 
 L'interface demande l'utilisateur `admin` et le mot de passe affiché par `init` (section `[web]` de
 `config.ini`). Ne videz pas ces deux valeurs : l'onglet Configuration affiche vos mots de passe. Sans mot de passe,
@@ -286,7 +314,9 @@ supprimés.
 | `sudo python3 synoarr.py search "Titre 1968"` | teste une recherche et affiche les scores (n'envoie rien) |
 | `sudo python3 synoarr.py process` | traite le dossier Download maintenant |
 | `sudo python3 synoarr.py status` | derniers envois et événements |
-| `sudo python3 synoarr.py indexer list` | liste les indexers |
+| `sudo python3 synoarr.py indexer list` | liste les indexers (avec leur priorité) |
+| `sudo python3 synoarr.py indexer priority <id\|nom> <1-50>` | change la priorité d'un indexer (1 = le plus prioritaire) |
+| `sudo python3 synoarr.py indexer import-prowlarr URL --api-key CLE` | importe les indexers torrent de Prowlarr |
 
 Journal : `data/synoarr.log` (consultable dans File Station).
 

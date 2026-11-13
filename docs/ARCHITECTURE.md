@@ -47,8 +47,11 @@ Objectif : remplacer Prowlarr + Radarr + Sonarr + Filebot sur un NAS Synology, *
 def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig) -> Tuple[Optional[int], str]
     # (score, raison). score None = rejeté, raison en français ("résolution 480p non acceptée"...)
 def pick_best(releases: List[Release], request: SearchRequest, cfg: QualityConfig,
-              is_blocked: Callable[[str], bool] = lambda t: False) -> Optional[Release]
+              is_blocked: Callable[[str], bool] = lambda t: False,
+              priorities: Optional[Mapping[str, int]] = None) -> Optional[Release]
 ```
+`priorities` (nom d'indexer -> priorité 1..50, 1 = le plus prioritaire) ajoute (50 - priorité) x 200 points
+(max 9800) : plus que seeders + taille (1000), moins qu'un cran de source (10000) — voir l'en-tête de quality.py.
 Règles : le titre parsé doit `titles_match` la demande ; film → année ±1 si les deux sont connues, pas de marqueur
 saison/épisode ; épisode → même saison et l'épisode dans `episodes` (pack refusé) ; saison → pack de cette saison
 (`is_season_pack` et `request.season in seasons`, épisodes vides). Rejets : `reject_words` (mots entiers sur le titre
