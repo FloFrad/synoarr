@@ -1079,6 +1079,7 @@ class WebDownloadsTest(RealAppWebBase):
         by_title = {r["title"]: r for r in res["results"]}
         self.assertIsNotNone(by_title[MOVIE]["score"])
         self.assertEqual(by_title[MOVIE]["priority"], 25)
+        self.assertEqual(by_title[MOVIE]["link_type"], "torrent")  # the fake indexer serves real .torrent files
         ita = by_title["Night.of.the.Living.Dead.1968.iTALiAN.1080p.BluRay-ITA"]
         self.assertIsNone(ita["score"])
         self.assertNotIn("download_url", json.dumps(res))

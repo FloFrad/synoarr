@@ -908,6 +908,8 @@ const DSL={waiting:'En attente',downloading:'Téléchargement',paused:'En pause'
   hash_checking:'Vérification',seeding:'Partage (seeding)',filehosting_waiting:'En attente',extracting:'Extraction',error:'Erreur',
   introuvable:'Absent de Download Station',inconnu:'État inconnu',unknown:'État inconnu',failed:'Échec'};
 const tgt=d=>d.season!=null?(d.episode!=null?` S${pad(d.season)}E${pad(d.episode)}`:` saison ${d.season}`):'';
+const LT={torrent:['b-done','.torrent','Fichier .torrent : Download Station le télécharge directement'],magnet:['b-grabbed','magnet','Lien magnet : Download Station doit d\'abord trouver des sources (peut rester « En attente »)'],inconnu:['b-planned','lien ?','Type de lien non vérifié']};
+const lt=x=>{const t=LT[x.link_type||'inconnu']||LT.inconnu;return ` <span class="b ${t[0]}" title="${esc(t[2])}">${t[1]}</span>`};
 const pr=x=>x.priority!=null?` <span class="mut" title="Priorité de l'indexer (1 = le plus prioritaire)">· prio ${esc(x.priority)}</span>`:'';
 const fpct=p=>(Math.round(p*10)/10).toLocaleString('fr-FR')+' %';
 const srcBtn=(mid,s,e,g,label,rt,txt)=>`<button class="sec xs" data-src="${mid}" data-s="${s==null?'':s}" data-e="${e==null?'':e}" data-g="${g||''}" data-t="${esc(label)}" data-rt="${esc(rt||'')}">${txt||'Changer de source'}</button>`;
@@ -1078,7 +1080,7 @@ function drawSearch(j){const r=j.result;let h=`<p class="small">${esc(j.label)} 
   if(j.status==='running')h+='<p class="mut">Recherche en cours sur les indexers…</p>';
   else if(j.status==='error')h+=con(j.output);
   else if(r){const ok=r.results.filter(x=>x.score!=null),ko=r.results.filter(x=>x.score==null);
-    const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b><div class="mut small">${esc(x.reason)}</div>
+    const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div>
       <div class="mut small sm">${size(x.size)} · ${x.seeders==null?'?':esc(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${x.seeders==null?'?':esc(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td>
       <td>${x.score!=null?`<button data-grab="${x.index}" title="Envoyer à Download Station">Envoyer<span class="hm"> à Download Station</span></button>`:''}</td></tr>`;
     const tbl=a=>`<div class="tw"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>${a.map(row).join('')}</table></div>`;
@@ -1231,7 +1233,7 @@ function drawSrcRes(j){const r=j.result,el=$('#sres2');if(j.status==='error'||!r
   SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
   if(!r.results.length){el.innerHTML=`<p class="mut">Aucun résultat pour ${esc(r.request)} (langues : ${langs}). Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
   const ok=r.results.filter(x=>x.score!=null).length;
-  el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis.</p><div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
+  el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p><div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
   ${r.results.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b><div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
   <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir<span class="hm"> quand même</span>':'Choisir'}</button></td></tr>`).join('')}</table></div>`}
 async function srcSend(body){const S0=SRC;if(!S0)return;const msg=$('#smsg'),btns=[...document.querySelectorAll('#srcb button')];

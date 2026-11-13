@@ -669,3 +669,31 @@ class SendModeTests(SearcherTestBase):
         from synoarr.searcher import _looks_like_torrent
         self.assertTrue(_looks_like_torrent(b"d8:announce3:abc4:infod4:name1:xee"))
         self.assertFalse(_looks_like_torrent(b"<html>error</html>"))
+
+
+
+class LinkTypeTests(unittest.TestCase):
+    def test_probe_classifies_links(self) -> None:
+        from synoarr.app import App
+        from synoarr.models import Release
+        from tests.fakes import FakeServer
+
+        def handler(req: Any) -> Any:
+            if req.path == "/t.torrent":
+                return 200, {}, torrent("Movie.2020.1080p")
+            if req.path == "/m":
+                return 302, {"Location": "magnet:?xt=urn:btih:" + "c" * 40}, b""
+            return 404, {}, b"nope"
+
+        class Job:
+            def emit(self, level: str, msg: str) -> None:
+                pass
+        with FakeServer(handler) as srv:
+            rels = [Release(title="A", indexer="i", download_url=srv.url + "/t.torrent"),
+                    Release(title="B", indexer="i", download_url=srv.url + "/m"),
+                    Release(title="C", indexer="i", magnet="magnet:?xt=urn:btih:" + "d" * 40),
+                    Release(title="D", indexer="i", download_url=srv.url + "/missing")]
+            report = [(r, None, "") for r in rels]
+            results = [{"index": i} for i in range(len(rels))]
+            App._detect_link_types(object.__new__(App), Job(), report, results)
+        self.assertEqual([r["link_type"] for r in results], ["torrent", "magnet", "magnet", "inconnu"])

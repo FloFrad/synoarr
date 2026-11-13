@@ -1493,10 +1493,54 @@ class App:
                             "leechers": rel.leechers, "indexer": rel.indexer, "priority": prios.get(rel.indexer),
                             "score": score, "reason": reason, "magnet": bool(rel.magnet),
                             "torrent": bool(rel.download_url)})
+        self._detect_link_types(job, report, results)
         accepted = sum(1 for r in results if r["score"] is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(results), accepted))
         return {"media_id": target[0], "season": target[1], "episode": target[2], "request": req.describe(),
                 "kind": req.kind, "languages": list(req.languages), "total": len(results), "results": results}
+
+    LINK_PROBE_MAX = 40  # results whose link is checked (best first)
+
+    def _detect_link_types(self, job: Job, report: List[Any], results: List[Dict[str, Any]]) -> None:
+        """results[i]["link_type"] = "torrent" | "magnet" | "inconnu". A link from the indexer (Prowlarr...)
+        is fetched once WITHOUT following a redirect to a magnet: a .torrent file or a magnet behind the link."""
+        from concurrent.futures import ThreadPoolExecutor
+        from .bencode import torrent_info
+        from .searcher import _looks_like_torrent
+
+        def probe(rel: Any) -> str:
+            if not rel.download_url:
+                return "magnet" if rel.magnet else "inconnu"
+            try:
+                http = HttpClient(timeout=10, retries=0, use_proxy=not is_local_url(rel.download_url))
+                resp = http.get(rel.download_url, raise_for_status=False)
+            except Exception:
+                return "inconnu"
+            if resp.redirect_location and resp.redirect_location.lower().startswith("magnet:"):
+                return "magnet"
+            if resp.ok and resp.body:
+                try:
+                    torrent_info(resp.body)
+                    return "torrent"
+                except ValueError:
+                    return "torrent" if _looks_like_torrent(resp.body) else "inconnu"
+            return "inconnu"
+
+        for r in results:
+            r["link_type"] = "magnet" if (report[r["index"]][0].magnet and not report[r["index"]][0].download_url) \
+                else "inconnu"
+        todo = [r for r in results if report[r["index"]][0].download_url][:self.LINK_PROBE_MAX]
+        if not todo:
+            return
+        job.emit("info", "Vérification du type de lien (fichier .torrent ou magnet) de %d résultat(s)…" % len(todo))
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for r, kind in zip(todo, pool.map(lambda r: probe(report[r["index"]][0]), todo)):
+                r["link_type"] = kind
+        counts = {}  # type: Dict[str, int]
+        for r in results:
+            counts[r["link_type"]] = counts.get(r["link_type"], 0) + 1
+        job.emit("info", "Liens : %d fichier(s) .torrent, %d magnet(s), %d inconnu(s)"
+                 % (counts.get("torrent", 0), counts.get("magnet", 0), counts.get("inconnu", 0)))
 
     def replace_source(self, media_id: Any, season: Any = None, episode: Any = None, grab_id: Any = None,
                        job_id: Any = None, index: Any = None, link: Optional[str] = None,
