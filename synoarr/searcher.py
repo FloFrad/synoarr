@@ -78,6 +78,7 @@ class Searcher:
         self.ds = ds
         self.tmdb = tmdb
         self.indexers_provider = indexers_provider
+        self._episode_errors = set()  # media ids whose episode list failed to load (retry, never guess)
         # set by the daemon on shutdown: a long search cycle stops between two items
         self.stop_event = None  # type: Optional[threading.Event]
 
@@ -145,6 +146,7 @@ class Searcher:
                 episodes = self.plex.show_episodes(media["plex_key"])
             except Exception as exc:
                 log.warning("Épisodes Plex indisponibles pour %s : %s", media["title"], exc)
+                self._episode_errors.add(media["id"])
         if not episodes and self.tmdb is not None and getattr(self.tmdb, "enabled", False):
             tmdb_id = media.get("tmdb")
             if not tmdb_id:
@@ -153,8 +155,10 @@ class Searcher:
             if tmdb_id:
                 episodes = self.tmdb.show_episodes(str(tmdb_id))
         if not episodes:
-            log.info("Aucune liste d'épisodes pour %s : recherche par saisons complètes", media["title"])
+            if media["id"] not in self._episode_errors:
+                log.info("Aucune liste d'épisodes pour %s : recherche par saisons complètes", media["title"])
             return
+        self._episode_errors.discard(media["id"])
         first_sync = not self.db.list_episodes(media["id"])
         policy = self.cfg.series.monitor
         added_on = (media.get("added_at") or _today())[:10]
@@ -306,7 +310,13 @@ class Searcher:
                      stats: Dict[str, int]) -> None:
         all_eps = self.db.list_episodes(media["id"])
         if not all_eps:
-            self._search_show_without_episodes(media, indexers, force, stats)
+            if media["id"] in self._episode_errors:
+                log.info("Liste d'épisodes de %s momentanément indisponible : recherche reportée", media["title"])
+            elif self.cfg.series.monitor != "all":
+                log.info("Aucune liste d'épisodes pour %s : impossible d'appliquer monitor = %s sans elle "
+                         "(ajoutez une clé TMDb)", media["title"], self.cfg.series.monitor)
+            else:
+                self._search_show_without_episodes(media, indexers, force, stats)
             return
         wanted = [e for e in all_eps if e["status"] == "wanted" and _is_aired(e["air_date"])]
         if not wanted:

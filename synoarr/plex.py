@@ -326,8 +326,9 @@ class PlexClient:
             try:
                 eps, _ = self._paginated("/library/metadata/%s/children" % skey)
             except HttpError as exc:
-                log.warning("Plex : épisodes de la saison %s indisponibles : %s", sidx, exc)
-                continue
+                # never return a partial list: missing old episodes would later be added as "wanted"
+                raise HttpError("Plex : épisodes de la saison %s indisponibles : %s" % (sidx, exc),
+                                exc.status, exc.body, exc.url)
             for ep in eps:
                 self._add_episode(episodes, ep, sidx)
         if not season_items:
