@@ -49,17 +49,12 @@ class DownloadStationConfig:
     password: str = ""
     destination: str = "Download"  # shared folder (+ optional subfolder) where Download Station saves files
     verify_ssl: bool = False  # DSM usually uses a self-signed certificate
-    # Open trackers added to magnet links that carry fewer than 2 trackers: a magnet without tracker can only be
-    # resolved through DHT, and stays "En attente" forever when DHT is off or blocked.
-    extra_trackers: List[str] = field(default_factory=lambda: [
-        "udp://tracker.opentrackr.org:1337/announce",
-        "udp://open.demonii.com:1337/announce",
-        "udp://open.stealth.si:80/announce",
-        "udp://tracker.torrent.eu.org:451/announce",
-        "udp://exodus.desync.com:6969/announce",
-        "udp://explodie.org:6969/announce",
-        "udp://tracker.openbittorrent.com:6969/announce",
-    ])
+    # How a .torrent link is handed over: "url" = Download Station downloads the link itself (like « Créer >
+    # Saisir l'URL »), falling back to uploading the original file; "file" = synoarr uploads the original file.
+    send_mode: str = "url"
+    # Optional public trackers appended to magnet links with fewer than 2 trackers. Empty (default): magnets are
+    # sent exactly as the indexer provides them.
+    extra_trackers: List[str] = field(default_factory=list)
     # A download still waiting without any source after this many hours is abandoned: the release is blocklisted
     # and another one is searched (0 = never)
     stalled_hours: float = 6.0
@@ -175,6 +170,9 @@ class Config:
         problems = []
         if self.paths.action not in ("move", "copy", "hardlink"):
             problems.append("[paths] action doit valoir move, copy ou hardlink (valeur: %r)" % self.paths.action)
+        if self.downloadstation.send_mode not in ("url", "file"):
+            problems.append("[downloadstation] send_mode doit valoir url ou file (valeur: %r)"
+                            % self.downloadstation.send_mode)
         if self.series.monitor not in ("all", "future", "latest_season"):
             problems.append("[series] monitor doit valoir all, future ou latest_season (valeur: %r)" % self.series.monitor)
         for fmt_name in ("movie_format", "movie_collection_format", "series_format"):
@@ -318,6 +316,7 @@ def load_config(path: Optional[str]) -> Config:
     cfg.downloadstation.destination = cfg.downloadstation.destination.strip().strip("/")
     cfg.plex.server_url = cfg.plex.server_url.rstrip("/")
     cfg.paths.action = cfg.paths.action.lower().strip()
+    cfg.downloadstation.send_mode = (cfg.downloadstation.send_mode or "url").lower().strip()
     cfg.series.monitor = cfg.series.monitor.lower().strip()
     for attr in ("download_dir", "movies_dir", "series_dir"):
         value = getattr(cfg.paths, attr).strip()

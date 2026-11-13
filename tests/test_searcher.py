@@ -115,6 +115,7 @@ class SearcherTestBase(unittest.TestCase):
         self.cfg = Config()
         self.cfg.quality.languages = ["en", "fr"]
         self.cfg.quality.prefer_words = []
+        self.cfg.downloadstation.send_mode = "file"  # FakeDS records uploaded files (url mode: SendModeTests)
         self.cfg.paths.movies_dir = os.path.join(self.tmp, "Films")
         self.cfg.paths.series_dir = os.path.join(self.tmp, "Séries")
         os.makedirs(self.cfg.paths.movies_dir)
@@ -505,7 +506,7 @@ class ManualSourceTests(SearcherTestBase):
         rel = Searcher.release_from_link(self.MAGNET, "Heat")
         self.assertTrue(self.searcher.grab(rel, self.m, None, None))
         self.assertEqual(len(self.ds.added), 1)
-        self.assertTrue(self.ds.added[0].startswith(self.MAGNET + "&tr="))  # public trackers appended
+        self.assertEqual(self.ds.added[0], self.MAGNET)  # sent exactly as provided
         g = self.db.list_grabs()[0]
         self.assertEqual((g["indexer"], g["info_hash"], g["media_id"]),
                          ("manuel", "abcdef0123456789abcdef0123456789abcdef01", self.m["id"]))
@@ -599,6 +600,7 @@ class StalledMagnetTests(SearcherTestBase):
         media = self.media("m1")
         rel = Release(title="Heat.1995.1080p.BluRay.x264-GRP", indexer="idx",
                       magnet="magnet:?xt=urn:btih:%s&dn=Heat" % ("a" * 40))
+        self.cfg.downloadstation.extra_trackers = ["udp://tracker.opentrackr.org:1337/announce"]
         self.assertTrue(self.searcher.grab(rel, media, None, None))
         sent = self.ds.added[-1]
         self.assertIn("tr=udp%3A%2F%2Ftracker.opentrackr.org", sent)
@@ -623,3 +625,47 @@ class StalledMagnetTests(SearcherTestBase):
         self.assertFalse(self.searcher._is_stalled(task, {"created_at": None}, 6))
         task = DSTask(id="x", title="X", status="downloading", created=int(_time.time() - 9 * 3600))
         self.assertFalse(self.searcher._is_stalled(task, {"created_at": None}, 6))
+
+
+
+class SendModeTests(SearcherTestBase):
+    """Links from the indexer are handed over unmodified."""
+
+    def test_url_mode_gives_the_link_to_download_station(self) -> None:
+        self.cfg.downloadstation.send_mode = "url"
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        rel = self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.assertTrue(self.searcher.grab(rel, self.media("m1"), None, None))
+        self.assertEqual(self.ds.added, [rel.download_url])  # the indexer link itself, not a re-upload
+        g = self.db.list_grabs()[0]
+        self.assertEqual(g["torrent_name"], "Heat.1995.1080p.BluRay.x264-GRP")  # still known for matching
+
+    def test_url_mode_falls_back_to_original_file(self) -> None:
+        self.cfg.downloadstation.send_mode = "url"
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        rel = self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        uploads = []
+
+        def refuse(url: str) -> None:
+            raise RuntimeError("lien injoignable")
+        self.ds.add_url = refuse  # type: ignore[assignment]
+        orig = self.ds.add_torrent_file
+        self.ds.add_torrent_file = lambda data, fn: (uploads.append(data), orig(data, fn))  # type: ignore
+        self.assertTrue(self.searcher.grab(rel, self.media("m1"), None, None))
+        self.assertEqual(uploads, [self.http.get(rel.download_url).body])  # byte-for-byte original
+
+    def test_magnet_sent_as_is_by_default(self) -> None:
+        from synoarr.models import Release
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        magnet = "magnet:?xt=urn:btih:%s&dn=Heat%%201995&tr=udp%%3A%%2F%%2Fx" % ("b" * 40)
+        self.assertTrue(self.searcher.grab(Release(title="Heat.1995.1080p", indexer="i", magnet=magnet),
+                                           self.media("m1"), None, None))
+        self.assertEqual(self.ds.added, [magnet])
+
+    def test_unparseable_but_torrent_looking_file_is_still_sent(self) -> None:
+        from synoarr.searcher import _looks_like_torrent
+        self.assertTrue(_looks_like_torrent(b"d8:announce3:abc4:infod4:name1:xee"))
+        self.assertFalse(_looks_like_torrent(b"<html>error</html>"))

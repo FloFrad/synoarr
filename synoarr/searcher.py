@@ -74,6 +74,11 @@ def _is_local_key(plex_key: Optional[str]) -> bool:
     return str(plex_key or "").startswith("local:")
 
 
+def _looks_like_torrent(body: bytes) -> bool:
+    head = body.lstrip()[:1]
+    return head == b"d" and b"4:info" in body
+
+
 class Searcher:
     def __init__(self, cfg: "Config", db: Database, http: HttpClient,
                  plex: Optional["PlexClient"], ds: Optional["DownloadStation"], tmdb: Optional["TmdbClient"],
@@ -669,24 +674,40 @@ class Searcher:
         return True
 
     def _send(self, release: Release) -> Tuple[Optional[str], Optional[str]]:
+        """Send *release* to Download Station WITHOUT modifying what the indexer (Prowlarr...) provides:
+        - a .torrent link: Download Station downloads the link itself (exactly like « Créer > Saisir l'URL »),
+          or, if it cannot, synoarr uploads the original bytes untouched;
+        - a magnet (direct or behind a redirect): sent as is."""
         assert self.ds is not None
         if release.download_url:
             resp = self.http.get(release.download_url, raise_for_status=False, timeout=60)
             if resp.redirect_location and resp.redirect_location.lower().startswith("magnet:"):
                 return self._send_magnet(resp.redirect_location)
             if resp.ok and resp.body:
+                body = resp.body
+                name, info_hash = None, None  # type: Optional[str], Optional[str]
                 try:
-                    name, info_hash = bencode.torrent_info(resp.body)
+                    name, info_hash = bencode.torrent_info(body)
                 except ValueError:
-                    if release.magnet:
-                        return self._send_magnet(release.magnet)
-                    raise ValueError("le lien ne renvoie pas un fichier .torrent valide (%s)"
-                                     % redact(release.download_url))
+                    if not _looks_like_torrent(body):  # HTML error page, JSON...
+                        if release.magnet:
+                            return self._send_magnet(release.magnet)
+                        raise ValueError("le lien ne renvoie pas un fichier .torrent valide (%s)"
+                                         % redact(release.download_url))
+                    log.debug("Fichier .torrent non analysable par synoarr, envoyé tel quel : %s", release.title)
                 if self._hash_already_grabbed(info_hash):
                     raise _AlreadyGrabbed()
-                filename = re.sub(r"[^\w.\- ()\[\]]+", "_", name or "release")[:150] + ".torrent"
-                self.ds.add_torrent_file(resp.body, filename)
-                return name, info_hash
+                mode = (getattr(self.cfg.downloadstation, "send_mode", "url") or "url").lower()
+                if mode == "url":
+                    try:
+                        self.ds.add_url(release.download_url)
+                        log.info("Lien .torrent transmis à Download Station (téléchargé par Download Station)")
+                        return name or release.title, info_hash
+                    except Exception as exc:  # DS cannot reach the link: upload the same bytes ourselves
+                        log.info("Download Station ne peut pas télécharger le lien (%s) : envoi du fichier", exc)
+                filename = re.sub(r"[^\w.\- ()\[\]]+", "_", name or release.title or "release")[:150] + ".torrent"
+                self.ds.add_torrent_file(body, filename)  # original bytes, never modified
+                return name or release.title, info_hash
             if release.magnet:
                 return self._send_magnet(release.magnet)
             raise HttpError("HTTP %s en téléchargeant le .torrent" % resp.status, resp.status, resp.body,
@@ -700,8 +721,9 @@ class Searcher:
         name, info_hash = bencode.magnet_info(magnet)
         if self._hash_already_grabbed(info_hash):
             raise _AlreadyGrabbed()
-        trackers = getattr(self.cfg.downloadstation, "extra_trackers", None) or []
-        self.ds.add_url(bencode.add_trackers(magnet, trackers))
+        trackers = getattr(self.cfg.downloadstation, "extra_trackers", None) or []  # empty by default: as is
+        self.ds.add_url(bencode.add_trackers(magnet, trackers) if trackers else magnet)
+        log.info("Lien magnet transmis à Download Station : %s", magnet[:120])
         return name, info_hash
 
     # ================================================================ failed downloads

@@ -1280,6 +1280,7 @@ class App:
     _dl_cache = None  # type: Optional[Tuple[Any, float, Optional[List[Any]], Optional[str]]]
     _dl_gen = 0  # incrémenté par invalidate_downloads : un rafraîchissement plus ancien n'écrit pas le cache
     _dl_refreshing = None  # type: Optional[Tuple[Any, object]]  # (ds, jeton) du rafraîchissement en cours
+    _dl_event = None  # type: Optional[threading.Event]  # signalé à la fin du rafraîchissement en cours
     _dl_client = None  # type: Optional[Tuple[Tuple[Any, ...], Any]]  # (clé, client DS à délai court)
 
     def invalidate_downloads(self) -> None:
@@ -1321,9 +1322,24 @@ class App:
             if not force and self._dl_refreshing is not None and self._dl_refreshing[0] is ds:
                 if usable:
                     return cache[2], cache[3]
-                return None, "Download Station ne répond pas encore : progression des téléchargements inconnue"
-            token = object()
-            self._dl_refreshing = (ds, token)
+                waiter = self._dl_event
+            else:
+                waiter = None
+            if waiter is None:
+                token = object()
+                self._dl_refreshing = (ds, token)
+                ev = threading.Event()
+                self._dl_event = ev
+        if waiter is not None:
+            # first load: another request is already asking DSM -> wait for its answer (bounded) instead of
+            # showing a scary "ne répond pas" for a simple overlap of two page requests
+            waiter.wait(2.5)
+            with self._dl_lock:
+                cache = self._dl_cache
+                if cache is not None and cache[0] is ds:
+                    return cache[2], cache[3]
+            return None, "Download Station ne répond pas encore : progression des téléchargements inconnue"
+        with self._dl_lock:
             gen = self._dl_gen
             client = self._ds_progress_client(ds)
         try:
@@ -1337,6 +1353,7 @@ class App:
                 self._dl_refreshing = None
             if self._dl_gen == gen and self.ds is ds:
                 self._dl_cache = (ds, time.time(), tasks, warning)
+        ev.set()  # wake the requests that waited for this refresh
         return tasks, warning
 
     @staticmethod

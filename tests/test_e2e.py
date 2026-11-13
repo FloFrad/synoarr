@@ -54,6 +54,7 @@ class World:
         self.tasks = {}  # id -> dict
         self.deleted = []
         self.uploads = []
+        self.url_adds = []  # .torrent links handed to Download Station (send_mode = url)
         self.base = ""
 
     # ------------------------------------------------------------- Plex
@@ -152,6 +153,18 @@ class World:
                 if json.loads(params.get("type", '""')) == "url":
                     from synoarr.bencode import magnet_info
                     for uri in json.loads(params.get("url", "[]")):
+                        if uri.lower().startswith(("http://", "https://")):
+                            # like the real Download Station: it downloads the .torrent link itself
+                            import urllib.request
+                            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                            content = opener.open(uri, timeout=10).read()
+                            name = content.split(b"4:name", 1)[1]
+                            length, rest = name.split(b":", 1)
+                            title = rest[:int(length)].decode()
+                            self.uploads.append((uri.rsplit("/", 1)[-1], dest))
+                            self.url_adds.append(uri)
+                            self._new_task(title, dest)
+                            continue
                         dn, _h = magnet_info(uri)
                         self._new_task(dn or (_h or uri), dest, uri=uri)
             return 200, {}, {"success": True, "data": {"list_id": [], "task_id": list(self.tasks)[-1:]}}
