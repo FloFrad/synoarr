@@ -922,10 +922,36 @@ class Organizer:
             except _PlanError as exc:
                 problems.append((v, str(exc)))
                 continue
-            items.append(_Item(v, stem + "." + _ext(v), {
+            dst_path = self._existing_episode_variant(stem, season, episodes[0]) or stem + "." + _ext(v)
+            items.append(_Item(v, dst_path, {
                 "kind": "episode", "media_id": media.get("id") if media else None, "title": show, "year": year,
                 "season": season, "episodes": episodes, "size": _file_size(v)}))
         return items, problems
+
+    def _existing_episode_variant(self, stem: str, season: int, episode: int) -> Optional[str]:
+        """An episode already in the library under another name ("Show - S02E01 - Title.mkv" vs
+        "Show - S02E01.mkv", other extension...) -> its path, so the size/upgrade rules apply instead of
+        creating a duplicate."""
+        folder, base = os.path.split(stem)
+        code = "S%02dE%02d" % (season, episode)
+        idx = base.upper().find(code)
+        if idx < 0 or not os.path.isdir(folder):
+            return None
+        prefix = base[:idx + len(code)].lower()
+        vexts = set(self.cfg.naming.video_extensions)
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            return None
+        for n in names:
+            low = n.lower()
+            if not low.startswith(prefix) or _ext(n) not in vexts or n.startswith(TMP_PREFIX):
+                continue
+            nxt = low[len(prefix):len(prefix) + 1]
+            if nxt.isdigit():  # S01E01 must not match S01E010
+                continue
+            return os.path.join(folder, n)
+        return None
 
     def _season_from_folders(self, entry_path: str, video: str) -> Optional[int]:
         if not os.path.isdir(entry_path):

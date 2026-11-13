@@ -252,3 +252,21 @@ class HttpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InitTests(unittest.TestCase):
+    def test_init_generates_a_web_password(self):
+        import contextlib
+        import io as _io
+        from synoarr import cli
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "config.ini")
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(cli.main(["init", "--config", target]), 0)
+            cfg = config_mod.load_config(target)
+            self.assertEqual(cfg.web.username, "admin")
+            self.assertGreaterEqual(len(cfg.web.password), 10)
+            self.assertIn(cfg.web.password, buf.getvalue())
+            self.assertEqual(cfg.downloadstation.username, "")  # only the [web] section is filled
+            self.assertEqual(cfg.validate(), [])

@@ -69,6 +69,9 @@ récent), puis recommencez.
 sudo python3 synoarr.py init
 ```
 
+La commande affiche le **mot de passe de l'interface web** (utilisateur `admin`) : notez-le. Il est aussi dans
+`config.ini`, section `[web]`.
+
 Ouvrez ensuite `config.ini` : File Station → `docker/synoarr/config.ini` → clic droit → Ouvrir avec
 l'**Éditeur de texte** (paquet « Text Editor » du Centre de paquets), ou en SSH avec `sudo vi config.ini`.
 
@@ -200,9 +203,9 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 | Journal | dernières lignes du journal, filtres, téléchargement |
 | Configuration | éditeur de `config.ini` : vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
 
-**Important** : protégez l'interface par un mot de passe, car l'onglet Configuration affiche vos mots de passe.
-Dans l'onglet Configuration, renseignez `[web] username` et `password`, enregistrez, puis cliquez sur
-« Redémarrer maintenant ».
+L'interface demande l'utilisateur `admin` et le mot de passe affiché par `init` (section `[web]` de
+`config.ini`). Ne videz pas ces deux valeurs : l'onglet Configuration affiche vos mots de passe. Sans mot de passe,
+l'interface n'est accessible que par l'adresse IP ou le nom local du NAS.
 
 Arrêter / redémarrer :
 
@@ -243,7 +246,14 @@ sudo sh scripts/restart.sh
    sudo docker exec -it synoarr python3 /app/synoarr.py process --dry-run
    ```
 
-En Docker, le journal est dans `config/data/synoarr.log`.
+En Docker :
+
+- le journal est dans `config/data/synoarr.log` ;
+- le mot de passe de l'interface web est généré au premier démarrage : il est dans `config/config.ini`, section
+  `[web]` ;
+- `Download` et `video` étant deux montages séparés, un « déplacement » est en réalité une copie suivie d'une
+  suppression : c'est plus lent pour les grosses saisons, et `action = hardlink` n'y fonctionne pas. Pour des
+  déplacements instantanés, préférez la méthode native.
 
 ---
 

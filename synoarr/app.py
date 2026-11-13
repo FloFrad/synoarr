@@ -973,13 +973,16 @@ class App:
                 log.info("Interface web : http://<ip-du-nas>:%s", self.cfg.web.port)
             except OSError as exc:
                 log.error("Interface web impossible sur le port %s : %s", self.cfg.web.port, exc)
-        watch_every = max(1.0, self.cfg.general.watchlist_interval_minutes) * 60
-        process_every = max(0.5, self.cfg.general.process_interval_minutes) * 60
         next_watch = time.time() + 5
         next_process = time.time() + 2
         while not self._stop.is_set():
             try:
                 now = time.time()
+                # re-read at each turn: a config change made from the web UI applies without restart
+                watch_every = max(1.0, self.cfg.general.watchlist_interval_minutes) * 60
+                process_every = max(0.5, self.cfg.general.process_interval_minutes) * 60
+                next_watch = min(next_watch, now + watch_every)
+                next_process = min(next_process, now + process_every)
                 if now >= next_process:
                     self.job_process()
                     next_process = time.time() + process_every

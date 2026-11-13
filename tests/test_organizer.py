@@ -839,3 +839,25 @@ class NewNamingTests(OrganizerTestBase):
         self.org().run_once()
         self.assertTrue(os.path.isfile(self.series_path("Some Show", "Saison 03", "Some Show - S03E04.mkv")),
                         os.listdir(self.series_path("Some Show", "Saison 03")))
+
+
+class FinalQaFixTests(NewNamingTests):
+    def test_episode_with_other_name_is_not_duplicated(self) -> None:
+        existing = self.make("Test Show/Saison 02/Test Show - S02E01 - Return.mkv", 5000, base=self.series)
+        self.make("Test.Show.S02E01.720p.HDTV.x264-LOW.mkv", 1000)  # smaller, no episode title known
+        self.org().run_once()
+        self.assertEqual(os.listdir(os.path.dirname(existing)), ["Test Show - S02E01 - Return.mkv"])
+        self.assertEqual(os.path.getsize(existing), 5000)
+
+    def test_bigger_episode_replaces_existing_variant(self) -> None:
+        existing = self.make("Test Show/Saison 02/Test Show - S02E01 - Return.mkv", 1000, base=self.series)
+        self.make("Test.Show.S02E01.1080p.WEB-DL.x264-GRP.mkv", 5000)
+        self.org().run_once()
+        self.assertEqual(os.listdir(os.path.dirname(existing)), ["Test Show - S02E01 - Return.mkv"])
+        self.assertEqual(os.path.getsize(existing), 5000)
+
+    def test_unrelated_tmdb_result_is_ignored(self) -> None:
+        from synoarr.tmdb import TmdbClient
+        pick = TmdbClient._pick([{"title": "Night of the Living Dead", "release_date": "1968-10-01"}],
+                                "My Holiday", 2019, "title", "original_title", "release_date")
+        self.assertIsNone(pick)

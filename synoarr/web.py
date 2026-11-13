@@ -167,6 +167,26 @@ def mask_secrets(row: Any) -> Any:
     return out
 
 
+def host_is_local(host_header: str) -> bool:
+    """True for an IP address, localhost, a single-label LAN name ("diskstation") or *.local / *.lan / *.home."""
+    import ipaddress
+    host = (host_header or "").strip().lower()
+    if not host:
+        return True  # HTTP/1.0 clients, tools
+    if host.startswith("["):  # [::1]:8778
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or "." not in host:
+        return True
+    return host.endswith((".local", ".lan", ".home", ".localdomain", ".home.arpa"))
+
+
 class WebServer:
     def __init__(self, app: Any, host: str, port: int, username: str = "", password: str = ""):
         self.app = app
@@ -556,6 +576,11 @@ def _make_handler(server: WebServer) -> type:
                     pass
 
         def _handle_inner(self) -> None:
+            if not server.auth_enabled and not host_is_local(self.headers.get("Host", "")):
+                # protection contre le « DNS rebinding » quand aucun mot de passe n'est configuré
+                self._send(403, {"error": "Accès refusé : utilisez l'adresse IP du NAS, ou configurez [web] "
+                                          "username et password pour y accéder par un nom de domaine"})
+                return
             if not server.check_auth(self.headers.get("Authorization")):
                 self._send(401, {"error": "Authentification requise"},
                            extra={"WWW-Authenticate": 'Basic realm="synoarr", charset="UTF-8"'})

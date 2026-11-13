@@ -5,7 +5,6 @@ import argparse
 import errno
 import logging
 import os
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -128,6 +127,23 @@ def _app(args: argparse.Namespace, console: bool = True):  # -> App
 
 
 # ---------------------------------------------------------------- commands
+def write_initial_config(target: str) -> str:
+    """Copy config.example.ini to *target* with a random web UI password. Returns that password."""
+    import re as _re
+    import secrets
+    with open(os.path.join(ROOT_DIR, "config.example.ini"), "r", encoding="utf-8") as fh:
+        text = fh.read()
+    password = secrets.token_urlsafe(9)
+    head, sep, web = text.partition("[web]")
+    if sep:
+        web = _re.sub(r"(?m)^username\s*=\s*$", "username = admin", web, count=1)
+        web = _re.sub(r"(?m)^password\s*=\s*$", "password = " + password, web, count=1)
+        text = head + sep + web
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return password
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     target = args.config
     if os.path.exists(target):
@@ -139,9 +155,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     os.makedirs(folder, exist_ok=True)
     if created_folder:
         _chown_to_sudo_user(folder)
-    shutil.copyfile(example, target)
+    if not os.path.isfile(example):
+        _out(KO + "config.example.ini introuvable dans %s" % ROOT_DIR)
+        return 2
+    password = write_initial_config(target)
     _chown_to_sudo_user(target)
     _out(OK + "Fichier créé : %s" % target)
+    _out("      Interface web protégée : utilisateur « admin », mot de passe « %s »" % password)
+    _out("      (modifiable dans [web] username / password)")
     _out("      Éditez-le (identifiants Download Station, dossiers), puis lancez : " + _command("check"))
     return 0
 
@@ -483,8 +504,10 @@ def _wait_for_docker_config(args: argparse.Namespace) -> bool:
     folder = os.path.dirname(os.path.abspath(target))
     if os.path.exists(target) or not _in_docker() or not os.path.isdir(folder):
         return False
-    shutil.copyfile(os.path.join(ROOT_DIR, "config.example.ini"), target)
+    password = write_initial_config(target)
     mtime = os.path.getmtime(target)
+    _out(OK + "Interface web protégée : utilisateur « admin », mot de passe « %s » ([web] dans config.ini)"
+         % password)
     msg = ("Configuration créée : éditez %s (config/config.ini sur le NAS) ; synoarr démarrera dès qu'il sera "
            "enregistré (ou redémarrez le conteneur)." % target)
     _out(WARN + msg)

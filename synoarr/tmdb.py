@@ -84,7 +84,12 @@ class TmdbClient:
             return s
 
         # keep TMDb popularity order on ties (sorted is stable)
-        return sorted(results[:20], key=score, reverse=True)[0]
+        best = sorted(results[:20], key=score, reverse=True)[0]
+        if score(best) < 10:
+            # TMDb search is fuzzy: "My Holiday 2019" returns some unrelated 2019 film. Never rename a file
+            # after a movie/show whose title does not match.
+            return None
+        return best
 
     # ------------------------------------------------------------ search
     def search_movie(self, title: str, year: Optional[int]) -> Optional[Dict]:

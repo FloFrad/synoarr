@@ -896,3 +896,12 @@ class WebConfigAuthTest(RealAppWebBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostCheckTests(unittest.TestCase):
+    def test_host_is_local(self) -> None:
+        from synoarr.web import host_is_local
+        for h in ("192.168.1.10:8778", "[::1]:8778", "localhost:8778", "diskstation:8778", "nas.local", ""):
+            self.assertTrue(host_is_local(h), h)
+        for h in ("evil.example.com", "attacker.com:8778", "rebind.evil.net"):
+            self.assertFalse(host_is_local(h), h)
