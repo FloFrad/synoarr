@@ -188,8 +188,21 @@ Panneau de configuration → **Planificateur de tâches** :
 
 Ouvrez l'interface : **http://IP-DU-NAS:8778**
 
-Conseil : protégez l'interface par un mot de passe (`[web] username` et `password` dans `config.ini`, puis
-redémarrez).
+Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
+
+| Onglet | Contenu |
+|---|---|
+| Tableau de bord | état général, derniers envois |
+| Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français) |
+| Indexers | ajouter (catalogue ou URL), tester, activer, supprimer |
+| Historique | envois vers Download Station et événements |
+| Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer |
+| Journal | dernières lignes du journal, filtres, téléchargement |
+| Configuration | éditeur de `config.ini` : vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
+
+**Important** : protégez l'interface par un mot de passe, car l'onglet Configuration affiche vos mots de passe.
+Dans l'onglet Configuration, renseignez `[web] username` et `password`, enregistrez, puis cliquez sur
+« Redémarrer maintenant ».
 
 Arrêter / redémarrer :
 
