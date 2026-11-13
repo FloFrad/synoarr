@@ -151,6 +151,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         cfg = _load(args)
     except ConfigError as exc:
         _out(KO + str(exc))
+        if "introuvable" in str(exc):
+            _out("      Créez-le avec : " + _command("init"))
         return 2
     errors = 0
     _out("synoarr %s — vérification de %s" % (__version__, cfg.path))

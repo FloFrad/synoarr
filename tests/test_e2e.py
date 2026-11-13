@@ -424,6 +424,93 @@ class AppAndCliRobustnessTest(EndToEndTest):
         self.assertEqual(rc, 1)
         self.assertIn("sudo", out)
 
+    def test_config_option_before_the_command(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["--config", self.cfg_path, "watchlist", "--no-sync"])
+        for h in list(__import__("logging").getLogger().handlers):
+            __import__("logging").getLogger().removeHandler(h)
+            h.close()
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertIn("Watchlist vide", buf.getvalue())
+        args = cli.build_parser().parse_args(["--config", "/a.ini", "check", "--dry-run"])
+        self.assertEqual((args.config, args.dry_run), ("/a.ini", True))
+        args = cli.build_parser().parse_args(["check", "-c", "/b.ini"])
+        self.assertEqual((args.config, args.dry_run, args.verbose), ("/b.ini", False, False))
+
+    def test_init_gives_the_file_back_to_the_sudo_user(self):
+        from unittest import mock
+        target = os.path.join(self.tmp, "new", "config.ini")
+        calls = []
+        with mock.patch.dict(os.environ, {"SUDO_UID": "1026", "SUDO_GID": "100"}), \
+                mock.patch.object(cli, "_not_root", return_value=False), \
+                mock.patch("os.chown", side_effect=lambda p, u, g: calls.append((p, u, g))):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main(["init", "--config", target])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(target))
+        self.assertIn((target, 1026, 100), calls)
+        self.assertIn((os.path.dirname(target), 1026, 100), calls)
+        self.assertIn("sudo python3 synoarr.py check", buf.getvalue())
+
+    def test_docker_first_run_creates_the_config_and_waits(self):
+        from unittest import mock
+        target = os.path.join(self.tmp, "config", "config.ini")
+        os.makedirs(os.path.dirname(target))
+        args = cli.build_parser().parse_args(["run", "--config", target])
+        sleeps = []
+
+        def fake_sleep(sec):
+            sleeps.append(sec)
+            if len(sleeps) == 2:  # the user saves the file
+                os.utime(target, (1, 1))
+        with mock.patch.object(cli, "_in_docker", return_value=True), mock.patch("time.sleep", fake_sleep):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertTrue(cli._wait_for_docker_config(args))
+        self.assertTrue(os.path.isfile(target))
+        self.assertIn("Configuration créée", buf.getvalue())
+        with mock.patch.object(cli, "_in_docker", return_value=True):
+            self.assertFalse(cli._wait_for_docker_config(args))  # exists now: no wait
+
+    def test_check_flags_missing_share_and_empty_password(self):
+        from unittest import mock
+        with open(self.cfg_path, encoding="utf-8") as fh:
+            text = fh.read().replace("password = secret", "password =")
+        with open(self.cfg_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        with mock.patch.object(cli, "_share_problem",
+                               side_effect=lambda d: "Dossier partagé /volume1/Videos introuvable"
+                               if d == self.movies else None):
+            rc, out = self._cli("check")
+        self.assertEqual(rc, 1)
+        self.assertIn("Dossier partagé /volume1/Videos introuvable", out)
+        self.assertFalse(os.path.exists(self.movies))
+        self.assertIn("password est vide", out)
+
+    def test_indexer_add_returns_1_when_the_test_fails(self):
+        rc, out = self._cli("indexer", "add-url", "Mort", self.srv.url + "/nothing", "--type", "torznab")
+        self.assertEqual(rc, 1, out)
+
+    def test_dsm_requests_bypass_proxies(self):
+        from synoarr.app import is_local_url
+        for url in ("http://127.0.0.1:5000", "https://localhost:5001", "http://192.168.1.10:5000",
+                    "http://diskstation:5000", "http://nas.local:5000"):
+            self.assertTrue(is_local_url(url), url)
+        self.assertFalse(is_local_url("https://mynas.synology.me:5001"))
+        import urllib.request
+        from unittest import mock
+
+        def proxies(client):
+            return [h.proxies for h in client._opener.handlers if isinstance(h, urllib.request.ProxyHandler)
+                    and h.proxies]
+        with mock.patch.dict(os.environ, {"http_proxy": "http://proxy.invalid:3128",
+                                          "https_proxy": "http://proxy.invalid:3128"}):
+            app = self.make_app()
+            self.assertEqual(proxies(app.ds_http), [])  # DSM on 127.0.0.1: direct
+            self.assertNotEqual(proxies(app.http), [])  # Internet services keep the proxy
+
 
 if __name__ == "__main__":
     unittest.main()
