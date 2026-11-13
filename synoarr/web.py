@@ -939,6 +939,11 @@ const DSL={waiting:'En attente',downloading:'Téléchargement',paused:'En pause'
 const tgt=d=>d.season!=null?(d.episode!=null?` S${pad(d.season)}E${pad(d.episode)}`:` saison ${d.season}`):'';
 const LT={torrent:['b-done','.torrent','Fichier .torrent : Download Station le télécharge directement'],magnet:['b-grabbed','magnet','Lien magnet : Download Station doit d\'abord trouver des sources (peut rester « En attente »)'],inconnu:['b-planned','lien ?','Type de lien non vérifié']};
 const lt=x=>{const t=LT[x.link_type||'inconnu']||LT.inconnu;return ` <span class="b ${t[0]}" title="${esc(t[2])}">${t[1]}</span>`};
+const LTF={src:'all',srch:'all'};
+const ltPass=(x,f)=>f==='all'||(x.link_type||'inconnu')===f;
+const ltChips=(list,scope)=>{const n=k=>list.filter(x=>k==='all'||(x.link_type||'inconnu')===k).length,f=LTF[scope];
+  const c=(k,l)=>`<button type="button" class="xs${f===k?'':' sec'}" data-ltf="${k}" data-lts="${scope}" aria-pressed="${f===k}">${l} (${n(k)})</button>`;
+  return `<div class="row ltf" role="group" aria-label="Filtrer par type de lien">${c('all','Tous')}${c('torrent','.torrent')}${c('magnet','magnet')}${n('inconnu')?c('inconnu','lien ?'):''}</div>`};
 const pr=x=>x.priority!=null?` <span class="mut" title="Priorité de l'indexer (1 = le plus prioritaire)">· prio ${esc(x.priority)}</span>`:'';
 const fpct=p=>(Math.round(p*10)/10).toLocaleString('fr-FR')+' %';
 const srcBtn=(mid,s,e,g,label,rt,txt)=>`<button class="sec xs" data-src="${mid}" data-s="${s==null?'':s}" data-e="${e==null?'':e}" data-g="${g||''}" data-t="${esc(label)}" data-rt="${esc(rt||'')}">${txt||'Changer de source'}</button>`;
@@ -1108,12 +1113,13 @@ function drawOut(j){$('#outh').innerHTML=`${esc(j.label)} ${badge(j.status)} <sp
 function drawSearch(j){const r=j.result;let h=`<p class="small">${esc(j.label)} ${badge(j.status)}</p>`;
   if(j.status==='running')h+='<p class="mut">Recherche en cours sur les indexers…</p>';
   else if(j.status==='error')h+=con(j.output);
-  else if(r){const ok=r.results.filter(x=>x.score!=null),ko=r.results.filter(x=>x.score==null);
+  else if(r){const all=r.results,vis=all.filter(x=>ltPass(x,LTF.srch)),ok=vis.filter(x=>x.score!=null),ko=vis.filter(x=>x.score==null);
     const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div>
       <div class="mut small sm">${size(x.size)} · ${x.seeders==null?'?':esc(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${x.seeders==null?'?':esc(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td>
       <td>${x.score!=null?`<button data-grab="${x.index}" title="Envoyer à Download Station">Envoyer<span class="hm"> à Download Station</span></button>`:''}</td></tr>`;
     const tbl=a=>`<div class="tw"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>${a.map(row).join('')}</table></div>`;
-    h+=`<p class="mut small">Requête : ${esc(r.request)} (${esc(r.kind==='movie'?'film':r.kind==='season'?'saison':'épisode')}) — ${r.total} résultat(s), ${ok.length} acceptable(s)</p>`;
+    h+=`<p class="mut small">Requête : ${esc(r.request)} (${esc(r.kind==='movie'?'film':r.kind==='season'?'saison':'épisode')}) — ${r.total} résultat(s), ${all.filter(x=>x.score!=null).length} acceptable(s)</p>`;
+    if(all.length)h+=ltChips(all,'srch');
     h+=ok.length?tbl(ok):'<p class="mut">Aucun résultat acceptable.</p>';
     if(ko.length)h+=`<details><summary>Résultats rejetés (${ko.length})</summary>${tbl(ko)}</details>`}
   $('#sres').innerHTML=h}
@@ -1215,6 +1221,7 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.src)openSrc(d);
   else if(d.wadd)openAdd();
   else if(d.wdel)openDel(d);
+  else if(d.ltf&&d.lts==='srch'){LTF.srch=d.ltf;if(srch&&jobs[srch])drawSearch(jobs[srch])}
   else if(d.iedit)openIdxEdit(d.iedit);
   else if(d.pd)setPrio(d.pd,d.v);
   else if(d.prws)prwSync();
@@ -1245,7 +1252,7 @@ function setPrio(id,v){const n=Number(v);if(!Number.isInteger(n)||n<1||n>50){toa
 /* ---------------------------------------------------- Changer de source */
 let SRC=null;const srcm=$('#srcm');
 function openSrc(d){const num=v=>v===''||v==null?null:+v;
-  SRC={mid:+d.src,s:num(d.s),e:num(d.e),g:d.g?+d.g:null,label:d.t||'',rt:d.rt||'',job:null,res:[]};
+  SRC={mid:+d.src,s:num(d.s),e:num(d.e),g:d.g?+d.g:null,label:d.t||'',rt:d.rt||'',job:null,res:[]};srcJob=null;
   $('#srch').textContent=SRC.g?'Changer de source':'Choisir une source';
   $('#srcb').innerHTML=`<p class="small"><b>${esc(SRC.label)}</b>${SRC.rt?`<br><span class="mut brk">Source actuelle : ${esc(SRC.rt)}</span>`:''}</p>
   ${SRC.g?`<div class="row opts"><label class="chk"><input type="checkbox" id="sdel" checked> Supprimer l'ancien téléchargement</label><label class="chk"><input type="checkbox" id="sblk"> Bloquer l'ancienne release</label></div>`:''}
@@ -1259,12 +1266,13 @@ async function srcSearch(){const S0=SRC;try{const r=await api('media/'+S0.mid+'/
     while(SRC===S0&&j.status==='running'){await sleep(800);try{j=await api('jobs/'+j.id);fails=0}catch(e){if(e.status===404||++fails>20)throw e}}
     if(SRC===S0)drawSrcRes(j)}
   catch(e){if(SRC===S0)$('#sres2').innerHTML=`<div class="msg ko">${esc(e.message)}</div>`}}
-function drawSrcRes(j){const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
+let srcJob=null;
+function drawSrcRes(j){srcJob=j;const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
   SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
   if(!r.results.length){el.innerHTML=`<p class="mut">Aucun résultat pour ${esc(r.request)} (langues : ${langs}). Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
-  const ok=r.results.filter(x=>x.score!=null).length;
-  el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p><div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
-  ${r.results.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
+  const ok=r.results.filter(x=>x.score!=null).length,vis=r.results.filter(x=>ltPass(x,LTF.src));
+  el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>${ltChips(r.results,'src')}${vis.length?'':'<p class="mut">Aucun résultat de ce type.</p>'}<div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
+  ${vis.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
   <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir<span class="hm"> quand même</span>':'Choisir'}</button></td></tr>`).join('')}</table></div>`}
 async function srcSend(body){const S0=SRC;if(!S0)return;const msg=$('#smsg'),btns=[...document.querySelectorAll('#srcb button')];
   Object.assign(body,{season:S0.s,episode:S0.e,grab_id:S0.g,delete_old:!!($('#sdel')&&$('#sdel').checked),blocklist_old:!!($('#sblk')&&$('#sblk').checked)});
@@ -1282,6 +1290,7 @@ async function srcFile(){const f=$('#sfile').files[0];if(!f){toast('Choisissez u
   try{const data=await new Promise((ok,ko)=>{const rd=new FileReader();rd.onload=()=>ok(String(rd.result));rd.onerror=()=>ko(new Error('Lecture du fichier impossible'));rd.readAsDataURL(f)});
     srcSend({torrent_base64:data.slice(data.indexOf(',')+1)})}catch(e){toast(e.message,true)}}
 srcm.addEventListener('click',e=>{if(e.target===srcm||e.target.closest('[data-mclose]')){closeSrc();return}
+  const f=e.target.closest('button[data-ltf]');if(f){LTF.src=f.dataset.ltf;if(srcJob)drawSrcRes(srcJob);return}
   const b=e.target.closest('button[data-pick]');if(b)pick(+b.dataset.pick)});
 srcm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='slf'){const v=$('#slink').value.trim();if(!v){toast('Collez un lien magnet ou une URL .torrent',true);return}srcSend({link:v})}
   else if(e.target.id==='sff')srcFile()});

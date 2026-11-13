@@ -675,8 +675,8 @@ class Searcher:
 
     def _send(self, release: Release) -> Tuple[Optional[str], Optional[str]]:
         """Send *release* to Download Station WITHOUT modifying what the indexer (Prowlarr...) provides:
-        - a .torrent link: Download Station downloads the link itself (exactly like « Créer > Saisir l'URL »),
-          or, if it cannot, synoarr uploads the original bytes untouched;
+        - a .torrent link: synoarr downloads it and uploads the original bytes untouched (like Prowlarr/Sonarr),
+          or, with send_mode = url, Download Station downloads the link itself;
         - a magnet (direct or behind a redirect): sent as is."""
         assert self.ds is not None
         if release.download_url:
@@ -697,7 +697,7 @@ class Searcher:
                     log.debug("Fichier .torrent non analysable par synoarr, envoyé tel quel : %s", release.title)
                 if self._hash_already_grabbed(info_hash):
                     raise _AlreadyGrabbed()
-                mode = (getattr(self.cfg.downloadstation, "send_mode", "url") or "url").lower()
+                mode = (getattr(self.cfg.downloadstation, "send_mode", "file") or "file").lower()
                 if mode == "url":
                     try:
                         self.ds.add_url(release.download_url)

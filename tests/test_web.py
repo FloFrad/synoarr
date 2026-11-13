@@ -1698,3 +1698,14 @@ class IndexerEditTest(RealAppWebBase):
     def test_synced_indexer_is_flagged(self) -> None:
         row = self.app.indexer_manager.add_url("YTS (Prowlarr)", "http://127.0.0.1:9696/1/api", type_="torznab")
         self.assertEqual(self.req("/api/indexers/%d" % row["id"])[1]["synced_by"], "Prowlarr")
+
+
+class DefaultSendModeTest(RealAppWebBase):
+    def test_torrent_file_is_uploaded_by_default_like_prowlarr(self) -> None:
+        self.assertEqual(self.app.cfg.downloadstation.send_mode, "file")
+        self.app.indexer_manager.add_url("Fake", self.srv.url + "/torznab", type_="torznab")
+        self.app.job_watchlist()
+        self.assertTrue(self.world.uploads)
+        self.assertEqual(self.world.url_adds, [])  # no indexer link handed to Download Station
+        from synoarr.web import INDEX_JS
+        self.assertIn("data-ltf", INDEX_JS)  # .torrent / magnet filters

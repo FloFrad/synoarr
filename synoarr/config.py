@@ -49,9 +49,10 @@ class DownloadStationConfig:
     password: str = ""
     destination: str = "Download"  # shared folder (+ optional subfolder) where Download Station saves files
     verify_ssl: bool = False  # DSM usually uses a self-signed certificate
-    # How a .torrent link is handed over: "url" = Download Station downloads the link itself (like « Créer >
-    # Saisir l'URL »), falling back to uploading the original file; "file" = synoarr uploads the original file.
-    send_mode: str = "url"
+    # How a .torrent link is handed over: "file" (default, like Prowlarr/Sonarr) = synoarr downloads the .torrent
+    # from the indexer and uploads the original bytes to Download Station; "url" = Download Station downloads the
+    # link itself (only works when the link looks like a .torrent file to Download Station).
+    send_mode: str = "file"
     # Optional public trackers appended to magnet links with fewer than 2 trackers. Empty (default): magnets are
     # sent exactly as the indexer provides them.
     extra_trackers: List[str] = field(default_factory=list)
@@ -316,7 +317,7 @@ def load_config(path: Optional[str]) -> Config:
     cfg.downloadstation.destination = cfg.downloadstation.destination.strip().strip("/")
     cfg.plex.server_url = cfg.plex.server_url.rstrip("/")
     cfg.paths.action = cfg.paths.action.lower().strip()
-    cfg.downloadstation.send_mode = (cfg.downloadstation.send_mode or "url").lower().strip()
+    cfg.downloadstation.send_mode = (cfg.downloadstation.send_mode or "file").lower().strip()
     cfg.series.monitor = cfg.series.monitor.lower().strip()
     for attr in ("download_dir", "movies_dir", "series_dir"):
         value = getattr(cfg.paths, attr).strip()
