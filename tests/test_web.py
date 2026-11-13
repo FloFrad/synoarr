@@ -1627,3 +1627,26 @@ class UpdateCommandTest(RealAppWebBase):
             job = self.wait_job(data["job"]["id"])
             self.assertIn("Téléchargement impossible", json.dumps(job["output"], ensure_ascii=False))
         self.assertEqual(len(restarts), 1)
+
+
+class DsDiagTest(RealAppWebBase):
+    def test_waiting_tasks_are_explained(self) -> None:
+        self.app.indexer_manager.add_url("Fake", self.srv.url + "/torznab", type_="torznab")
+        self.app.job_watchlist()
+        with self.world.lock:
+            for t in self.world.tasks.values():
+                t["status"] = "waiting"
+                t["additional"]["detail"]["total_peers"] = 0
+        status, data, _ = self.req("/api/jobs", "POST", {"command": "ds_diag"})
+        self.assertEqual(status, 200, data)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            job = self.req("/api/jobs/%d" % data["job"]["id"])[1]
+            if job["status"] != "running":
+                break
+            time.sleep(0.05)
+        self.assertEqual(job["status"], "done", job)
+        text = json.dumps(job["output"], ensure_ascii=False)
+        self.assertIn("En attente", text)
+        self.assertIn("aucun pair connecté", text)
+        self.assertGreaterEqual(job["result"]["waiting"], 1)

@@ -458,6 +458,39 @@ class DownloadStation:
             tasks = data
         return [t for t in (self._to_task(x) for x in tasks) if t is not None]
 
+    def diagnostics(self) -> Dict[str, Any]:
+        """Raw facts for troubleshooting (tasks with their raw status/status_extra, DS settings, schedule).
+        Never raises: each part reports its own error. URIs are never returned (they can hold a passkey)."""
+        out: Dict[str, Any] = {"tasks": [], "config": None, "schedule": None, "errors": []}
+        try:
+            data = self._call(TASK_API, "list", {"additional": "detail,transfer"}, version=1)
+            for t in ((data or {}).get("tasks") or []) if isinstance(data, dict) else []:
+                if not isinstance(t, dict):
+                    continue
+                add = t.get("additional") if isinstance(t.get("additional"), dict) else {}
+                detail = add.get("detail") if isinstance(add.get("detail"), dict) else {}
+                transfer = add.get("transfer") if isinstance(add.get("transfer"), dict) else {}
+                out["tasks"].append({
+                    "id": t.get("id"), "title": t.get("title"), "type": t.get("type"),
+                    "status": t.get("status"), "status_extra": t.get("status_extra"),
+                    "size": t.get("size"), "destination": detail.get("destination"),
+                    "create_time": detail.get("create_time"), "started_time": detail.get("started_time"),
+                    "total_peers": detail.get("total_peers"), "connected_seeders": detail.get("connected_seeders"),
+                    "connected_leechers": detail.get("connected_leechers"),
+                    "downloaded": transfer.get("size_downloaded"), "speed_download": transfer.get("speed_download"),
+                    "is_magnet": str(detail.get("uri") or "").lower().startswith("magnet:"),
+                })
+        except Exception as exc:
+            out["errors"].append("liste des tâches : %s" % exc)
+        for key, api, method in (("config", "SYNO.DownloadStation.Info", "getconfig"),
+                                 ("schedule", "SYNO.DownloadStation.Schedule", "getconfig")):
+            try:
+                if self.has_api(api):
+                    out[key] = self._call(api, method, {}, version=1)
+            except Exception as exc:
+                out["errors"].append("%s : %s" % (api, exc))
+        return out
+
     @staticmethod
     def _to_task(t: Any) -> Optional[DSTask]:
         if not isinstance(t, dict):

@@ -664,6 +664,20 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ds_diag(args: argparse.Namespace) -> int:
+    """Why do Download Station tasks stay waiting? (same as the web UI command)."""
+    app = _app(args)
+
+    class _Out(object):
+        private = {}  # type: dict
+
+        @staticmethod
+        def emit(level: str, msg: str) -> None:
+            _out(_PREFIX.get(level, "") + msg)
+    res = app._cmd_ds_diag(_Out())
+    return 0 if res.get("ok", True) else 1
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     app = _app(args)
     app.run_once()
@@ -801,6 +815,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("process", parents=[common], help="renommer/déplacer les téléchargements terminés") \
         .set_defaults(func=cmd_process)
+    sub.add_parser("ds-diag", parents=[common], help="diagnostic des téléchargements Download Station en attente") \
+        .set_defaults(func=cmd_ds_diag)
     pu = sub.add_parser("update", parents=[common], help="mettre à jour synoarr depuis GitHub")
     pu.add_argument("--check", action="store_true", help="seulement vérifier s'il existe une mise à jour")
     pu.add_argument("--rollback", action="store_true", help="revenir à la version précédente")

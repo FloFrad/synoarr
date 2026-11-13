@@ -39,6 +39,7 @@ import signal
 import stat
 import sys
 import tempfile
+import json
 import threading
 import time
 import uuid
@@ -623,6 +624,7 @@ COMMANDS = {
     "test_indexers": "Tester tous les indexers",
     "search": "Recherche manuelle",
     "plex_login": "Connexion Plex",
+    "ds_diag": "Diagnostic Download Station",
     "update_check": "Vérifier les mises à jour",
     "update": "Mettre à jour synoarr",
     "update_rollback": "Revenir à la version précédente",
@@ -978,6 +980,8 @@ class App:
             target, args, capture = self._cmd_check, (), False
         elif command == "test_indexers":
             target, args = self._cmd_test_indexers, ()
+        elif command == "ds_diag":
+            target, args = self._cmd_ds_diag, ()
         elif command in ("update_check", "update", "update_rollback"):
             target, args, key = self._cmd_update, (command,), "update"  # one update job at a time
         else:  # search
@@ -1096,6 +1100,60 @@ class App:
             job.emit("warn", w)
         code = check_report(self.cfg, job.emit, app=self, hint=_web_hint)
         return {"ok": code == 0}
+
+    def _cmd_ds_diag(self, job: Job) -> Dict[str, Any]:
+        """Explain why Download Station tasks do not start (waiting / error)."""
+        if self.ds is None:
+            job.emit("err", "Download Station n'est pas configuré ([downloadstation] username/password)")
+            return {"ok": False}
+        d = self.ds.diagnostics()
+        for e in d["errors"]:
+            job.emit("warn", e)
+        tasks = d["tasks"]
+        counts = {}  # type: Dict[str, int]
+        for t in tasks:
+            counts[str(t["status"])] = counts.get(str(t["status"]), 0) + 1
+        job.emit("info", "%d tâche(s) dans Download Station : %s" % (
+            len(tasks), ", ".join("%s %d" % kv for kv in sorted(counts.items())) or "aucune"))
+        cfg = d.get("config") or {}
+        if cfg:
+            job.emit("info", "Réglages : téléchargements BT simultanés max = %s, HTTP max = %s, dossier par défaut = %s"
+                     % (cfg.get("bt_max_download", "?"), cfg.get("http_max_download", "?"),
+                        cfg.get("default_destination", "?")))
+        sched = d.get("schedule") or {}
+        if sched.get("enabled"):
+            job.emit("warn", "La planification de Download Station est ACTIVÉE : en dehors des plages autorisées, "
+                             "les tâches restent « En attente » (Download Station > Paramètres > Général/BT > "
+                             "Planification).")
+        active = sum(1 for t in tasks if str(t["status"]) in ("downloading", "2", "finishing", "hash_checking"))
+        waiting = [t for t in tasks if str(t["status"]) in ("waiting", "1")]
+        try:
+            max_bt = int(cfg.get("bt_max_download"))
+        except (TypeError, ValueError):
+            max_bt = 0
+        if waiting and max_bt and active >= max_bt:
+            job.emit("warn", "%d tâche(s) en cours = limite de %d téléchargements simultanés atteinte : les autres "
+                             "attendent leur tour (Download Station > Paramètres > BT > nombre maximal)."
+                     % (active, max_bt))
+        for t in waiting[:30]:
+            peers = t.get("total_peers")
+            hint = []
+            if t.get("is_magnet") and not t.get("size"):
+                hint.append("lien magnet sans métadonnées : aucune source trouvée pour l'instant")
+            if peers in (0, "0"):
+                hint.append("aucun pair connecté")
+            if t.get("status_extra"):
+                hint.append("détail DSM : %s" % json.dumps(t["status_extra"], ensure_ascii=False))
+            job.emit("warn", "En attente : %s — dossier %s, taille %s, pairs %s%s" % (
+                t.get("title"), t.get("destination") or "?", t.get("size") or "?", peers if peers is not None else "?",
+                (" — " + " ; ".join(hint)) if hint else ""))
+        for t in [t for t in tasks if str(t["status"]) in ("error", "10")][:20]:
+            job.emit("err", "Erreur : %s — %s" % (t.get("title"), json.dumps(t.get("status_extra"), ensure_ascii=False)))
+        if waiting and not sched.get("enabled") and not (max_bt and active >= max_bt):
+            job.emit("info", "Pistes : 1) Download Station > Paramètres > BT : port TCP/UDP ouvert et non bloqué par le "
+                             "pare-feu DSM ; 2) testez le même .torrent ajouté à la main dans Download Station ; "
+                             "3) « Changer de source » dans la Watchlist pour une release avec plus de seeds.")
+        return {"counts": counts, "config": cfg, "schedule": sched, "waiting": len(waiting), "active": active}
 
     def _cmd_update(self, job: Job, command: str) -> Dict[str, Any]:
         from .updater import UpdateError, make_updater
