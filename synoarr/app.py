@@ -1216,6 +1216,7 @@ class App:
             results.append({"index": i, "title": rel.title, "size": rel.size or 0, "seeders": rel.seeders,
                             "leechers": rel.leechers, "indexer": rel.indexer, "priority": prios.get(rel.indexer),
                             "score": score, "reason": reason})
+        self._detect_link_types(job, report, results)
         accepted = sum(1 for _r, score, _x in report if score is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(report), accepted))
         return {"query": query, "request": req.describe(), "kind": req.kind, "total": len(report),

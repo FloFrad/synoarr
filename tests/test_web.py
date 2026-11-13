@@ -1651,3 +1651,10 @@ class DsDiagTest(RealAppWebBase):
         self.assertIn("En attente", text)
         self.assertIn("aucun pair connecté", text)
         self.assertGreaterEqual(job["result"]["waiting"], 1)
+
+
+class LinkBadgeTemplateTest(unittest.TestCase):
+    def test_both_result_lists_show_the_link_badge(self) -> None:
+        from synoarr.web import INDEX_JS
+        # "Changer de source" window AND manual search (Commandes) rows
+        self.assertEqual(INDEX_JS.count("<b>${esc(x.title)}</b>${lt(x)}"), 2)
