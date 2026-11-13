@@ -28,6 +28,14 @@ ALL_APIS = {
 }
 
 
+def dsm_value(raw):
+    """How DSM's entry.cgi reads a parameter: JSON first, else the raw string."""
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
 def ok(data=None):
     out = {"success": True}
     if data is not None:
@@ -51,6 +59,10 @@ class FakeDSM:
         self.counter = 0
         self.expire_next = 0  # number of upcoming DS calls answered with 119
         self.ds2_create_error = None
+        self.ds2_create_data = None  # e.g. {"list_id": ["btlist_1"], "task_id": []}
+        self.default_destination = "Download"
+        self.list_files = [{"index": 0, "name": "a.mkv", "size": 900}, {"index": 1, "name": "b.nfo", "size": 1}]
+        self.list_calls = []  # (api, method, params) of SYNO.DownloadStation2.Task.List*
         self.shares = ("Download", "Download/synoarr", "Vidéos")
         self.created = []  # (api, params, files)
         self.deleted = []
@@ -80,7 +92,7 @@ class FakeDSM:
         if info is None or req.path != "/webapi/" + info["path"]:
             return err(102)
         sid = p.get("_sid")
-        if api == "SYNO.DownloadStation2.Task" and req.method == "POST":
+        if info["path"] == "entry.cgi" and req.method == "POST":
             sid = req.query.get("_sid")  # DS2 POST: sid expected in the query string
         if sid not in self.sids:
             return err(119)
@@ -90,6 +102,17 @@ class FakeDSM:
             return err(119)
         if api == "SYNO.DownloadStation2.Task":
             return self.ds2(req, p)
+        if api.startswith("SYNO.DownloadStation2.Task.List"):
+            self.list_calls.append((api, p["method"], p))
+            if p["method"] == "get":
+                if dsm_value(p.get("list_id")) != "btlist_1":
+                    return err(120)
+                return ok({"title": "X", "size": 901, "type": "bt", "files": self.list_files})
+            if p["method"] == "download":
+                return ok({"task_id": "dbid_99"})
+            return err(103)
+        if api == "SYNO.DownloadStation.Info" and p["method"] == "getconfig":
+            return ok({"default_destination": self.default_destination, "emule_enabled": False})
         return self.legacy(req, p)
 
     def auth(self, req, p):
@@ -113,27 +136,25 @@ class FakeDSM:
             return err(103)
         if self.ds2_create_error:
             return err(self.ds2_create_error)
-        if p.get("create_list") != "false":
+        if dsm_value(p.get("create_list")) is not False:
             return err(120)
-        try:
-            typ = json.loads(p["type"])
-            dest = json.loads(p["destination"]) if "destination" in p else None
-        except ValueError:
-            return err(120)
-        if dest is not None and not self._check_dest(dest):
+        typ = dsm_value(p.get("type"))
+        dest = dsm_value(p["destination"]) if "destination" in p else None
+        if dest is not None and (not isinstance(dest, str) or not self._check_dest(dest)):
             return err(120)
         files = {k: v for k, v in req.multipart.items() if v[0]}
         if typ == "file":
-            names = json.loads(p["file"])
-            if not names or names[0] not in files:
+            names = dsm_value(p["file"])
+            if req.method != "POST" or not isinstance(names, list) or not names or names[0] not in files:
                 return err(120)
         elif typ == "url":
-            if not json.loads(p["url"]):
+            urls = dsm_value(p.get("url"))
+            if not urls:
                 return err(120)
         else:
             return err(120)
         self.created.append(("ds2", p, files))
-        return ok({"list_id": [], "task_id": ["synoarr/SYNODLTaskListDownload1"]})
+        return ok(self.ds2_create_data or {"list_id": [], "task_id": ["synoarr/SYNODLTaskListDownload1"]})
 
     def legacy(self, req, p):
         method = p["method"]
@@ -243,13 +264,114 @@ class DownloadStationTest(unittest.TestCase):
         api, p, files = self.dsm.created[0]
         self.assertEqual(api, "ds2")
         self.assertEqual(p["type"], '"file"')
-        self.assertEqual(p["file"], '["torrent"]')
+        self.assertEqual(p["file"], '["fileData"]')  # Prowlarr's field name
         self.assertEqual(p["destination"], '"Download/synoarr"')
         self.assertEqual(p["create_list"], "false")
-        self.assertEqual(files["torrent"], ("My.Show.S01E01.torrent", TORRENT))
+        self.assertEqual(files["fileData"], ("My.Show.S01E01.torrent", TORRENT))
         req = [r for r in self.srv.requests if r.method == "POST" and r.query.get("_sid")][-1]
         self.assertEqual(req.path, "/webapi/entry.cgi")
+        self.assertEqual(set(req.query), {"_sid"})
         self.assertIn("multipart/form-data", req.headers["content-type"])
+        self.assertEqual(int(req.headers["content-length"]), len(req.body))
+        # byte layout of the parts, like NzbDrone's HttpRequestBuilder (CRLF, octet-stream file part)
+        boundary = req.headers["content-type"].split("boundary=", 1)[1].encode()
+        self.assertIn(b'--' + boundary + b'\r\nContent-Disposition: form-data; name="create_list"\r\n\r\nfalse\r\n',
+                      req.body)
+        self.assertIn(b'Content-Disposition: form-data; name="fileData"; filename="My.Show.S01E01.torrent"\r\n'
+                      b'Content-Type: application/octet-stream\r\n\r\n' + TORRENT + b'\r\n--' + boundary + b'--\r\n',
+                      req.body)
+        order = [n for n in ("api", "version", "method", "type", "file", "create_list", "destination", "fileData")]
+        positions = [req.body.index(('name="%s"' % n).encode()) for n in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(ds.last_create["data"], {"list_id": [], "task_id": ["synoarr/SYNODLTaskListDownload1"]})
+        self.assertEqual(self.dsm.list_calls, [])
+
+    def test_add_url_ds2_like_prowlarr(self):
+        ds = self.ds()
+        magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=A+B&tr=udp%3A%2F%2Ft.example%3A80"
+        ds.add_url(magnet)
+        api, p, _ = self.dsm.created[0]
+        self.assertEqual(api, "ds2")
+        req = [r for r in self.srv.requests if r.query.get("method") == "create"][-1]
+        self.assertEqual(req.method, "GET")
+        self.assertEqual(req.body, b"")
+        self.assertEqual(req.query, {"_sid": "sid1", "api": "SYNO.DownloadStation2.Task", "version": "2",
+                                     "method": "create", "type": "url", "url": magnet, "create_list": "false",
+                                     "destination": "Download/synoarr"})
+        self.assertTrue(req.raw_path.startswith("/webapi/entry.cgi?_sid=sid1&api=SYNO.DownloadStation2.Task&"))
+        # percent-encoding of .NET's Uri.EscapeDataString: "+" -> %2B, ":" -> %3A, "/" -> %2F, never "+"
+        self.assertIn("&url=magnet%3A%3Fxt%3Durn%3Abtih%3A0123456789abcdef0123456789abcdef01234567%26dn%3DA%2BB%26"
+                      "tr%3Dudp%253A%252F%252Ft.example%253A80&create_list=false&destination=Download%2Fsynoarr",
+                      req.raw_path)
+        ds.add_url("magnet:?xt=urn:btih:abc&dn=A B")
+        self.assertIn("dn%3DA%20B", [r for r in self.srv.requests if r.query.get("method") == "create"][-1].raw_path)
+
+    def test_add_url_very_long_magnet_is_posted(self):
+        ds = self.ds()
+        magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" + "".join(
+            "&tr=udp%%3A%%2F%%2Ftracker%d.example.org%%3A1337%%2Fannounce" % i for i in range(150))
+        ds.add_url(magnet)
+        req = [r for r in self.srv.requests if r.params().get("method") == "create"][-1]
+        self.assertEqual(req.method, "POST")
+        self.assertEqual(set(req.query), {"_sid"})
+        self.assertEqual(req.form["url"], magnet)
+        self.assertEqual(req.form["type"], "url")
+        self.assertEqual(self.dsm.created[0][0], "ds2")
+
+    def test_numeric_destination_stays_a_string(self):
+        self.dsm.shares = ("2024",)
+        self.ds(destination="2024").add_url("magnet:?xt=urn:btih:abc")
+        self.assertEqual(self.dsm.created[0][1]["destination"], '"2024"')
+
+    def test_empty_destination_uses_download_station_default(self):
+        # Prowlarr (TorrentDownloadStation.GetDownloadDirectory) always passes a destination: the configured
+        # one or SYNO.DownloadStation.Info getconfig "default_destination"
+        ds = self.ds(destination="")
+        ds.add_torrent_file(TORRENT, "x.torrent")
+        ds.add_url("magnet:?xt=urn:btih:abc")
+        (a1, p1, _), (a2, p2, _) = self.dsm.created
+        self.assertEqual((a1, a2), ("ds2", "ds2"))
+        self.assertEqual(p1["destination"], '"Download"')
+        self.assertEqual(p2["destination"], "Download")
+        getconfig = [r for r in self.srv.requests if r.params().get("method") == "getconfig"]
+        self.assertEqual(len(getconfig), 1)  # cached
+        self.assertEqual(getconfig[0].path, "/webapi/DownloadStation/info.cgi")
+
+    def test_empty_destination_default_unreadable(self):
+        del self.dsm.apis["SYNO.DownloadStation.Info"]
+        ds = self.ds(destination="")
+        ds.add_torrent_file(TORRENT, "x.torrent")
+        api, p, _ = self.dsm.created[0]
+        self.assertEqual(api, "ds2")
+        self.assertNotIn("destination", p)
+
+    def test_pending_file_list_is_confirmed(self):
+        self.dsm.apis["SYNO.DownloadStation2.Task.List"] = {"maxVersion": 2, "minVersion": 1, "path": "entry.cgi"}
+        self.dsm.ds2_create_data = {"list_id": ["btlist_1"], "task_id": []}
+        ds = self.ds()
+        self.assertEqual(ds.add_torrent_file(TORRENT, "x.torrent"), "DownloadStation2")
+        (a1, m1, p1), (a2, m2, p2) = self.dsm.list_calls
+        self.assertEqual((a1, m1), ("SYNO.DownloadStation2.Task.List", "get"))
+        self.assertEqual(a2, "SYNO.DownloadStation2.Task.List")  # no .Polling API on this NAS
+        self.assertEqual(m2, "download")
+        self.assertEqual(json.loads(p2["list_id"]), "btlist_1")
+        self.assertEqual(json.loads(p2["selected"]), [0, 1])
+        self.assertEqual(json.loads(p2["destination"]), "Download/synoarr")
+        self.assertEqual(p2["create_subfolder"], "true")
+
+    def test_pending_file_list_polling_api_and_failure_tolerated(self):
+        self.dsm.apis["SYNO.DownloadStation2.Task.List"] = {"maxVersion": 2, "minVersion": 1, "path": "entry.cgi"}
+        self.dsm.apis["SYNO.DownloadStation2.Task.List.Polling"] = {"maxVersion": 2, "minVersion": 1,
+                                                                    "path": "entry.cgi"}
+        self.dsm.ds2_create_data = {"list_id": ["btlist_1"], "task_id": []}
+        self.ds().add_url("magnet:?xt=urn:btih:abc")
+        self.assertEqual(self.dsm.list_calls[-1][:2], ("SYNO.DownloadStation2.Task.List.Polling", "download"))
+        # unknown list: get fails (list_id= then id=), download refused -> no exception
+        self.dsm.ds2_create_data = {"list_id": "other", "task_id": []}
+        del self.dsm.list_calls[:]
+        self.assertEqual(self.ds().add_url("magnet:?xt=urn:btih:abd"), "DownloadStation2")
+        self.assertEqual([c[1] for c in self.dsm.list_calls], ["get", "get", "download"])
+        self.assertNotIn("selected", self.dsm.list_calls[-1][2])
 
     def test_ds2_sid_only_in_query_string(self):
         # Sonarr's DownloadStationTaskProxyV2: _sid in the query, api/version/method + params in the body
@@ -273,9 +395,9 @@ class DownloadStationTest(unittest.TestCase):
         ds.add_url(magnet)
         api, p, _ = self.dsm.created[0]
         self.assertEqual(api, "ds2")
-        self.assertEqual(json.loads(p["url"]), [magnet])
-        self.assertEqual(json.loads(p["destination"]), "Vidéos")
-        self.assertEqual(p["type"], '"url"')
+        self.assertEqual(p["url"], magnet)
+        self.assertEqual(p["destination"], "Vidéos")
+        self.assertEqual(p["type"], "url")
 
     def test_legacy_fallback_when_ds2_missing(self):
         del self.dsm.apis["SYNO.DownloadStation2.Task"]
@@ -285,6 +407,8 @@ class DownloadStationTest(unittest.TestCase):
         (a1, p1, f1), (a2, p2, f2) = self.dsm.created
         self.assertEqual(a1, "legacy")
         self.assertEqual(f1["file"], ("file.torrent", TORRENT))
+        self.assertIn(b"Content-Type: application/octet-stream", [r for r in self.srv.requests
+                                                                  if r.path.endswith("task.cgi")][0].body)
         self.assertEqual(p1["destination"], "Download/synoarr")
         self.assertEqual(p1["version"], "3")
         self.assertEqual(p2["uri"], "https://example.org/a.torrent")

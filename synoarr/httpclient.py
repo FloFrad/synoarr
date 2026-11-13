@@ -85,6 +85,8 @@ def redact(url: str) -> str:
         if low in ("passwd", "password", "_sid", "sid", "account") or \
                 low.endswith(("apikey", "api_key", "token", "passkey", "secret")):
             v = "***"
+        elif low in ("url", "uri") and v.lower().startswith(("http://", "https://")):
+            v = redact(v)  # a .torrent link handed to Download Station can carry an apikey/passkey
         q.append((k, v))
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(q), parts.fragment))
 

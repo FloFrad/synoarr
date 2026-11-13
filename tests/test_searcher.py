@@ -697,3 +697,17 @@ class LinkTypeTests(unittest.TestCase):
             results = [{"index": i} for i in range(len(rels))]
             App._detect_link_types(object.__new__(App), Job(), report, results)
         self.assertEqual([r["link_type"] for r in results], ["torrent", "magnet", "magnet", "inconnu"])
+
+
+
+class PreferMagnetTests(SearcherTestBase):
+    def test_prefer_magnet_like_prowlarr(self) -> None:
+        from synoarr.models import Release
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        magnet = "magnet:?xt=urn:btih:%s&dn=Heat" % ("e" * 40)
+        rel = self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        rel = Release(title=rel.title, indexer="i", download_url=rel.download_url, magnet=magnet)
+        self.cfg.downloadstation.prefer = "magnet"
+        self.assertTrue(self.searcher.grab(rel, self.media("m1"), None, None))
+        self.assertEqual(self.ds.added, [magnet])

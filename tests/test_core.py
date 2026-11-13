@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import urllib.parse
 
 from synoarr import config as config_mod
 from synoarr.db import Database
@@ -248,6 +249,12 @@ class HttpTests(unittest.TestCase):
     def test_redact(self):
         self.assertNotIn("SECRET", redact("http://x/api?apikey=SECRET&t=caps"))
         self.assertNotIn("SECRET", redact("http://x/?X-Plex-Token=SECRET"))
+        # a .torrent link passed to Download Station in the query string (DS2 create GET url=...)
+        nested = redact("http://nas/webapi/entry.cgi?_sid=S1&url=" +
+                        urllib.parse.quote("http://prowlarr/dl?apikey=SECRET&link=x", safe=""))
+        self.assertNotIn("SECRET", nested)
+        self.assertNotIn("S1", nested)
+        self.assertIn("prowlarr", nested)
 
 
 if __name__ == "__main__":

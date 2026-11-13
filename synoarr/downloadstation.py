@@ -2,9 +2,12 @@
 
 Flow: API discovery (SYNO.API.Info) -> login (SYNO.API.Auth, format=sid) ->
 calls with ``_sid``. Torrents are added with SYNO.DownloadStation2.Task
-(DSM 7 / Download Station 3.9+) with a fallback on the legacy
-SYNO.DownloadStation.Task API. Tasks are listed/deleted with the legacy API
-(still present on DSM 7), falling back on DownloadStation2 if it is missing.
+(DSM 7 / Download Station 3.9+) with exactly the requests of Prowlarr/Sonarr's
+DownloadStationTaskProxyV2 (.torrent: POST multipart "fileData"; link: GET
+type=url&url=...), with a fallback on the legacy SYNO.DownloadStation.Task API.
+Like Prowlarr, an empty destination is replaced by Download Station's default
+folder (SYNO.DownloadStation.Info getconfig). Tasks are listed/deleted with the
+legacy API (still present on DSM 7), falling back on DownloadStation2 if it is missing.
 """
 from __future__ import annotations
 
@@ -24,12 +27,26 @@ log = logging.getLogger(__name__)
 AUTH_API = "SYNO.API.Auth"
 TASK_API = "SYNO.DownloadStation.Task"
 TASK2_API = "SYNO.DownloadStation2.Task"
+INFO_API = "SYNO.DownloadStation.Info"
+LOCATION_API = "SYNO.DownloadStation2.Settings.Location"
+TASK2_LIST_API = "SYNO.DownloadStation2.Task.List"
+TASK2_LIST_POLLING_API = "SYNO.DownloadStation2.Task.List.Polling"
+# Prowlarr/Sonarr (DownloadStationTaskProxyV2.AddTaskFromData): multipart field "fileData", part type
+# application/octet-stream (HttpRequestBuilder.AddFormUpload default).
+UPLOAD_FIELD = "fileData"
+UPLOAD_CTYPE = "application/octet-stream"
+# Above this URL length the DS2 "create" of a link is POSTed instead of sent in the query string (like Prowlarr).
+MAX_GET_URL = 6000
 
 # Used when SYNO.API.Info cannot be queried.
 DEFAULT_APIS: Dict[str, Dict[str, Any]] = {
     AUTH_API: {"path": "auth.cgi", "minVersion": 1, "maxVersion": 3},
     TASK_API: {"path": "DownloadStation/task.cgi", "minVersion": 1, "maxVersion": 3},
     TASK2_API: {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+    INFO_API: {"path": "DownloadStation/info.cgi", "minVersion": 1, "maxVersion": 2},
+    LOCATION_API: {"path": "entry.cgi", "minVersion": 1, "maxVersion": 1},
+    TASK2_LIST_API: {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+    TASK2_LIST_POLLING_API: {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
 }
 
 SESSION_CODES = (105, 106, 107, 119)
@@ -111,6 +128,25 @@ def _first(d: Dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _ids(value: Any) -> List[str]:
+    """DSM "list_id" / "task_id": list, single value or nothing -> list of non-empty strings."""
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v not in (None, "") and not isinstance(v, bool)]
+    if value in (None, "") or isinstance(value, bool):
+        return []
+    return [str(value)]
+
+
+def _plain_param(value: str) -> str:
+    """Value sent as is (like Prowlarr's AddQueryParam), unless DSM would read it as JSON (a destination
+    "2024", "true"...): entry.cgi decodes each parameter as JSON first, then falls back on the raw string."""
+    try:
+        json.loads(value)
+    except ValueError:
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
 def normalize_destination(destination: str) -> str:
     """"/volume1/Download/x/" -> "Download/x" (Download Station wants a shared folder path, no leading slash)."""
     d = (destination or "").strip().replace("\\", "/").strip("/")
@@ -150,6 +186,8 @@ class DownloadStation:
         self._sid: Optional[str] = None
         self._apis: Optional[Dict[str, Dict[str, Any]]] = None
         self._discovered = False  # True when SYNO.API.Info answered
+        self._default_destination: Optional[str] = None  # Download Station's default folder (cache)
+        self.last_create: Optional[Dict[str, Any]] = None  # API, HTTP method and "data" of the last create
         self._lock = threading.RLock()
 
     def quick_client(self, timeout: float = 6.0) -> "DownloadStation":
@@ -164,6 +202,7 @@ class DownloadStation:
             other._sid = self._sid
             other._apis = dict(self._apis) if self._apis is not None else None
             other._discovered = self._discovered
+            other._default_destination = self._default_destination
         return other
 
     # ================================================================ low level
@@ -173,7 +212,10 @@ class DownloadStation:
         url = "%s/webapi/%s" % (self.url, path.lstrip("/"))
         try:
             if method == "GET":
-                resp = self.http.get(url, params=params)
+                # %20 / %2B like .NET's Uri.EscapeDataString (Prowlarr), never "+" for a space
+                items = [(k, v) for k, v in params.items() if v is not None]
+                query = urllib.parse.urlencode(items, quote_via=urllib.parse.quote, safe="")
+                resp = self.http.get(url + ("?" + query if query else ""))
             else:
                 resp = self.http.post(url, params=params, data=data, files=files)
         except HttpError as exc:
@@ -338,8 +380,9 @@ class DownloadStation:
             fields.update(params or {})
             sid = self._sid
             if http_method == "GET":
-                fields["_sid"] = sid
-                payload = self._raw(info["path"], fields)
+                ordered: Dict[str, Any] = {"_sid": sid}  # first, like Prowlarr's DiskStationProxyBase.BuildRequest
+                ordered.update(fields)
+                payload = self._raw(info["path"], ordered)
             else:
                 query: Dict[str, Any] = {}
                 # Same as Sonarr's DownloadStation proxies: SYNO.DownloadStation2.Task wants _sid in the
@@ -379,16 +422,54 @@ class DownloadStation:
         return msg
 
     # ================================================================ add
+    def _effective_destination(self) -> str:
+        """Configured destination or, when empty, Download Station's default folder, read and passed
+        explicitly like Prowlarr/Sonarr (TorrentDownloadStation.GetDownloadDirectory -> GetDefaultDir:
+        SYNO.DownloadStation.Info getconfig "default_destination"). "" if it cannot be read."""
+        if self.destination:
+            return self.destination
+        if self._default_destination:
+            return self._default_destination
+        found = ""
+        for api, method, version in ((INFO_API, "getconfig", 1), (LOCATION_API, "get", 1)):
+            if not self.has_api(api):
+                continue
+            try:
+                data = self._call(api, method, {}, version=version)
+            except DownloadStationError as exc:
+                if exc.auth:
+                    raise
+                log.debug("Download Station : dossier par défaut illisible via %s (%s)", api, exc)
+                continue
+            value = data.get("default_destination") if isinstance(data, dict) else None
+            if isinstance(value, str) and value.strip():
+                found = normalize_destination(value)
+                break
+        if found:
+            self._default_destination = found
+            log.info("Download Station : aucune destination configurée, dossier par défaut de Download Station "
+                     "« %s » transmis explicitement (comme Prowlarr)", found)
+        else:
+            log.info("Download Station : aucune destination configurée et dossier par défaut illisible : "
+                     "la tâche est créée sans destination")
+        return found
+
     def _create_with_fallback(self, ds2: Dict[str, Any], legacy: Dict[str, Any],
                               ds2_files: Optional[Mapping[str, Tuple[str, bytes, str]]],
-                              legacy_files: Optional[Mapping[str, Tuple[str, bytes, str]]]) -> str:
+                              legacy_files: Optional[Mapping[str, Tuple[str, bytes, str]]],
+                              destination: str = "", ds2_http_method: str = "POST") -> str:
         """Create a task; returns the API used: "DownloadStation2" or "ancienne API"."""
         ds2_error: Optional[DownloadStationError] = None
         if self.has_api(TASK2_API):
+            how = "multipart" if ds2_files else ("GET" if ds2_http_method == "GET" else "POST")
             try:
-                data = self._call(TASK2_API, "create", ds2, version=2, http_method="POST", files=ds2_files,
-                                  sid_in_query=True)
-                log.debug("Download Station : création via DownloadStation2 OK (réponse %s)", str(data)[:200])
+                data = self._call(TASK2_API, "create", ds2, version=2, http_method=ds2_http_method,
+                                  files=ds2_files, sid_in_query=True)
+                self.last_create = {"api": TASK2_API, "http": how, "data": data}
+                log.info("Download Station : création via %s create v%s (%s %s) -> réponse %s", TASK2_API,
+                         self._version(TASK2_API, 2), how, self._api_info(TASK2_API).get("path"),
+                         json.dumps(data, ensure_ascii=False)[:300])
+                self._confirm_file_lists(data, destination)
                 return "DownloadStation2"
             except DownloadStationError as exc:
                 if exc.auth:
@@ -401,15 +482,63 @@ class DownloadStation:
                 raise ds2_error
             raise self._not_installed_error()
         try:
-            self._call(TASK_API, "create", legacy, version=3, http_method="POST", files=legacy_files,
-                       sid_in_query=False)
+            data = self._call(TASK_API, "create", legacy, version=3, http_method="POST", files=legacy_files,
+                              sid_in_query=False)
         except DownloadStationError as exc:
             if ds2_error is not None and (exc.code in _PARAM_CODES or exc.auth):
                 raise ds2_error
             raise
+        self.last_create = {"api": TASK_API, "http": "multipart" if legacy_files else "POST", "data": data}
+        log.info("Download Station : création via %s create v%s (%s %s) -> réponse %s", TASK_API,
+                 self._version(TASK_API, 3), self.last_create["http"], self._api_info(TASK_API).get("path"),
+                 json.dumps(data, ensure_ascii=False)[:300])
         if ds2_error is not None:
             log.warning("Download Station : tâche créée avec l'ancienne API (DownloadStation2 a refusé : %s)", ds2_error)
         return "ancienne API"
+
+    def _confirm_file_lists(self, data: Any, destination: str) -> None:
+        """DownloadStation2 answers {"list_id": [...], "task_id": []} when it prepared a file-selection list
+        instead of a task (create_list not taken as false): nothing downloads until the list is confirmed
+        (what the DS web UI does after its "select files" dialog). Confirm it with every file selected.
+        Never raises."""
+        if not isinstance(data, dict):
+            return
+        list_ids = _ids(data.get("list_id"))
+        if not list_ids:
+            return
+        log.warning("Download Station a préparé une liste de sélection de fichiers (list_id %s) au lieu de lancer "
+                    "la tâche : confirmation automatique avec tous les fichiers", ", ".join(list_ids))
+        for list_id in list_ids:
+            try:
+                self._confirm_file_list(list_id, destination)
+            except Exception as exc:  # never fail an add that DSM accepted
+                log.warning("Download Station : confirmation de la liste %s impossible (%s) : validez la tâche "
+                            "à la main dans Download Station", list_id, exc)
+
+    def _confirm_file_list(self, list_id: str, destination: str) -> None:
+        selected: Optional[List[int]] = None
+        if self.has_api(TASK2_LIST_API):
+            info: Any = None
+            for key in ("list_id", "id"):
+                try:
+                    info = self._call(TASK2_LIST_API, "get", {key: json.dumps(list_id)}, version=2)
+                    break
+                except DownloadStationError as exc:
+                    if exc.auth:
+                        raise
+                    log.debug("Download Station : lecture de la liste %s (%s=) impossible : %s", list_id, key, exc)
+            files = info.get("files") if isinstance(info, dict) else None
+            if isinstance(files, list) and files:
+                selected = [_to_int(f.get("index"), i) if isinstance(f, dict) else i for i, f in enumerate(files)]
+        api = TASK2_LIST_POLLING_API if self.has_api(TASK2_LIST_POLLING_API) else TASK2_LIST_API
+        params: Dict[str, Any] = {"list_id": json.dumps(list_id), "create_subfolder": "true"}
+        if destination:
+            params["destination"] = json.dumps(destination, ensure_ascii=False)
+        if selected is not None:
+            params["selected"] = json.dumps(selected, separators=(",", ":"))
+        data = self._call(api, "download", params, version=2, http_method="POST", sid_in_query=True)
+        log.info("Download Station : liste %s confirmée via %s download (%s fichier(s)) -> réponse %s", list_id, api,
+                 len(selected) if selected is not None else "tous les", json.dumps(data, ensure_ascii=False)[:300])
 
     def add_torrent_file(self, data: bytes, filename: str) -> str:
         if not data:
@@ -417,29 +546,36 @@ class DownloadStation:
         name = re.sub(r'[\\/:*?"<>|\r\n]+', "_", (filename or "").strip()) or "synoarr"
         if not name.lower().endswith(".torrent"):
             name += ".torrent"
-        ctype = "application/x-bittorrent"
-        ds2: Dict[str, Any] = {"type": '"file"', "file": '["torrent"]', "create_list": "false"}
+        # Exactly Prowlarr's DownloadStationTaskProxyV2.AddTaskFromData: POST multipart, _sid in the query,
+        # api/version/method, type="file", file=["fileData"], create_list=false, destination="<dir>", fileData.
+        ds2: Dict[str, Any] = {"type": '"file"', "file": json.dumps([UPLOAD_FIELD]), "create_list": "false"}
         legacy: Dict[str, Any] = {}
-        if self.destination:
-            ds2["destination"] = json.dumps(self.destination, ensure_ascii=False)
-            legacy["destination"] = self.destination
-        api = self._create_with_fallback(ds2, legacy, {"torrent": (name, data, ctype)},
-                                         {"file": (name, data, ctype)})
+        dest = self._effective_destination()
+        if dest:
+            ds2["destination"] = json.dumps(dest, ensure_ascii=False)
+            legacy["destination"] = dest
+        api = self._create_with_fallback(ds2, legacy, {UPLOAD_FIELD: (name, data, UPLOAD_CTYPE)},
+                                         {"file": (name, data, UPLOAD_CTYPE)}, destination=dest)
         log.info("Download Station : torrent « %s » ajouté%s (%s, %d octets envoyés tels quels)", name,
-                 " dans %s" % self.destination if self.destination else "", api, len(data))
+                 " dans %s" % dest if dest else "", api, len(data))
         return api
 
     def add_url(self, url: str) -> str:
         url = (url or "").strip()
         if not url:
             raise DownloadStationError("URL vide")
-        ds2: Dict[str, Any] = {"type": '"url"', "url": json.dumps([url], ensure_ascii=False),
-                               "create_list": "false"}
+        # Exactly Prowlarr's DownloadStationTaskProxyV2.AddTaskFromUrl: GET, query string
+        # _sid, api, version, method, type=url, url=<link as is>, create_list=false, destination=<dir>.
+        ds2: Dict[str, Any] = {"type": "url", "url": _plain_param(url), "create_list": "false"}
         legacy: Dict[str, Any] = {"uri": url}
-        if self.destination:
-            ds2["destination"] = json.dumps(self.destination, ensure_ascii=False)
-            legacy["destination"] = self.destination
-        api = self._create_with_fallback(ds2, legacy, None, None)
+        dest = self._effective_destination()
+        if dest:
+            ds2["destination"] = _plain_param(dest)
+            legacy["destination"] = dest
+        method = "GET"
+        if len(urllib.parse.urlencode(ds2)) + len(self.url) + 200 > MAX_GET_URL:
+            method = "POST"  # very long magnet (many trackers): too long for a request line
+        api = self._create_with_fallback(ds2, legacy, None, None, destination=dest, ds2_http_method=method)
         log.info("Download Station : lien ajouté via %s (%s)", api,
                  redact(url)[:120] if not url.startswith("magnet:") else url[:300])
         return api

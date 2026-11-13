@@ -53,6 +53,9 @@ class DownloadStationConfig:
     # from the indexer and uploads the original bytes to Download Station; "url" = Download Station downloads the
     # link itself (only works when the link looks like a .torrent file to Download Station).
     send_mode: str = "file"
+    # When the indexer offers both: "torrent" (default) sends the .torrent file, "magnet" sends the magnet
+    # link first, like Prowlarr's own Download Station client
+    prefer: str = "torrent"
     # Optional public trackers appended to magnet links with fewer than 2 trackers. Empty (default): magnets are
     # sent exactly as the indexer provides them.
     extra_trackers: List[str] = field(default_factory=list)
@@ -173,6 +176,9 @@ class Config:
         problems = []
         if self.paths.action not in ("move", "copy", "hardlink"):
             problems.append("[paths] action doit valoir move, copy ou hardlink (valeur: %r)" % self.paths.action)
+        if self.downloadstation.prefer not in ("torrent", "magnet"):
+            problems.append("[downloadstation] prefer doit valoir torrent ou magnet (valeur: %r)"
+                            % self.downloadstation.prefer)
         if self.downloadstation.send_mode not in ("url", "file"):
             problems.append("[downloadstation] send_mode doit valoir url ou file (valeur: %r)"
                             % self.downloadstation.send_mode)
@@ -320,6 +326,7 @@ def load_config(path: Optional[str]) -> Config:
     cfg.plex.server_url = cfg.plex.server_url.rstrip("/")
     cfg.paths.action = cfg.paths.action.lower().strip()
     cfg.downloadstation.send_mode = (cfg.downloadstation.send_mode or "file").lower().strip()
+    cfg.downloadstation.prefer = (cfg.downloadstation.prefer or "torrent").lower().strip()
     cfg.series.monitor = cfg.series.monitor.lower().strip()
     for attr in ("download_dir", "movies_dir", "series_dir"):
         value = getattr(cfg.paths, attr).strip()

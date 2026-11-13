@@ -46,6 +46,14 @@ def torrent_bytes(name):
     return bencode({b"announce": b"http://tracker.invalid/announce", b"info": info})
 
 
+def dsm_value(raw):
+    """How DSM's entry.cgi reads a parameter: JSON first, else the raw string."""
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
 class World:
     """State of the fake services."""
 
@@ -141,7 +149,7 @@ class World:
             return 200, {}, {"success": False, "error": {"code": 119}}
         if api == "SYNO.DownloadStation2.Task" and method == "create":
             files = req.multipart
-            dest = json.loads(params.get("destination", '""'))
+            dest = dsm_value(params.get("destination", '""'))
             with self.lock:
                 for _field, (fn, content) in files.items():
                     if fn:
@@ -150,9 +158,10 @@ class World:
                         length, rest = name.split(b":", 1)
                         title = rest[:int(length)].decode()
                         self._new_task(title, dest)
-                if json.loads(params.get("type", '""')) == "url":
+                if dsm_value(params.get("type", '""')) == "url":
                     from synoarr.bencode import magnet_info
-                    for uri in json.loads(params.get("url", "[]")):
+                    urls = dsm_value(params.get("url", "[]"))
+                    for uri in urls if isinstance(urls, list) else [urls]:
                         if uri.lower().startswith(("http://", "https://")):
                             # like the real Download Station: it downloads the .torrent link itself
                             import urllib.request

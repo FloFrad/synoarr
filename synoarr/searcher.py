@@ -679,6 +679,8 @@ class Searcher:
           or, with send_mode = url, Download Station downloads the link itself;
         - a magnet (direct or behind a redirect): sent as is."""
         assert self.ds is not None
+        if release.magnet and (getattr(self.cfg.downloadstation, "prefer", "torrent") or "") == "magnet":
+            return self._send_magnet(release.magnet)
         if release.download_url:
             resp = self.http.get(release.download_url, raise_for_status=False, timeout=60)
             if resp.redirect_location and resp.redirect_location.lower().startswith("magnet:"):
