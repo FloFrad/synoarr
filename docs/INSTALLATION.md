@@ -241,7 +241,7 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 | Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » |
 | Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), priorité (1 = le plus prioritaire), tester, activer, supprimer |
 | Historique | envois vers Download Station et événements |
-| Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer |
+| Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer, mettre à jour synoarr (et revenir en arrière) |
 | Journal | dernières lignes du journal, filtres, téléchargement |
 | Configuration | éditeur de `config.ini` : vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
 
@@ -361,6 +361,19 @@ Journal : `data/synoarr.log` (consultable dans File Station).
 | synoarr ne démarre pas | lisez `data/console.log` et `data/synoarr.log` |
 
 ## Mise à jour
+
+**Le plus simple (installation native) : depuis l'interface web**, onglet Commandes :
+
+1. « Vérifier les mises à jour » : liste les fichiers qui changeraient, sans rien modifier.
+2. « Mettre à jour synoarr » : télécharge la dernière version depuis GitHub, vérifie qu'elle démarre avec le
+   Python du NAS (sinon rien n'est modifié), sauvegarde les fichiers remplacés, garde `config.ini` et `data/`, puis
+   redémarre synoarr ; la page se recharge toute seule.
+3. En cas de souci : « Revenir à la version précédente ».
+
+Même chose en SSH : `sudo python3 synoarr.py update` (`--check` pour vérifier, `--rollback` pour revenir en
+arrière), puis `sudo sh scripts/restart.sh`.
+
+Ou avec le script :
 
 Installation native :
 

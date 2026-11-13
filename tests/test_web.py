@@ -175,7 +175,7 @@ class WebApiTest(WebTestBase):
             self.assertIn(word, html)
         self.assertNotIn("http://", html.split("<script>")[0].replace('href="data:,"', ""))  # aucun CDN
         self.assertIn("script-src 'sha256-", hdrs["Content-Security-Policy"])
-        self.assertLess(len(html.splitlines()), 500)
+        self.assertLess(len(html.splitlines()), 600)  # single light page
         self.assertLess(len(html), 120 * 1024)
 
     def test_status(self) -> None:
@@ -1590,3 +1590,40 @@ class JackettImportTest(RealAppWebBase):
         base = self.start(FakeJackett(xml_list=False))
         res = self.app.indexer_manager.import_jackett(base, FakeJackett.KEY)
         self.assertEqual(sorted(res["added"]), ["1337x (Jackett)", "YTS (Jackett)"])
+
+
+class UpdateCommandTest(RealAppWebBase):
+    def wait_job(self, job_id: int, timeout: float = 20) -> Dict[str, Any]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status, job, _ = self.req("/api/jobs/%d" % job_id)
+            if job.get("status") != "running":
+                return job
+            time.sleep(0.05)
+        self.fail("tâche %d toujours en cours" % job_id)
+
+    def test_update_jobs(self) -> None:
+        from unittest import mock
+        from synoarr import updater
+        with mock.patch.object(updater.Updater, "check", lambda self, emit: (emit("ok", "synoarr est à jour"),
+                                                                            {"available": False})[1]):
+            status, data, _ = self.req("/api/jobs", "POST", {"command": "update_check"})
+            self.assertEqual(status, 200, data)
+            job = self.wait_job(data["job"]["id"])
+            self.assertEqual(job["status"], "done", job)
+            self.assertIn("à jour", json.dumps(job["output"], ensure_ascii=False))
+        restarts = []
+        self.app.restart = lambda delay=1.0: restarts.append(delay)  # type: ignore[assignment]
+        with mock.patch.object(updater.Updater, "apply", lambda self, emit: {"updated": True}):
+            data = self.req("/api/jobs", "POST", {"command": "update"})[1]
+            job = self.wait_job(data["job"]["id"])
+            self.assertTrue(job["result"]["restarting"], job)
+        self.assertEqual(len(restarts), 1)
+
+        def boom(self, emit):
+            raise updater.UpdateError("Téléchargement impossible")
+        with mock.patch.object(updater.Updater, "apply", boom):
+            data = self.req("/api/jobs", "POST", {"command": "update"})[1]
+            job = self.wait_job(data["job"]["id"])
+            self.assertIn("Téléchargement impossible", json.dumps(job["output"], ensure_ascii=False))
+        self.assertEqual(len(restarts), 1)

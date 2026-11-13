@@ -1036,7 +1036,10 @@ const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (f
   ['process','Traiter les téléchargements','Renomme et range les téléchargements terminés.'],
   ['dry_run','Simulation du traitement','Montre ce qui serait rangé, sans rien déplacer.'],
   ['check','Vérifier la configuration','Dossiers, Download Station, Plex, TMDb et indexers.'],
-  ['test_indexers','Tester tous les indexers','Vérifie que chaque indexer répond.']];
+  ['test_indexers','Tester tous les indexers','Vérifie que chaque indexer répond.'],
+  ['update_check','Vérifier les mises à jour','Compare votre version avec GitHub, sans rien modifier.'],
+  ['update','Mettre à jour synoarr','Télécharge la dernière version, la vérifie, garde config.ini et data/, puis redémarre.'],
+  ['update_rollback','Revenir à la version précédente','Restaure les fichiers sauvegardés lors de la dernière mise à jour, puis redémarre.']];
 const PFX={ok:'[OK]  ',err:'[ERR] ',warn:'[!]   ',info:''};
 let jobs={}, cur=null, srch=null, plexId=null;
 const polling=new Set();
@@ -1057,7 +1060,8 @@ function track(j){jobs[j.id]=j;if(j.command==='search')srch=j.id;else if(j.comma
 async function poll(id){if(polling.has(id))return;polling.add(id);let fails=0;
   try{while(fails<30){await sleep(1000);let j;try{j=await api('jobs/'+id);fails=0}catch(e){if(e.status===404)break;fails++;continue}
     jobs[id]=j;draw(j);if(j.status!=='running'){done(j);break}}}finally{polling.delete(id)}}
-function done(j){if(j.command==='plex_login')toast(j.status==='done'?'Compte Plex connecté':(j.error||'Connexion Plex échouée'),j.status!=='done');
+function done(j){if(j.result&&j.result.restarting){waitRestart(upS0)}
+  if(j.command==='plex_login')toast(j.status==='done'?'Compte Plex connecté':(j.error||'Connexion Plex échouée'),j.status!=='done');
   else if(j.command!=='search')toast(j.label+' : '+(j.status==='done'?'terminé':'erreur'),j.status!=='done');loadJobs()}
 function draw(j){if(tab!=='cmd')return;if(j.id===cur&&$('#out'))drawOut(j);if(j.id===srch&&$('#sres'))drawSearch(j);if(j.id===plexId&&$('#plexbox'))drawPlex(j)}
 const con=o=>`<pre class="con">${o.map(x=>`<span class="o-${esc(x.level)}">${esc(PFX[x.level]||'')}${esc(x.text)}</span>`).join('\n')}</pre>`;
@@ -1093,6 +1097,12 @@ async function openJob(id){try{const j=await api('jobs/'+id);track(j);const t=j.
 async function plexLogin(){try{const r=await api('plex/login','POST');toast(r.message);track(r.job)}catch(e){toast(e.message,true)}}
 async function grab(i,b){b.disabled=true;b.textContent='Envoi…';try{const r=await api('jobs/'+srch+'/grab','POST',{index:i});toast(r.message,!r.ok);b.textContent=r.ok?'Envoyé ✔':'Échec';if(!r.ok)b.disabled=false}
   catch(e){toast(e.message,true);b.textContent='Envoyer';b.disabled=false}}
+async function waitRestart(s0){$('#conn').textContent='Redémarrage en cours…';const t0=Date.now();
+  const wait=async()=>{try{const s=await api('status');if(s.started_at!==s0){toast('synoarr a redémarré');setTimeout(()=>location.reload(),800);return}}catch(e){}
+    if(Date.now()-t0<600000)setTimeout(wait,2000);else $('#conn').textContent='⚠ synoarr ne répond plus : vérifiez le journal sur le NAS'};setTimeout(wait,2500)}
+let upS0=null;
+async function startUpdate(cmd){const q=cmd==='update'?'Mettre à jour synoarr depuis GitHub ? config.ini et data/ sont conservés ; synoarr redémarre ensuite.':'Revenir à la version précédente de synoarr ? synoarr redémarre ensuite.';
+  if(!confirm(q))return;try{upS0=(await api('status')).started_at}catch(e){}startJob({command:cmd})}
 async function restart(){if(!confirm('Redémarrer synoarr ? Les tâches en cours seront terminées avant.'))return;let s0=null;
   try{s0=(await api('status')).started_at}catch(e){}
   try{const r=await api('restart','POST');toast(r.message)}catch(e){toast(e.message,true);return}
@@ -1178,6 +1188,7 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.prwx)prwForget();
   else if(d.jkts)jktSync();
   else if(d.jktx)jktForget();
+  else if(d.cmd==='update'||d.cmd==='update_rollback')startUpdate(d.cmd);
   else if(d.cmd)startJob({command:d.cmd,force:d.cmd==='search_all'&&!!($('#force')&&$('#force').checked)});
   else if(d.plex)plexLogin();
   else if(d.restart)restart();

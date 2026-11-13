@@ -642,6 +642,28 @@ def cmd_process(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    """Self-update from GitHub (same code as the web UI). Restart the daemon afterwards (scripts/restart.sh)."""
+    from .updater import UpdateError, make_updater
+    cfg = _load(args)
+    upd = make_updater(cfg)
+    emit = lambda level, msg: _out(_PREFIX.get(level, "") + msg)  # noqa: E731
+    try:
+        if args.check:
+            res = upd.check(emit)
+        elif args.rollback:
+            res = upd.rollback(emit)
+            res["updated"] = True
+        else:
+            res = upd.apply(emit)
+    except UpdateError as exc:
+        _out(KO + str(exc))
+        return 1
+    if res.get("updated"):
+        _out("      Redémarrez synoarr : sudo sh scripts/restart.sh (ou bouton « Redémarrer » de l'interface web)")
+    return 0
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     app = _app(args)
     app.run_once()
@@ -779,6 +801,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("process", parents=[common], help="renommer/déplacer les téléchargements terminés") \
         .set_defaults(func=cmd_process)
+    pu = sub.add_parser("update", parents=[common], help="mettre à jour synoarr depuis GitHub")
+    pu.add_argument("--check", action="store_true", help="seulement vérifier s'il existe une mise à jour")
+    pu.add_argument("--rollback", action="store_true", help="revenir à la version précédente")
+    pu.set_defaults(func=cmd_update)
     sub.add_parser("once", parents=[common], help="un cycle complet puis quitter (mode tâche planifiée)") \
         .set_defaults(func=cmd_once)
     sub.add_parser("run", parents=[common], help="lancer le démon (+ interface web)").set_defaults(func=cmd_run)

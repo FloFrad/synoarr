@@ -31,6 +31,8 @@ class GeneralConfig:
     process_interval_minutes: int = 2
     research_interval_hours: float = 6.0
     dry_run: bool = False
+    # GitHub repository used by the "Mettre à jour" command (owner/name)
+    update_repo: str = "FloFrad/synoarr"
 
 
 @dataclass

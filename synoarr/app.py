@@ -623,6 +623,9 @@ COMMANDS = {
     "test_indexers": "Tester tous les indexers",
     "search": "Recherche manuelle",
     "plex_login": "Connexion Plex",
+    "update_check": "Vérifier les mises à jour",
+    "update": "Mettre à jour synoarr",
+    "update_rollback": "Revenir à la version précédente",
 }
 MAX_JOBS = 20
 # statuts Download Station d'un téléchargement qui avance (rafraîchissement rapide de l'interface)
@@ -975,6 +978,8 @@ class App:
             target, args, capture = self._cmd_check, (), False
         elif command == "test_indexers":
             target, args = self._cmd_test_indexers, ()
+        elif command in ("update_check", "update", "update_rollback"):
+            target, args, key = self._cmd_update, (command,), "update"  # one update job at a time
         else:  # search
             if not query:
                 raise ValueError("Saisissez un titre à rechercher (ex. « Night of the Living Dead 1968 »)")
@@ -1091,6 +1096,28 @@ class App:
             job.emit("warn", w)
         code = check_report(self.cfg, job.emit, app=self, hint=_web_hint)
         return {"ok": code == 0}
+
+    def _cmd_update(self, job: Job, command: str) -> Dict[str, Any]:
+        from .updater import UpdateError, make_updater
+        upd = make_updater(self.cfg, self.http)
+        try:
+            if command == "update_check":
+                return upd.check(job.emit)
+            if command == "update_rollback":
+                res = upd.rollback(job.emit)
+                changed = True
+            else:
+                res = upd.apply(job.emit)
+                changed = bool(res.get("updated"))
+        except UpdateError as exc:
+            job.emit("err", str(exc))
+            return {"ok": False, "message": str(exc)}
+        if changed:
+            self.db.add_event("update", "synoarr mis à jour (%s) : redémarrage" % command)
+            job.emit("info", "Redémarrage de synoarr dans quelques secondes (la page se recharge toute seule)")
+            self.restart(delay=2.0)
+            res["restarting"] = True
+        return res
 
     def _cmd_test_indexers(self, job: Job) -> Dict[str, Any]:
         rows = self.indexer_manager.list()
