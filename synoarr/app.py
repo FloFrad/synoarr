@@ -680,6 +680,7 @@ COMMANDS = {
     "search": "Recherche manuelle",
     "plex_login": "Connexion Plex",
     "ds_diag": "Diagnostic Download Station",
+    "ds_test": "Test d'envoi Download Station",
     "update_check": "Vérifier les mises à jour",
     "update": "Mettre à jour synoarr",
     "update_rollback": "Revenir à la version précédente",
@@ -1037,6 +1038,8 @@ class App:
             target, args = self._cmd_test_indexers, ()
         elif command == "ds_diag":
             target, args = self._cmd_ds_diag, ()
+        elif command == "ds_test":
+            target, args = self._cmd_ds_test, ()
         elif command in ("update_check", "update", "update_rollback"):
             target, args, key = self._cmd_update, (command,), "update"  # one update job at a time
         else:  # search
@@ -1155,6 +1158,19 @@ class App:
             job.emit("warn", w)
         code = check_report(self.cfg, job.emit, app=self, hint=_web_hint)
         return {"ok": code == 0}
+
+    def _cmd_ds_test(self, job: Job) -> Dict[str, Any]:
+        """Send a legal, heavily seeded torrent the 3 possible ways and report which ones start."""
+        from . import dstest
+        if self.ds is None:
+            job.emit("err", "Download Station n'est pas configuré ([downloadstation] username/password)")
+            return {"ok": False}
+        url = getattr(self.cfg.downloadstation, "test_torrent_url", "") or ""
+        try:
+            return dstest.run(self.ds, self.http, job.emit, torrent_url=url)
+        except Exception as exc:
+            job.emit("err", "Test impossible : %s" % exc)
+            return {"ok": False, "message": str(exc)}
 
     def _cmd_ds_diag(self, job: Job) -> Dict[str, Any]:
         """Explain why Download Station tasks do not start (waiting / error)."""

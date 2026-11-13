@@ -1073,6 +1073,7 @@ const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (f
   ['dry_run','Simulation du traitement','Montre ce qui serait rangé, sans rien déplacer.'],
   ['check','Vérifier la configuration','Dossiers, Download Station, Plex, TMDb et indexers.'],
   ['test_indexers','Tester tous les indexers','Vérifie que chaque indexer répond.'],
+  ['ds_test','Test d\'envoi Download Station','Envoie un torrent libre très partagé (Ubuntu) des 3 façons possibles (fichier, lien, magnet) et indique lesquelles démarrent (≈ 5 min).'],
   ['ds_diag','Diagnostic Download Station','Explique pourquoi des téléchargements restent « En attente » ou en erreur.'],
   ['update_check','Vérifier les mises à jour','Compare votre version avec GitHub, sans rien modifier.'],
   ['update','Mettre à jour synoarr','Télécharge la dernière version, la vérifie, garde config.ini et data/, puis redémarre.'],

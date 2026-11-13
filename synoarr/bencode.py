@@ -258,3 +258,46 @@ def add_trackers(magnet: str, trackers: Any, minimum: int = 2) -> str:
     if not extra:
         return magnet
     return magnet + ("&" if not magnet.endswith("&") else "") + "&".join(extra)
+
+
+def normalize_magnet(magnet: str) -> Tuple[str, Optional[str]]:
+    """Repair a magnet whose encoding was damaged on the way (HTML entities "&amp;", double percent-encoding
+    "%2520" / "udp%253A%252F%252F"...). Returns (magnet, reason) - reason None when nothing had to be fixed.
+    The content (hash, name, trackers) is never changed, only its encoding."""
+    import html
+    import urllib.parse
+    if not isinstance(magnet, str) or not magnet.lower().startswith("magnet:?"):
+        return magnet, None
+    original = magnet.strip()
+    reasons = []
+    m = original
+    if "&amp;" in m.lower():
+        m = html.unescape(m)
+        reasons.append("entités HTML (&amp;)")
+    query = m.split("?", 1)[1]
+    pairs = []
+    for part in query.split("&"):
+        if not part:
+            continue
+        k, _, v = part.partition("=")
+        val = urllib.parse.unquote_plus(v) if k.lower() != "xt" else urllib.parse.unquote(v)
+        # double encoding: after one decoding the value still looks percent-encoded (udp%3A%2F%2F..., %20...)
+        rounds = 0
+        while re.search(r"%[0-9A-Fa-f]{2}", val) and rounds < 3 and (
+                k.lower() == "tr" and re.match(r"^[a-z]+%3a%2f%2f", val, re.I) or
+                k.lower() == "dn" and re.search(r"%(20|28|29|5b|5d|2c|27|26)", val, re.I)):
+            val = urllib.parse.unquote(val)
+            rounds += 1
+        if rounds:
+            reasons.append("double encodage (%s)" % k)
+        pairs.append((k, val))
+    if not reasons:
+        return original, None
+    out = []
+    for k, v in pairs:
+        if k.lower() == "xt":
+            out.append("%s=%s" % (k, v))
+        else:
+            out.append("%s=%s" % (k, urllib.parse.quote(v, safe="")))
+    fixed = "magnet:?" + "&".join(out)
+    return fixed, ", ".join(sorted(set(reasons)))

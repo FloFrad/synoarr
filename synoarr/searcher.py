@@ -721,9 +721,14 @@ class Searcher:
         name, info_hash = bencode.magnet_info(magnet)
         if self._hash_already_grabbed(info_hash):
             raise _AlreadyGrabbed()
+        fixed, reason = bencode.normalize_magnet(magnet)
+        if reason:
+            log.warning("Lien magnet mal encodé (%s) : réparé avant l'envoi (même hash, même nom, mêmes trackers)",
+                        reason)
+            magnet = fixed
+            name = bencode.magnet_info(magnet)[0] or name
         trackers = getattr(self.cfg.downloadstation, "extra_trackers", None) or []  # empty by default: as is
         self.ds.add_url(bencode.add_trackers(magnet, trackers) if trackers else magnet)
-        log.info("Lien magnet transmis à Download Station : %s", magnet[:120])
         return name, info_hash
 
     # ================================================================ failed downloads

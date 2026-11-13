@@ -691,6 +691,20 @@ def cmd_ds_diag(args: argparse.Namespace) -> int:
     return 0 if res.get("ok", True) else 1
 
 
+def cmd_ds_test(args: argparse.Namespace) -> int:
+    """Send a legal, heavily seeded torrent the 3 ways and report which ones start."""
+    app = _app(args)
+
+    class _Out(object):
+        private = {}  # type: dict
+
+        @staticmethod
+        def emit(level: str, msg: str) -> None:
+            _out(_PREFIX.get(level, "") + msg)
+    res = app._cmd_ds_test(_Out())
+    return 0 if res.get("working") else 1
+
+
 def cmd_once(args: argparse.Namespace) -> int:
     app = _app(args)
     app.run_once()
@@ -830,6 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("process", parents=[common], help="renommer/déplacer les téléchargements terminés") \
         .set_defaults(func=cmd_process)
+    sub.add_parser("ds-test", parents=[common], help="tester l'envoi à Download Station (torrent Ubuntu, 3 méthodes)") \
+        .set_defaults(func=cmd_ds_test)
     sub.add_parser("ds-diag", parents=[common], help="diagnostic des téléchargements Download Station en attente") \
         .set_defaults(func=cmd_ds_diag)
     pu = sub.add_parser("update", parents=[common], help="mettre à jour synoarr depuis GitHub")

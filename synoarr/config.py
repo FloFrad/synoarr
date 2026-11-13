@@ -59,6 +59,8 @@ class DownloadStationConfig:
     # A download still waiting without any source after this many hours is abandoned: the release is blocklisted
     # and another one is searched (0 = never)
     stalled_hours: float = 6.0
+    # torrent used by « Test d'envoi Download Station » (empty = latest official Ubuntu Server ISO torrent)
+    test_torrent_url: str = ""
 
 
 @dataclass

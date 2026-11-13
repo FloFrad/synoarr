@@ -381,13 +381,15 @@ class DownloadStation:
     # ================================================================ add
     def _create_with_fallback(self, ds2: Dict[str, Any], legacy: Dict[str, Any],
                               ds2_files: Optional[Mapping[str, Tuple[str, bytes, str]]],
-                              legacy_files: Optional[Mapping[str, Tuple[str, bytes, str]]]) -> None:
+                              legacy_files: Optional[Mapping[str, Tuple[str, bytes, str]]]) -> str:
+        """Create a task; returns the API used: "DownloadStation2" or "ancienne API"."""
         ds2_error: Optional[DownloadStationError] = None
         if self.has_api(TASK2_API):
             try:
-                self._call(TASK2_API, "create", ds2, version=2, http_method="POST", files=ds2_files,
-                           sid_in_query=True)
-                return
+                data = self._call(TASK2_API, "create", ds2, version=2, http_method="POST", files=ds2_files,
+                                  sid_in_query=True)
+                log.debug("Download Station : création via DownloadStation2 OK (réponse %s)", str(data)[:200])
+                return "DownloadStation2"
             except DownloadStationError as exc:
                 if exc.auth:
                     raise
@@ -405,8 +407,11 @@ class DownloadStation:
             if ds2_error is not None and (exc.code in _PARAM_CODES or exc.auth):
                 raise ds2_error
             raise
+        if ds2_error is not None:
+            log.warning("Download Station : tâche créée avec l'ancienne API (DownloadStation2 a refusé : %s)", ds2_error)
+        return "ancienne API"
 
-    def add_torrent_file(self, data: bytes, filename: str) -> None:
+    def add_torrent_file(self, data: bytes, filename: str) -> str:
         if not data:
             raise DownloadStationError("Fichier .torrent vide")
         name = re.sub(r'[\\/:*?"<>|\r\n]+', "_", (filename or "").strip()) or "synoarr"
@@ -418,11 +423,13 @@ class DownloadStation:
         if self.destination:
             ds2["destination"] = json.dumps(self.destination, ensure_ascii=False)
             legacy["destination"] = self.destination
-        self._create_with_fallback(ds2, legacy, {"torrent": (name, data, ctype)}, {"file": (name, data, ctype)})
-        log.info("Download Station : torrent « %s » ajouté%s", name,
-                 " dans %s" % self.destination if self.destination else "")
+        api = self._create_with_fallback(ds2, legacy, {"torrent": (name, data, ctype)},
+                                         {"file": (name, data, ctype)})
+        log.info("Download Station : torrent « %s » ajouté%s (%s, %d octets envoyés tels quels)", name,
+                 " dans %s" % self.destination if self.destination else "", api, len(data))
+        return api
 
-    def add_url(self, url: str) -> None:
+    def add_url(self, url: str) -> str:
         url = (url or "").strip()
         if not url:
             raise DownloadStationError("URL vide")
@@ -432,9 +439,10 @@ class DownloadStation:
         if self.destination:
             ds2["destination"] = json.dumps(self.destination, ensure_ascii=False)
             legacy["destination"] = self.destination
-        self._create_with_fallback(ds2, legacy, None, None)
-        log.info("Download Station : lien ajouté (%s)", redact(url)[:80] if not url.startswith("magnet:")
-                 else url[:60])
+        api = self._create_with_fallback(ds2, legacy, None, None)
+        log.info("Download Station : lien ajouté via %s (%s)", api,
+                 redact(url)[:120] if not url.startswith("magnet:") else url[:300])
+        return api
 
     # ================================================================ list / delete
     def list_tasks(self) -> List[DSTask]:
