@@ -5,9 +5,9 @@ Remplaçant léger de **Prowlarr + Radarr + Sonarr + Filebot**, pensé pour un N
 - **Indexers** torrent légaux : catalogue intégré (Internet Archive) ou n'importe quelle URL **Torznab** / **RSS**.
 - **Watchlist Plex** : chaque film ou série ajouté est recherché automatiquement (épisodes manquants, saisons
   complètes, nouveaux épisodes).
-- **Download Station** : le meilleur torrent (1080p → 720p, anglais ou français) est envoyé directement.
+- **Download Station** : le meilleur torrent (1080p → 720p, en anglais, ou en français pour l'animation) est envoyé directement.
 - **Renommage façon Filebot** : le dossier `Download` est surveillé, les fichiers terminés sont renommés au format
-  Plex puis déplacés dans `Vidéos/Films` et `Vidéos/Séries`.
+  Plex puis déplacés dans `video/Films` et `video/TvShows`.
 - **Une seule mini interface web** (port 8778) + une ligne de commande complète.
 
 Aucune dépendance : **Python 3.8+ seul** (déjà présent dans DSM 7). Docker possible mais pas obligatoire.
@@ -15,7 +15,7 @@ Aucune dépendance : **Python 3.8+ seul** (déjà présent dans DSM 7). Docker p
 ```
 Watchlist Plex ──► recherche indexers ──► Download Station ──► dossier Download
                                                                      │
-                     Vidéos/Films, Vidéos/Séries ◄── renommage Plex ◄┘
+                     video/Films, video/TvShows ◄── renommage Plex ◄┘
 ```
 
 ## Installation
@@ -54,8 +54,9 @@ sudo sh scripts/start.sh
 
 | Type | Résultat |
 |---|---|
-| Film | `Films/Night of the Living Dead (1968)/Night of the Living Dead (1968).mkv` |
-| Épisode | `Séries/The Office/Season 02/The Office - S02E05.mkv` |
+| Film | `Films/Night of the Living Dead (1968).mkv` |
+| Film d'une collection | `Films/The Matrix Collection/The Matrix Reloaded (2003).mkv` |
+| Épisode | `TvShows/The Office/Saison 02/The Office - S02E05 - Halloween.mkv` |
 | Sous-titres | `... - S02E05.fr.srt` |
 
 Modifiable dans `config.ini` (`[naming]`), syntaxe proche de Filebot : `{title}`, `{year}`, `{show}`,

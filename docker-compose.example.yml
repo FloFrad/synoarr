@@ -23,7 +23,7 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: /volume1/Vidéos
-        target: /volume1/Vidéos
+        source: /volume1/video
+        target: /volume1/video
         bind:
           create_host_path: false

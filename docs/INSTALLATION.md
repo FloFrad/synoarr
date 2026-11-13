@@ -20,12 +20,12 @@ Deux méthodes :
    Panneau de configuration → Utilisateur et groupe → Créer :
    - Nom : `synoarr`, un mot de passe solide.
    - Groupe : `users` suffit.
-   - Permissions des dossiers partagés : **Lecture/Écriture** sur `Download` et `Vidéos`.
+   - Permissions des dossiers partagés : **Lecture/Écriture** sur `Download` et `video`.
    - Applications : **Autoriser** Download Station.
    - Ne pas activer la validation en 2 étapes pour ce compte.
 4. **Noter les chemins exacts de vos dossiers** : File Station → clic droit sur le dossier `Download` →
-   Propriétés → « Emplacement » (ex. `/volume1/Download`). Faites de même pour `Vidéos`. Attention aux accents
-   et aux majuscules : `Vidéos` et `Videos` sont deux dossiers différents.
+   Propriétés → « Emplacement » (ex. `/volume1/Download`). Faites de même pour `video`. Attention aux accents
+   et aux majuscules : `video`, `Video` et `Vidéos` sont trois dossiers différents.
 5. **Créer le dossier d'installation** : si vous n'avez pas de dossier partagé `docker`, créez-le
    (Panneau de configuration → Dossier partagé → Créer → nom `docker`). Il permet aussi d'éditer la configuration
    depuis File Station.
@@ -82,20 +82,33 @@ destination = Download
 
 [paths]
 download_dir = /volume1/Download
-movies_dir = /volume1/Vidéos/Films
-series_dir = /volume1/Vidéos/Séries
+movies_dir = /volume1/video/Films
+series_dir = /volume1/video/TvShows
 ```
 
 Règles importantes :
 
 - `download_dir` est le chemin complet du dossier indiqué dans `destination`
   (`destination = Download` ↔ `download_dir = /volume1/Download`).
-- Les dossiers partagés (`Download`, `Vidéos`) doivent exister ; les sous-dossiers `Films` et `Séries` sont créés
+- Les dossiers partagés (`Download`, `video`) doivent exister ; les sous-dossiers `Films` et `TvShows` sont créés
   automatiquement.
 - Enregistrez le fichier en UTF-8 (c'est le cas par défaut avec l'Éditeur de texte de DSM).
 
-Les autres réglages ont déjà les bonnes valeurs : qualité 1080p puis 720p, langues anglais ou français
-(MULTI accepté), noms au format Plex.
+Les autres réglages ont déjà les bonnes valeurs :
+
+- qualité 1080p, puis 720p ;
+- films et séries en **anglais** (MULTI accepté, sous-titres préférés), **animation en français** (genre
+  « Animation » sur Plex ou TMDb) ;
+- noms : `Films/Titre (Année).mkv`, `Films/Nom Collection/Titre (Année).mkv`,
+  `TvShows/Série/Saison 01/Série - S01E02 - Titre épisode.mkv`.
+
+**Recommandé — clé TMDb gratuite** (nécessaire pour les dossiers de collections, améliore les titres d'épisodes et
+la détection de l'animation) : créez un compte sur <https://www.themoviedb.org>, puis Paramètres → API → Créer →
+« Developer », et copiez la « Clé d'API » dans `config.ini` : `[tmdb] api_key = ...`.
+
+Sous-titres anglais : synoarr garde les sous-titres fournis avec la vidéo (`Titre (Année).en.srt`) et préfère les
+releases qui en contiennent. Pour les autres, activez la recherche automatique de sous-titres de Plex
+(Plex → Paramètres → Langues → « Sélection automatique des sous-titres » et votre langue de sous-titres : anglais).
 
 ## Étape 4 — Connecter Plex (2 min)
 
@@ -198,7 +211,7 @@ sudo sh scripts/restart.sh
    cd /volume1/docker/synoarr && cp docker-compose.example.yml docker-compose.yml && mkdir -p config && cp config.example.ini config/config.ini
    ```
 3. Éditez `config/config.ini` comme à l'étape 3. Les chemins sont **identiques** en Docker
-   (`/volume1/Download`, `/volume1/Vidéos/...`) grâce aux montages de `docker-compose.yml`. Si vos dossiers ont un
+   (`/volume1/Download`, `/volume1/video/...`) grâce aux montages de `docker-compose.yml`. Si vos dossiers ont un
    autre chemin, modifiez aussi les lignes `source:` et `target:` de `docker-compose.yml`.
 4. Container Manager → Projet → Créer : nom `synoarr`, chemin `/docker/synoarr`. DSM détecte le
    `docker-compose.yml` existant : choisissez de l'utiliser → Suivant → Terminé. L'image se construit (1 à 2 min)
@@ -224,13 +237,15 @@ En Docker, le journal est dans `config/data/synoarr.log`.
 ## Comment ça marche
 
 1. Toutes les 15 minutes, synoarr lit votre **Watchlist Plex**.
-2. Pour chaque film ou épisode manquant (déjà présent dans `Vidéos` → ignoré), il interroge vos indexers et choisit
-   la meilleure release : 1080p puis 720p, anglais ou français (MULTI accepté), assez de sources, pas de CAM.
+2. Pour chaque film ou épisode manquant (déjà présent dans `video` → ignoré), il interroge vos indexers et choisit
+   la meilleure release : 1080p puis 720p, en **anglais** (avec sous-titres si possible) ou en **français pour
+   l'animation**, assez de sources, pas de CAM.
 3. Le `.torrent` (ou le lien magnet) est envoyé à **Download Station**, dans le dossier `Download`.
 4. Toutes les 2 minutes, synoarr regarde le dossier `Download`. Chaque téléchargement terminé est renommé au
    format Plex puis déplacé :
-   - `Vidéos/Films/Titre (Année)/Titre (Année).mkv`
-   - `Vidéos/Séries/Série/Season 01/Série - S01E02.mkv`
+   - `video/Films/Titre (Année).mkv`
+   - `video/Films/Nom Collection/Titre (Année).mkv` (films d'une collection, clé TMDb nécessaire)
+   - `video/TvShows/Série/Saison 01/Série - S01E02 - Titre épisode.mkv`
    La tâche Download Station est ensuite supprimée, puis Plex est rafraîchi si `server_url` est renseigné.
 5. Un téléchargement en erreur est mis sur liste noire et une autre release est recherchée.
 
