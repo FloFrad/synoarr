@@ -68,6 +68,9 @@ class OrganizerTestBase(unittest.TestCase):
         self.cfg.paths.movies_dir = self.movies
         self.cfg.paths.series_dir = self.series
         self.cfg.paths.min_age_minutes = 0
+        # these tests exercise the mechanics with the 1.0 naming layout (new layout: NewNamingTests)
+        self.cfg.naming.movie_format = "{title} ({year})/{title} ({year})"
+        self.cfg.naming.series_format = "{show}/Season {season:02d}/{show} - S{season:02d}E{episode:02d}"
         self.db = Database(":memory:")
         self.addCleanup(self.db.close)
         self.ds = FakeDS()
@@ -778,3 +781,61 @@ class ReviewFixesTests(OrganizerTestBase):
             os.close(fd)
         self.org().run_once()
         self.assertTrue(os.path.isfile(self.movie_path("Heat (1995)", "Heat (1995).mkv")))
+
+
+class NewNamingTests(OrganizerTestBase):
+    """Default layout requested by the user:
+    video/Films/Titre (Année).mkv, video/Films/<Collection>/Titre (Année).mkv,
+    video/TvShows/Série/Saison 01/Série - S01E02 - Titre épisode.mkv"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        defaults = Config().naming
+        self.cfg.naming.movie_format = defaults.movie_format
+        self.cfg.naming.movie_collection_format = defaults.movie_collection_format
+        self.cfg.naming.series_format = defaults.series_format
+
+    def test_movie_without_collection_is_flat(self) -> None:
+        entry = "Heat.1995.1080p.BluRay.x264-GRP"
+        self.make(entry + "/Heat.1995.1080p.BluRay.x264-GRP.mkv")
+        self.make(entry + "/Heat.1995.1080p.BluRay.x264-GRP.en.srt", 10)
+        self.grab(entry)
+        self.org().run_once()
+        self.assertEqual(sorted(os.listdir(self.movies)), ["Heat (1995).en.srt", "Heat (1995).mkv"])
+
+    def test_collection_from_watchlist_item(self) -> None:
+        mid = self.db.upsert_media("plex://movie/m", "movie", "The Matrix Reloaded", 2003, None, "604", None)
+        self.db.set_media_details(mid, collection="The Matrix Collection")
+        entry = "The.Matrix.Reloaded.2003.1080p.BluRay.x264-GRP"
+        self.db.add_grab(mid, None, None, entry, entry, "idx", None, 1000)
+        self.make(entry + "/movie.mkv")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("The Matrix Collection", "The Matrix Reloaded (2003).mkv")),
+                        os.listdir(self.movies))
+
+    def test_collection_from_tmdb_for_manual_download(self) -> None:
+        class Tmdb(FakeTmdb):
+            def movie_details(self, tmdb_id: str) -> Optional[Dict]:
+                return {"collection": "Alien Collection", "genres": ["Horror"], "is_animation": False}
+        tmdb = Tmdb(movies={"Aliens": {"title": "Aliens", "year": 1986, "tmdb": "679"}})
+        self.make("Aliens.1986.1080p.BluRay.x264-GRP.mkv")
+        self.org(tmdb=tmdb).run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("Alien Collection", "Aliens (1986).mkv")),
+                        os.listdir(self.movies))
+
+    def test_series_saison_folder_with_episode_title(self) -> None:
+        mid = self.db.upsert_media("plex://show/s", "show", "Severance", 2022, None, None, None)
+        self.db.upsert_episode(mid, 1, 2, "Half Loop", "2022-02-18", status="grabbed")
+        entry = "Severance.S01E02.1080p.WEB-DL.x264-GRP.mkv"
+        self.db.add_grab(mid, 1, 2, entry[:-4], entry, "idx", None, 1000)
+        self.make(entry)
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.series_path("Severance", "Saison 01",
+                                                        "Severance - S01E02 - Half Loop.mkv")),
+                        os.listdir(self.series))
+
+    def test_series_without_episode_title_has_no_trailing_dash(self) -> None:
+        self.make("Some.Show.S03E04.720p.HDTV.x264-GRP.mkv")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.series_path("Some Show", "Saison 03", "Some Show - S03E04.mkv")),
+                        os.listdir(self.series_path("Some Show", "Saison 03")))

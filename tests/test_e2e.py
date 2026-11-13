@@ -281,11 +281,14 @@ enabled = false
         imported = [a for a in actions if a["status"] == "imported"]
         self.assertGreaterEqual(len(imported), 5, actions)
 
-        m = os.path.join(self.movies, "Night of the Living Dead (1968)", "Night of the Living Dead (1968)")
+        # new layout: video/Films/Titre (Année).mkv (no sub-folder without a collection)
+        m = os.path.join(self.movies, "Night of the Living Dead (1968)")
         self.assertTrue(os.path.isfile(m + ".mkv"), os.listdir(self.movies) if os.path.isdir(self.movies) else None)
-        self.assertTrue(any(f.endswith(".srt") for f in os.listdir(os.path.dirname(m))))
-        for s, e in ((1, 1), (1, 2), (1, 3), (2, 1)):
-            p = os.path.join(self.series, "Test Show", "Season %02d" % s, "Test Show - S%02dE%02d.mkv" % (s, e))
+        self.assertTrue(os.path.isfile(m + ".srt"))
+        # video/TvShows/Série/Saison 01/Série - S01E02 - Titre épisode.mkv (titles from Plex)
+        titles = {(1, 1): "Episode 1", (1, 2): "Episode 2", (1, 3): "Episode 3", (2, 1): "Return"}
+        for (s, e), t in titles.items():
+            p = os.path.join(self.series, "Test Show", "Saison %02d" % s, "Test Show - S%02dE%02d - %s.mkv" % (s, e, t))
             self.assertTrue(os.path.isfile(p), p)
         # sources cleaned, tasks removed from Download Station
         self.assertEqual(sorted(os.listdir(self.dl)), [])

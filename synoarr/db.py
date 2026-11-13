@@ -166,6 +166,7 @@ class Database:
             except sqlite3.DatabaseError:  # pragma: no cover - some FS do not support WAL
                 pass
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
 
     # ----------------------------------------------------------- primitives
@@ -264,6 +265,40 @@ class Database:
         if on_watchlist_only:
             sql += " AND on_watchlist = 1"
         return self.query(sql + " ORDER BY added_at DESC", params)
+
+    # columns added after 1.0 (ALTER TABLE keeps existing databases working)
+    _MEDIA_EXTRA_COLUMNS = (
+        ("collection", "TEXT"),        # movie collection name (TMDb), e.g. "The Matrix Collection"
+        ("genres", "TEXT"),            # comma separated genres from Plex/TMDb
+        ("is_animation", "INTEGER"),   # 1 = animated (languages_animation applies), NULL = unknown
+        ("language_override", "TEXT"), # manual languages for this item, e.g. "fr" or "en,fr"
+    )
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(media)").fetchall()}
+        for name, sqltype in self._MEDIA_EXTRA_COLUMNS:
+            if name not in cols:
+                self._conn.execute("ALTER TABLE media ADD COLUMN %s %s" % (name, sqltype))
+        self._conn.commit()
+
+    def set_media_details(self, media_id: int, collection: Optional[str] = None,
+                          genres: Optional[List[str]] = None, is_animation: Optional[bool] = None) -> None:
+        """Store optional metadata (only non-None values are written)."""
+        sets, params = [], []  # type: List[str], List[Any]
+        if collection is not None:
+            sets.append("collection = ?")
+            params.append(collection)
+        if genres is not None:
+            sets.append("genres = ?")
+            params.append(",".join(genres))
+        if is_animation is not None:
+            sets.append("is_animation = ?")
+            params.append(1 if is_animation else 0)
+        if sets:
+            self.execute("UPDATE media SET %s WHERE id = ?" % ", ".join(sets), params + [media_id])
+
+    def set_language_override(self, media_id: int, languages: Optional[str]) -> None:
+        self.execute("UPDATE media SET language_override = ? WHERE id = ?", (languages or None, media_id))
 
     def upsert_media(self, plex_key: str, type_: str, title: str, year: Optional[int], imdb: Optional[str],
                      tmdb: Optional[str], tvdb: Optional[str], original_title: Optional[str] = None) -> int:

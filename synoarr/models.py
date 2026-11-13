@@ -41,6 +41,8 @@ class SearchRequest:
     tmdb: Optional[str] = None
     tvdb: Optional[str] = None
     alt_titles: List[str] = field(default_factory=list)
+    # accepted audio languages for this request (empty = [quality] languages)
+    languages: List[str] = field(default_factory=list)
 
     def query_string(self) -> str:
         """Free-text query used by indexers that do not support id search."""
@@ -96,6 +98,7 @@ class WatchItem:
     year: Optional[int] = None
     guids: Dict[str, str] = field(default_factory=dict)  # {"imdb": "tt..", "tmdb": "123", "tvdb": "456"}
     original_title: Optional[str] = None
+    genres: List[str] = field(default_factory=list)  # e.g. ["Animation", "Comedy"]
 
 
 @dataclass

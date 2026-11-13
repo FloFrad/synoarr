@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Tuple, Any, Dict, List, Optional
 
 from .httpclient import HttpClient, HttpError
 from .models import EpisodeInfo
@@ -22,6 +22,9 @@ def _year(date: Any) -> Optional[int]:
         return None
     m = re.match(r"^(\d{4})", str(date))
     return int(m.group(1)) if m else None
+
+
+ANIMATION_GENRE_ID = 16  # TMDb genre id of "Animation" (movies and TV)
 
 
 class TmdbClient:
@@ -127,6 +130,46 @@ class TmdbClient:
                 "original_title": best.get("original_name")}
 
     # ------------------------------------------------------------ episodes
+    @staticmethod
+    def _genres(data: Dict[str, Any]) -> Tuple[List[str], bool]:
+        genres = data.get("genres") or []
+        names = [str(g.get("name")) for g in genres if isinstance(g, dict) and g.get("name")]
+        ids = {g.get("id") for g in genres if isinstance(g, dict)}
+        return names, ANIMATION_GENRE_ID in ids
+
+    def movie_details(self, tmdb_id: str) -> Optional[Dict[str, Any]]:
+        """{"collection": name or None, "genres": [...], "is_animation": bool} or None."""
+        if not self.enabled or not tmdb_id:
+            return None
+        data = self._get("/movie/%s" % tmdb_id)
+        if not data:
+            return None
+        names, anim = self._genres(data)
+        coll = data.get("belongs_to_collection") or {}
+        cname = str(coll.get("name") or "").strip() if isinstance(coll, dict) else ""
+        return {"collection": cname or None, "genres": names, "is_animation": anim}
+
+    def show_details(self, tmdb_id: str) -> Optional[Dict[str, Any]]:
+        """{"genres": [...], "is_animation": bool} or None."""
+        if not self.enabled or not tmdb_id:
+            return None
+        data = self._get("/tv/%s" % tmdb_id)
+        if not data:
+            return None
+        names, anim = self._genres(data)
+        return {"genres": names, "is_animation": anim}
+
+    def find_by_imdb(self, imdb_id: str) -> Optional[Dict[str, str]]:
+        """{"movie": tmdb_id} or {"tv": tmdb_id} for an IMDb id, or None."""
+        if not self.enabled or not imdb_id:
+            return None
+        data = self._get("/find/%s" % imdb_id, {"external_source": "imdb_id"})
+        for key, kind in (("movie_results", "movie"), ("tv_results", "tv")):
+            res = (data or {}).get(key) or []
+            if res and isinstance(res[0], dict) and res[0].get("id"):
+                return {kind: str(res[0]["id"])}
+        return None
+
     def episode_title(self, tmdb_id: str, season: int, episode: int) -> Optional[str]:
         if not self.enabled or not tmdb_id:
             return None

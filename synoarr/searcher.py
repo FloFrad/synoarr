@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
+ANIMATION_GENRES = {"animation", "anime", "animé", "dessin animé", "animación", "animazione"}
 VIDEO_EXT = {"mkv", "mp4", "avi", "m4v", "mov", "wmv", "ts", "m2ts", "mpg", "mpeg", "webm"}
 
 
@@ -131,6 +132,9 @@ class Searcher:
                 item.title, " (%s)" % item.year if item.year else ""))
         media = self.db.get_media(media_id)
         assert media is not None
+        if media.get("genres") is None:  # details never fetched yet (new item or upgraded database)
+            self._fetch_details(media, item)
+            media = self.db.get_media(media_id) or media
         if item.type == "movie":
             if media["status"] == "wanted" and self._movie_in_library(item.title, item.year,
                                                                        self._alt_titles(media)):
@@ -138,6 +142,48 @@ class Searcher:
                 log.info("%s est déjà présent dans %s", item.title, self.cfg.paths.movies_dir)
         else:
             self._sync_episodes(media)
+
+    def _fetch_details(self, media: Dict[str, Any], item: Optional[WatchItem] = None) -> None:
+        """Genres (animation => French) and movie collection, from Plex then TMDb. Never raises."""
+        genres = list(item.genres) if item is not None else []
+        if not genres and self.plex is not None and hasattr(self.plex, "get_details"):
+            try:
+                genres = list(self.plex.get_details(media["plex_key"]).get("genres") or [])
+            except Exception as exc:
+                log.debug("Genres Plex indisponibles pour %s : %s", media["title"], exc)
+        collection = None
+        tmdb_anim = None
+        if self.tmdb is not None and getattr(self.tmdb, "enabled", False):
+            try:
+                tmdb_id = media.get("tmdb")
+                if not tmdb_id and media.get("imdb"):
+                    found = self.tmdb.find_by_imdb(media["imdb"]) or {}
+                    tmdb_id = found.get("movie" if media["type"] == "movie" else "tv")
+                if tmdb_id:
+                    det = (self.tmdb.movie_details(str(tmdb_id)) if media["type"] == "movie"
+                           else self.tmdb.show_details(str(tmdb_id))) or {}
+                    collection = det.get("collection")
+                    tmdb_anim = det.get("is_animation")
+                    if not genres:
+                        genres = list(det.get("genres") or [])
+            except Exception as exc:
+                log.debug("Détails TMDb indisponibles pour %s : %s", media["title"], exc)
+        is_anim = any(g.lower() in ANIMATION_GENRES for g in genres) or bool(tmdb_anim)
+        self.db.set_media_details(media["id"], collection=collection, genres=genres, is_animation=is_anim)
+        if is_anim:
+            log.info("%s : animation → langues %s", media["title"],
+                     ", ".join(self.cfg.quality.languages_animation))
+
+    def languages_for(self, media: Optional[Dict[str, Any]]) -> List[str]:
+        """Accepted audio languages for *media*: manual override > animation > [quality] languages."""
+        if not media:
+            return list(self.cfg.quality.languages)
+        override = (media.get("language_override") or "").strip()
+        if override:
+            return [x.strip().lower() for x in override.replace(";", ",").split(",") if x.strip()]
+        if media.get("is_animation"):
+            return list(self.cfg.quality.languages_animation)
+        return list(self.cfg.quality.languages)
 
     def _sync_episodes(self, media: Dict[str, Any]) -> None:
         episodes: List[EpisodeInfo] = []
@@ -186,29 +232,54 @@ class Searcher:
 
     # ------------------------------------------------------------ library checks
     def _movie_in_library(self, title: str, year: Optional[int], alt_titles: Optional[List[str]] = None) -> bool:
+        """True if movies_dir holds this movie: "Title (Year).mkv", "Title (Year)/..." or
+        "<Collection>/Title (Year).mkv" (one level of collection folders)."""
         root = self.cfg.paths.movies_dir
         if not os.path.isdir(root):
             return False
+        vexts = self._video_exts()
+
+        def matches(name: str) -> bool:
+            p = parse(name)
+            if not titles_match(p.title, title, alt_titles):
+                return False
+            return not (year and p.year and abs(p.year - year) > 1)
+
+        def has_video(folder: str) -> bool:
+            for _dirpath, _dirs, files in os.walk(folder):
+                if any(_ext(f) in vexts for f in files):
+                    return True
+            return False
+
         try:
             names = os.listdir(root)
         except OSError:
             return False
-        vexts = self._video_exts()
         for name in names:
             if name.startswith((".", "@", "#")):
                 continue
-            p = parse(name)
-            if not titles_match(p.title, title, alt_titles):
-                continue
-            if year and p.year and abs(p.year - year) > 1:
-                continue
             path = os.path.join(root, name)
             if os.path.isfile(path):
-                if _ext(name) in vexts:  # a stray "Title.nfo" must not hide the "Title (Year)/" folder
+                # a stray "Title.nfo" must not count
+                if _ext(name) in vexts and matches(name):
                     return True
                 continue
-            for _dirpath, _dirs, files in os.walk(path):
-                if any(_ext(f) in vexts for f in files):
+            if not os.path.isdir(path):
+                continue
+            if matches(name) and has_video(path):
+                return True
+            # collection folder: look one level down
+            try:
+                children = os.listdir(path)
+            except OSError:
+                continue
+            for child in children:
+                cpath = os.path.join(path, child)
+                if child.startswith((".", "@", "#")) or not matches(child):
+                    continue
+                if os.path.isfile(cpath) and _ext(child) in vexts:
+                    return True
+                if os.path.isdir(cpath) and has_video(cpath):
                     return True
         return False
 
@@ -295,7 +366,7 @@ class Searcher:
                       stats: Dict[str, int]) -> None:
         if not self._due(media.get("last_search_at"), force):
             return
-        req = SearchRequest(kind="movie", title=media["title"], year=media.get("year"), imdb=media.get("imdb"),
+        req = SearchRequest(languages=self.languages_for(media), kind="movie", title=media["title"], year=media.get("year"), imdb=media.get("imdb"),
                             tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media))
         self._touch_media(media["id"])
         stats["searched"] += 1
@@ -332,7 +403,7 @@ class Searcher:
                 continue
             # 1) season pack when the whole season has aired and several episodes are missing
             if self.cfg.series.season_packs and season_complete and len(eps) >= 2:
-                req = SearchRequest(kind="season", title=media["title"], year=media.get("year"), season=season,
+                req = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"), season=season,
                                     imdb=media.get("imdb"), tvdb=media.get("tvdb"), tmdb=media.get("tmdb"),
                                     alt_titles=self._alt_titles(media))
                 stats["searched"] += 1
@@ -350,7 +421,7 @@ class Searcher:
                 current = self.db.get_episode(media["id"], season, e["episode"])
                 if current is not None and current["status"] != "wanted":
                     continue  # covered by a multi-episode release grabbed just before
-                req = SearchRequest(kind="episode", title=media["title"], year=media.get("year"), season=season,
+                req = SearchRequest(languages=self.languages_for(media), kind="episode", title=media["title"], year=media.get("year"), season=season,
                                     episode=e["episode"], imdb=media.get("imdb"), tvdb=media.get("tvdb"),
                                     tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media))
                 self._touch_episode(e["id"])
@@ -375,10 +446,10 @@ class Searcher:
             pr = parse(g["release_title"] or "")
             if pr.is_season_pack:
                 grabbed_seasons.update(pr.seasons)  # "S01-S03" pack covers 3 seasons
-        base = SearchRequest(kind="season", title=media["title"], year=media.get("year"),
+        base = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"),
                              alt_titles=self._alt_titles(media))
         stats["searched"] += 1
-        results = self._collect(SearchRequest(kind="season", title=media["title"], season=None,
+        results = self._collect(SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], season=None,
                                               alt_titles=base.alt_titles), indexers)
         seasons = set()
         for r in results:
@@ -388,7 +459,7 @@ class Searcher:
         for season in sorted(seasons):
             if season in grabbed_seasons:
                 continue
-            req = SearchRequest(kind="season", title=media["title"], year=media.get("year"), season=season,
+            req = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"), season=season,
                                 alt_titles=base.alt_titles)
             best = quality.pick_best(results, req, self.cfg.quality, self._is_excluded)
             if best and self.grab(best, media, season, None):

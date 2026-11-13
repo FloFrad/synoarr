@@ -819,6 +819,10 @@ class Organizer:
                 ids["tmdb"] = str(found.get("tmdb") or "")
         if not title:
             return [], [(main, "titre du film introuvable")]
+        collection = self._movie_collection(media, ids["tmdb"])
+        movie_fmt = self.cfg.naming.movie_format
+        if collection and getattr(self.cfg.naming, "movie_collection_format", ""):
+            movie_fmt = self.cfg.naming.movie_collection_format
 
         # several big videos: multi-part movie (CD1/CD2) or a movie + extras (extras are left in place)
         parts = {}  # type: Dict[str, int]
@@ -839,10 +843,11 @@ class Organizer:
         for v in chosen:
             p = parsed[v]
             kw = {"title": title, "year": year if year else "", "show": title, "season": 0, "episode": 0,
-                  "episode_title": "", "ext": _ext(v), "resolution": p.resolution or entry_parsed.resolution or ""}
+                  "episode_title": "", "collection": collection or "", "ext": _ext(v),
+                  "resolution": p.resolution or entry_parsed.resolution or ""}
             kw.update(ids)
             try:
-                stem = self._render(self.cfg.paths.movies_dir, self.cfg.naming.movie_format, kw)
+                stem = self._render(self.cfg.paths.movies_dir, movie_fmt, kw)
             except _PlanError as exc:
                 problems.append((v, str(exc)))
                 continue
@@ -909,7 +914,7 @@ class Organizer:
                 ep_title = self._episode_title(media, ids["tmdb"], season, episodes)
             kw = {"show": show, "title": show, "year": year if year else "", "season": season,
                   "episode": _EpisodeList(episodes) if len(episodes) > 1 else episodes[0],
-                  "episode_title": ep_title, "ext": _ext(v),
+                  "episode_title": ep_title, "collection": "", "ext": _ext(v),
                   "resolution": p.resolution or entry_parsed.resolution or ""}
             kw.update(ids)
             try:
@@ -949,6 +954,21 @@ class Organizer:
             if t and t not in titles:
                 titles.append(str(t))
         return " & ".join(titles)
+
+    def _movie_collection(self, media: Optional[Dict[str, Any]], tmdb_id: str) -> str:
+        """Collection name: stored on the watchlist item, else asked to TMDb (and remembered)."""
+        if media and media.get("collection"):
+            return str(media["collection"])
+        if not tmdb_id:
+            return ""
+        det = self._tmdb_call("movie_details", tmdb_id)
+        name = str((det or {}).get("collection") or "")
+        if name and media and media.get("id"):
+            try:
+                self.db.set_media_details(int(media["id"]), collection=name)
+            except Exception:  # pragma: no cover - cache only
+                pass
+        return name
 
     def _tmdb_call(self, method: str, *args: Any) -> Any:
         if self.tmdb is None or not getattr(self.tmdb, "enabled", False):

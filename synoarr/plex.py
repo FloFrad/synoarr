@@ -88,6 +88,19 @@ def extract_guids(item: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+def extract_genres(item: Dict[str, Any]) -> List[str]:
+    """Genre names of a metadata item: "Genre": [{"tag": "Animation"}, ...] (or plain strings)."""
+    raw = item.get("Genre") or item.get("genres") or []
+    if isinstance(raw, (dict, str)):
+        raw = [raw]
+    out: List[str] = []
+    for g in raw:
+        name = g.get("tag") or g.get("title") or g.get("name") if isinstance(g, dict) else g
+        if name and str(name) not in out:
+            out.append(str(name))
+    return out
+
+
 def _to_int(value: Any) -> Optional[int]:
     if value is None or isinstance(value, bool):
         return None
@@ -298,7 +311,8 @@ class PlexClient:
             year = _to_int(str(item.get("originallyAvailableAt"))[:4])
         orig = item.get("originalTitle") or None
         return WatchItem(rating_key=rk, type=itype, title=str(title), year=year, guids=extract_guids(item),
-                         original_title=str(orig) if orig and orig != title else None)
+                         original_title=str(orig) if orig and orig != title else None,
+                         genres=extract_genres(item))
 
     # ------------------------------------------------------------ metadata
     def get_guids(self, rating_key: str) -> Dict[str, str]:
@@ -310,6 +324,21 @@ class PlexClient:
             if guids:
                 break
         return guids
+
+    def get_details(self, rating_key: str) -> Dict[str, Any]:
+        """{"guids": {...}, "genres": [...]} from the item's metadata page. Raises HttpError."""
+        mc = self._provider_get("/library/metadata/%s" % rating_key, {"includeGuids": 1})
+        guids: Dict[str, str] = {}
+        genres: List[str] = []
+        for item in mc.get("Metadata") or []:
+            for k, v in extract_guids(item).items():
+                guids.setdefault(k, v)
+            for g in extract_genres(item):
+                if g not in genres:
+                    genres.append(g)
+            if guids or genres:
+                break
+        return {"guids": guids, "genres": genres}
 
     def show_episodes(self, rating_key: str) -> List[EpisodeInfo]:
         """Episodes of a show (season 0 / specials excluded), sorted."""

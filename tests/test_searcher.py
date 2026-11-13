@@ -113,6 +113,8 @@ class SearcherTestBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="synoarr-search-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.cfg = Config()
+        self.cfg.quality.languages = ["en", "fr"]
+        self.cfg.quality.prefer_words = []
         self.cfg.paths.movies_dir = os.path.join(self.tmp, "Films")
         self.cfg.paths.series_dir = os.path.join(self.tmp, "Séries")
         os.makedirs(self.cfg.paths.movies_dir)
@@ -404,3 +406,70 @@ class SearchTests(SearcherTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LanguageAndCollectionTests(SearcherTestBase):
+    """English by default, French for animation (genre from Plex or TMDb), collections from TMDb."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.quality.languages = ["en"]
+        self.cfg.quality.languages_animation = ["fr"]
+
+    def test_live_action_movie_gets_english_release(self) -> None:
+        self.movie(title="Heat", year=1995)
+        self.idx.add("Heat.1995.TRUEFRENCH.1080p.BluRay.x264-FR", seeders=500)
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP", seeders=5)
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["is_animation"], 0)
+        self.searcher.run_once()
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()], ["Heat.1995.1080p.BluRay.x264-GRP"])
+
+    def test_animated_movie_gets_french_release(self) -> None:
+        item = self.movie(title="Coco", year=2017)
+        item.genres = ["Animation", "Family"]
+        self.idx.add("Coco.2017.1080p.BluRay.x264-GRP", seeders=500)
+        self.idx.add("Coco.2017.TRUEFRENCH.1080p.BluRay.x264-FR", seeders=5)
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["is_animation"], 1)
+        self.searcher.run_once()
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
+                         ["Coco.2017.TRUEFRENCH.1080p.BluRay.x264-FR"])
+
+    def test_genres_and_collection_from_plex_details_and_tmdb(self) -> None:
+        class Plex(FakePlex):
+            def get_details(self, key: str) -> Dict[str, Any]:
+                return {"guids": {}, "genres": ["Animation"]}
+
+        class Tmdb:
+            enabled = True
+
+            def movie_details(self, tmdb_id: str) -> Dict[str, Any]:
+                return {"collection": "Toy Story Collection", "genres": ["Animation"], "is_animation": True}
+
+            def find_by_imdb(self, imdb: str) -> Dict[str, str]:
+                return {"movie": "863"}
+
+        self.searcher.plex = Plex()
+        self.searcher.tmdb = Tmdb()
+        item = WatchItem(rating_key="m9", type="movie", title="Toy Story 2", year=1999, guids={"imdb": "tt0120363"})
+        self.searcher.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        m = self.media("m9")
+        self.assertEqual(m["collection"], "Toy Story Collection")
+        self.assertEqual(m["is_animation"], 1)
+        self.assertEqual(self.searcher.languages_for(m), ["fr"])
+
+    def test_language_override(self) -> None:
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        self.db.set_language_override(self.media("m1")["id"], "fr, en")
+        self.assertEqual(self.searcher.languages_for(self.media("m1")), ["fr", "en"])
+
+    def test_movie_in_collection_folder_or_flat_is_detected(self) -> None:
+        self.touch("Films/Alien Collection/Aliens (1986).mkv")
+        self.touch("Films/Heat (1995).mkv")
+        self.touch("Films/Heat.nfo")
+        self.assertTrue(self.searcher._movie_in_library("Aliens", 1986))
+        self.assertTrue(self.searcher._movie_in_library("Heat", 1995))
+        self.assertFalse(self.searcher._movie_in_library("Alien", 1979))

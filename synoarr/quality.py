@@ -48,7 +48,8 @@ _SOURCE_LABELS = {
 # Language codes each detected tag satisfies.
 _LANG_SATISFIES = {
     "multi": ("multi", "fr", "en"),
-    "vostfr": ("vostfr", "en"),  # original version (usually English) with French subtitles
+    # original version with (often burned-in) French subtitles: only when "vostfr" is explicitly wanted
+    "vostfr": ("vostfr",),
 }
 
 
@@ -243,7 +244,7 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig) -> Tu
     # unknown resolution: accepted, no resolution points (low score)
 
     # --- language
-    lang_points, reason = _language_points(p.languages, cfg.languages)
+    lang_points, reason = _language_points(p.languages, request.languages or cfg.languages)
     if lang_points is None:
         return None, reason
     score += lang_points

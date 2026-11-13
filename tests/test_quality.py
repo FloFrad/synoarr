@@ -23,7 +23,7 @@ SEASON = SearchRequest(kind="season", title="The Last of Us", season=1)
 
 class EvaluateTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = QualityConfig()  # 1080p, 720p ; en, fr
+        self.cfg = QualityConfig(languages=["en", "fr"], prefer_words=[])  # 1080p, 720p ; en, fr
 
     def score(self, title, request=MOVIE, **kw):
         return evaluate(rel(title, **kw), request, self.cfg)
@@ -47,9 +47,30 @@ class EvaluateTests(unittest.TestCase):
         self.assertAccepted("Dune.2021.MULTI.1080p.BluRay.x264-GRP")
         self.assertAccepted("Dune.2021.TRUEFRENCH.1080p.BluRay.x264-GRP")
         self.assertAccepted("Dune.2021.FRENCH.1080p.WEB-DL.x264-GRP")
+        # VOSTFR = burned-in French subtitles: only when "vostfr" is explicitly wanted
+        self.assertRejected("Dune.2021.VOSTFR.1080p.WEB.x264-GRP", contains="langue")
+        self.cfg.languages = ["en", "vostfr"]
         self.assertAccepted("Dune.2021.VOSTFR.1080p.WEB.x264-GRP")
+        self.cfg.languages = ["en", "fr"]
         self.assertRejected("Dune.2021.iTALiAN.1080p.BluRay.x264-GRP", contains="langue")
         self.assertRejected("Dune.2021.German.1080p.BluRay.x264-GRP", contains="langue")
+
+    def test_english_default_and_animation_override(self):
+        cfg = QualityConfig()  # new defaults: en ; animation fr
+        self.assertEqual(cfg.languages, ["en"])
+        movie = SearchRequest(kind="movie", title="Dune", year=2021)
+        self.assertIsNotNone(evaluate(rel("Dune.2021.1080p.BluRay.x264-GRP"), movie, cfg)[0])
+        self.assertIsNotNone(evaluate(rel("Dune.2021.MULTi.1080p.BluRay.x264-GRP"), movie, cfg)[0])
+        self.assertIsNone(evaluate(rel("Dune.2021.TRUEFRENCH.1080p.BluRay.x264-GRP"), movie, cfg)[0])
+        self.assertIsNone(evaluate(rel("Dune.2021.VOSTFR.1080p.WEB.x264-GRP"), movie, cfg)[0])
+        # English subtitles preferred
+        a = evaluate(rel("Dune.2021.1080p.WEB-DL.MultiSubs.x264-GRP"), movie, cfg)[0]
+        b = evaluate(rel("Dune.2021.1080p.WEB-DL.x264-GRP"), movie, cfg)[0]
+        self.assertGreater(a, b)
+        cartoon = SearchRequest(kind="movie", title="Coco", year=2017, languages=list(cfg.languages_animation))
+        self.assertIsNone(evaluate(rel("Coco.2017.1080p.BluRay.x264-GRP"), cartoon, cfg)[0])
+        self.assertIsNotNone(evaluate(rel("Coco.2017.TRUEFRENCH.1080p.BluRay.x264-GRP"), cartoon, cfg)[0])
+        self.assertIsNotNone(evaluate(rel("Coco.2017.MULTi.VFF.1080p.BluRay.x264-GRP"), cartoon, cfg)[0])
 
     def test_language_only_french(self):
         self.cfg.languages = ["fr"]
@@ -209,7 +230,7 @@ class EvaluateTests(unittest.TestCase):
 
 class PickBestTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = QualityConfig()
+        self.cfg = QualityConfig(languages=["en", "fr"], prefer_words=[])
 
     def test_pick_best(self):
         releases = [

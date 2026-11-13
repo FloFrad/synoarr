@@ -52,8 +52,8 @@ class DownloadStationConfig:
 @dataclass
 class PathsConfig:
     download_dir: str = "/volume1/Download"
-    movies_dir: str = "/volume1/Vidéos/Films"
-    series_dir: str = "/volume1/Vidéos/Séries"
+    movies_dir: str = "/volume1/video/Films"
+    series_dir: str = "/volume1/video/TvShows"
     action: str = "move"  # move | copy | hardlink
     min_age_minutes: float = 5.0
     remove_task_after_import: bool = True
@@ -63,8 +63,10 @@ class PathsConfig:
 
 @dataclass
 class NamingConfig:
-    movie_format: str = "{title} ({year})/{title} ({year})"
-    series_format: str = "{show}/Season {season:02d}/{show} - S{season:02d}E{episode:02d}"
+    movie_format: str = "{title} ({year})"
+    # used instead of movie_format when the movie belongs to a collection (TMDb key needed)
+    movie_collection_format: str = "{collection}/{title} ({year})"
+    series_format: str = "{show}/Saison {season:02d}/{show} - S{season:02d}E{episode:02d} - {episode_title}"
     subtitle_extensions: List[str] = field(default_factory=lambda: ["srt", "ass", "ssa", "sub", "idx", "vtt"])
     video_extensions: List[str] = field(
         default_factory=lambda: ["mkv", "mp4", "avi", "m4v", "mov", "wmv", "ts", "m2ts", "mpg", "mpeg", "webm", "ogv"]
@@ -75,7 +77,9 @@ class NamingConfig:
 class QualityConfig:
     resolutions: List[str] = field(default_factory=lambda: ["1080p", "720p"])
     allow_other_resolutions: bool = False
-    languages: List[str] = field(default_factory=lambda: ["en", "fr"])
+    languages: List[str] = field(default_factory=lambda: ["en"])
+    # languages for animated movies/shows (genre "Animation" on Plex or TMDb)
+    languages_animation: List[str] = field(default_factory=lambda: ["fr"])
     min_seeders: int = 1
     min_size_mb: float = 100.0
     max_size_gb_movie: float = 25.0
@@ -84,7 +88,7 @@ class QualityConfig:
     reject_words: List[str] = field(
         default_factory=lambda: ["cam", "camrip", "hdcam", "ts", "telesync", "hdts", "tc", "telecine", "screener", "scr", "workprint"]
     )
-    prefer_words: List[str] = field(default_factory=list)
+    prefer_words: List[str] = field(default_factory=lambda: ["multisubs", "multi-subs", "subs"])
 
 
 @dataclass
@@ -96,7 +100,7 @@ class SeriesConfig:
 @dataclass
 class TmdbConfig:
     api_key: str = ""
-    language: str = "fr-FR"
+    language: str = "en-US"
 
 
 @dataclass
@@ -138,10 +142,10 @@ class Config:
             problems.append("[paths] action doit valoir move, copy ou hardlink (valeur: %r)" % self.paths.action)
         if self.series.monitor not in ("all", "future", "latest_season"):
             problems.append("[series] monitor doit valoir all, future ou latest_season (valeur: %r)" % self.series.monitor)
-        for fmt_name in ("movie_format", "series_format"):
+        for fmt_name in ("movie_format", "movie_collection_format", "series_format"):
             fmt = getattr(self.naming, fmt_name)
             try:
-                fmt.format(title="T", year=2000, show="S", season=1, episode=2, episode_title="E", ext="mkv",
+                fmt.format(title="T", year=2000, show="S", collection="C", season=1, episode=2, episode_title="E", ext="mkv",
                            resolution="1080p", tmdb="1", imdb="tt1", tvdb="1")
             except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
                 problems.append("[naming] %s invalide: %s" % (fmt_name, exc))
