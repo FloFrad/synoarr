@@ -152,6 +152,20 @@ class DownloadStation:
         self._discovered = False  # True when SYNO.API.Info answered
         self._lock = threading.RLock()
 
+    def quick_client(self, timeout: float = 6.0) -> "DownloadStation":
+        """Copie (mêmes adresse et identifiants, session et API déjà découvertes reprises) avec un délai
+        court et sans nouvelle tentative : pour les lectures fréquentes (progression) qui ne doivent jamais
+        bloquer longtemps quand DSM accepte la connexion mais ne répond pas."""
+        http = HttpClient(timeout=timeout, retries=0, verify_ssl=getattr(self.http, "verify_ssl", True),
+                          use_proxy=getattr(self.http, "use_proxy", True))
+        other = DownloadStation(self.url, self.username, self.password, "", http)
+        other.destination = self.destination
+        with self._lock:
+            other._sid = self._sid
+            other._apis = dict(self._apis) if self._apis is not None else None
+            other._discovered = self._discovered
+        return other
+
     # ================================================================ low level
     def _raw(self, path: str, params: Mapping[str, Any], method: str = "GET",
              data: Optional[Mapping[str, Any]] = None,

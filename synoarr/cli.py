@@ -427,6 +427,43 @@ def cmd_indexer(args: argparse.Namespace) -> int:
                     _out("      %s : %s" % (label, n))
             for n in res["skipped"]:
                 _out(WARN + "ignoré : " + n)
+            for n in res.get("disabled") or []:
+                _out(WARN + "désactivé (absent ou désactivé dans Prowlarr) : " + n)
+            _out("      Synchronisation automatique activée (toutes les %s h)." % app.cfg.prowlarr.sync_interval_hours)
+        elif action == "prowlarr-sync":
+            if not mgr.prowlarr_settings(app.cfg)["configured"]:
+                _out(KO + "Prowlarr n'est pas configuré : lancez d'abord indexer import-prowlarr")
+                return 1
+            res = mgr.sync_prowlarr(app.cfg) or {}
+            _out((KO if res.get("ok") is False else OK) + str(res.get("message")))
+            return 1 if res.get("ok") is False else 0
+        elif action == "import-jackett":
+            if not args.target:
+                _out(KO + "Usage : indexer import-jackett http://127.0.0.1:9117 --api-key CLE")
+                return 2
+            res = mgr.import_jackett(args.target, args.api_key or "")
+            _out(OK + res["message"])
+            for label, names in (("ajouté", res["added"]), ("mis à jour", res["updated"])):
+                for n in names:
+                    _out("      %s : %s" % (label, n))
+            for n in res["skipped"]:
+                _out(WARN + "ignoré : " + n)
+            for n in res.get("disabled") or []:
+                _out(WARN + "désactivé (absent de Jackett) : " + n)
+            _out("      Synchronisation automatique activée (toutes les %s h)." % app.cfg.prowlarr.sync_interval_hours)
+        elif action == "jackett-sync":
+            if not mgr.jackett_settings(app.cfg)["configured"]:
+                _out(KO + "Jackett n'est pas configuré : lancez d'abord indexer import-jackett")
+                return 1
+            res = mgr.sync_jackett(app.cfg) or {}
+            _out((KO if res.get("ok") is False else OK) + str(res.get("message")))
+            return 1 if res.get("ok") is False else 0
+        elif action == "jackett-forget":
+            mgr.forget_jackett()
+            _out(OK + "Synchronisation automatique avec Jackett arrêtée (indexers déjà importés gardés)")
+        elif action == "prowlarr-forget":
+            mgr.forget_prowlarr()
+            _out(OK + "Synchronisation automatique avec Prowlarr arrêtée (indexers déjà importés gardés)")
         elif action == "priority":
             if not args.target or args.url is None:
                 _out(KO + "Usage : indexer priority <id|nom> <1-50>  (1 = le plus prioritaire)")
@@ -531,7 +568,8 @@ def _watchlist_edit(args: argparse.Namespace, action: str) -> int:
             row = app.add_to_watchlist(results[pick - 1], add_to_plex=not args.local)
         local = str(row["plex_key"]).startswith("local:")
         what = "entrée locale" if local else "Watchlist Plex"
-        verb = "déjà présent, réactivé" if row.get("already_present") else "ajouté"
+        verb = ("ajouté" if not row.get("already_present") else
+                "déjà connu, réactivé" if row.get("reactivated") else "déjà dans la liste")
         _out(OK + "« %s »%s %s (%s, id %d)" % (row["title"], " (%s)" % row["year"] if row.get("year") else "",
                                               verb, what, row["id"]))
         if row.get("warning"):
@@ -698,7 +736,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pi = sub.add_parser("indexer", parents=[common], help="gérer les indexers")
     pi.add_argument("action", choices=["list", "catalog", "add", "add-url", "test", "enable", "disable", "remove",
-                                       "priority", "import-prowlarr"])
+                                       "priority", "import-prowlarr", "prowlarr-sync", "prowlarr-forget", "import-jackett", "jackett-sync", "jackett-forget"])
     pi.add_argument("target", nargs="?", help="id du catalogue, nom ou numéro de l'indexer (import-prowlarr : "
                                               "adresse de Prowlarr, ex. http://127.0.0.1:9696)")
     pi.add_argument("url", nargs="?", help="URL (pour add-url) ou priorité 1-50 (pour priority)")

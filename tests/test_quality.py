@@ -338,6 +338,25 @@ class IndexerPriorityTests(unittest.TestCase):
         self.assertGreater((q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP, q.SEEDERS_MAX + 200)
         self.assertLess((q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP, q.SOURCE_WEIGHT)
         self.assertLess((q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP, q.PREFER_WORD_BONUS)
+        # whole priority range + best seeders/size difference stays below ONE source step / prefer word
+        top = (q.PRIORITY_MAX - q.PRIORITY_MIN) * q.PRIORITY_STEP + q.SEEDERS_MAX + 200
+        self.assertLess(top, q.SOURCE_WEIGHT)
+        self.assertLess(top, q.PREFER_WORD_BONUS)
+        # source range still below the smallest language step for up to 5 wanted languages
+        self.assertLess(6 * q.SOURCE_WEIGHT, q.LANGUAGE_MAX // 5)
+
+    def test_priority_plus_seeders_never_beats_a_source_step(self):
+        a = self.on("Favori", "Dune.2021.1080p.WEB-DL.x264-AAA", seeders=5000)
+        b = self.on("Dernier", "Dune.2021.1080p.BluRay.x264-BBB", seeders=1)
+        sa = evaluate(a, MOVIE, self.cfg, self.prios)[0]
+        sb = evaluate(b, MOVIE, self.cfg, self.prios)[0]
+        self.assertGreater(sb, sa)
+        self.assertEqual(pick_best([a, b], MOVIE, self.cfg, priorities=self.prios).title, b.title)
+        # worst case for the source step: no seeder count accepted (min_seeders 0) and unknown size for B
+        cfg0 = QualityConfig(languages=["en", "fr"], prefer_words=[], min_seeders=0)
+        b0 = self.on("Dernier", "Dune.2021.1080p.BluRay.x264-BBB", seeders=0, size=0)
+        a9 = self.on("Favori", "Dune.2021.1080p.WEB-DL.x264-AAA", seeders=100000)
+        self.assertGreater(evaluate(b0, MOVIE, cfg0, self.prios)[0], evaluate(a9, MOVIE, cfg0, self.prios)[0])
 
     def test_equal_quality_prefers_the_priority_indexer_over_seeders(self):
         a = self.on("Dernier", "Dune.2021.1080p.BluRay.x264-AAA", seeders=5000)

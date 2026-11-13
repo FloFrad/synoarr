@@ -104,6 +104,23 @@ class TmdbConfig:
 
 
 @dataclass
+class ProwlarrConfig:
+    # Optional: Prowlarr instance whose indexers are kept in sync automatically. Empty = use the address/key
+    # remembered by the last "Importer depuis Prowlarr" (web UI / CLI), if any.
+    url: str = ""
+    api_key: str = ""
+    sync_interval_hours: float = 6.0  # 0 = no automatic sync
+
+
+@dataclass
+class JackettConfig:
+    # Optional, same idea as [prowlarr] (use one OR the other). Empty = address/key remembered by the last
+    # "Importer depuis Jackett". The sync frequency is [prowlarr] sync_interval_hours.
+    url: str = ""
+    api_key: str = ""
+
+
+@dataclass
 class WebConfig:
     enabled: bool = True
     host: str = "0.0.0.0"
@@ -124,6 +141,8 @@ class Config:
     series: SeriesConfig = field(default_factory=SeriesConfig)
     tmdb: TmdbConfig = field(default_factory=TmdbConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    prowlarr: ProwlarrConfig = field(default_factory=ProwlarrConfig)
+    jackett: JackettConfig = field(default_factory=JackettConfig)
     warnings: List[str] = field(default_factory=list)  # non fatal problems found while loading (French)
 
     @property
@@ -176,6 +195,8 @@ _SECTIONS = {
     "series": SeriesConfig,
     "tmdb": TmdbConfig,
     "web": WebConfig,
+    "prowlarr": ProwlarrConfig,
+    "jackett": JackettConfig,
 }
 
 _TRUE = ("1", "true", "yes", "on", "oui", "vrai")

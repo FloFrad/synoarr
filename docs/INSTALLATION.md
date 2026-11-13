@@ -145,14 +145,37 @@ Ajouter n'importe quel indexer par son URL (flux **Torznab** ou **RSS** ; le typ
 sudo python3 synoarr.py indexer add-url "Mon indexer" "https://exemple.org/api" --api-key VOTRE_CLE
 ```
 
-**Vous utilisez déjà Prowlarr sur le NAS ?** Importez tous ses indexers torrent actifs en une fois (chacun devient
+**Prowlarr ou Jackett : il faut l'un OU l'autre, pas les deux.** Les deux font la même chose (ils
+transforment des sites en flux Torznab). Si les deux étaient synchronisés, chaque site serait interrogé deux fois et
+apparaîtrait en double. Gardez celui que vous avez déjà ; si vous n'en avez aucun, Internet Archive suffit pour
+commencer.
+
+**Vous utilisez Prowlarr sur le NAS ?** Importez tous ses indexers torrent actifs en une fois (chacun devient
 un indexer Torznab « Nom (Prowlarr) », avec sa priorité). La clé API est dans Prowlarr > Settings > General > API Key :
 
 ```bash
 sudo python3 synoarr.py indexer import-prowlarr http://127.0.0.1:9696 --api-key CLE_PROWLARR
 ```
 
-Relancer l'import met à jour les indexers déjà importés (clé, priorité).
+Après ce premier import, **synoarr suit Prowlarr automatiquement** (toutes les 6 heures, et à chaque démarrage) :
+un indexer ajouté dans Prowlarr apparaît dans synoarr, un indexer supprimé ou désactivé dans Prowlarr est désactivé,
+et les priorités suivent celles de Prowlarr. Vous gérez votre annuaire d'indexers dans Prowlarr uniquement ; vous
+n'avez jamais à utiliser ses autres fonctions. Fréquence : `[prowlarr] sync_interval_hours` (0 = jamais).
+Synchroniser tout de suite : bouton « Synchroniser maintenant » (onglet Indexers) ou
+`sudo python3 synoarr.py indexer prowlarr-sync`. Arrêter : bouton « Arrêter la synchro » ou
+`indexer prowlarr-forget`.
+
+**Vous utilisez Jackett (à la place de Prowlarr) ?** Même principe : chaque indexer configuré dans Jackett devient un
+indexer Torznab « Nom (Jackett) », puis synoarr suit Jackett automatiquement (ajouts, suppressions). Jackett n'a pas
+de priorités : elles valent 25 par défaut et se règlent dans synoarr (elles sont conservées à chaque synchro). La clé
+API est en haut à droite de la page Jackett (« API Key ») :
+
+```bash
+sudo python3 synoarr.py indexer import-jackett http://127.0.0.1:9117 --api-key CLE_JACKETT
+```
+
+Depuis l'interface web : onglet Indexers → « Importer depuis Jackett ». Resynchroniser : `indexer jackett-sync` ;
+arrêter : `indexer jackett-forget`.
 
 **Priorité des indexers** : chaque indexer a une priorité de 1 (le plus prioritaire) à 50 (25 par défaut). Les
 indexers sont interrogés dans cet ordre et, à qualité égale (même résolution, langue et source), la release de
@@ -216,7 +239,7 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 |---|---|
 | Tableau de bord | état général, téléchargements en cours (progression, vitesses, sources), derniers envois |
 | Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » |
-| Indexers | ajouter (catalogue, URL ou import Prowlarr), priorité (1 = le plus prioritaire), tester, activer, supprimer |
+| Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), priorité (1 = le plus prioritaire), tester, activer, supprimer |
 | Historique | envois vers Download Station et événements |
 | Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer |
 | Journal | dernières lignes du journal, filtres, téléchargement |
@@ -317,6 +340,8 @@ supprimés.
 | `sudo python3 synoarr.py indexer list` | liste les indexers (avec leur priorité) |
 | `sudo python3 synoarr.py indexer priority <id\|nom> <1-50>` | change la priorité d'un indexer (1 = le plus prioritaire) |
 | `sudo python3 synoarr.py indexer import-prowlarr URL --api-key CLE` | importe les indexers torrent de Prowlarr |
+| `sudo python3 synoarr.py indexer prowlarr-sync` | resynchronise les indexers avec Prowlarr maintenant |
+| `sudo python3 synoarr.py indexer import-jackett URL --api-key CLE` | importe les indexers de Jackett (à la place de Prowlarr) |
 
 Journal : `data/synoarr.log` (consultable dans File Station).
 

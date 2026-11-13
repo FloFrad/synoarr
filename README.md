@@ -2,7 +2,8 @@
 
 Remplaçant léger de **Prowlarr + Radarr + Sonarr + Filebot**, pensé pour un NAS **Synology** :
 
-- **Indexers** torrent légaux : catalogue intégré (Internet Archive) ou n'importe quelle URL **Torznab** / **RSS**.
+- **Indexers** torrent légaux : catalogue intégré (Internet Archive), n'importe quelle URL **Torznab** / **RSS**,
+  ou import et synchronisation automatique depuis **Prowlarr** ou **Jackett** (l'un ou l'autre).
 - **Watchlist Plex** : chaque film ou série ajouté est recherché automatiquement (épisodes manquants, saisons
   complètes, nouveaux épisodes).
 - **Download Station** : le meilleur torrent (1080p → 720p, en anglais, ou en français pour l'animation) est envoyé directement.

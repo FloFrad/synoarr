@@ -215,6 +215,8 @@ class Searcher:
         if media.get("genres") is None:
             self._fetch_details(media)
             media = self.db.get_media(media["id"]) or media
+            if media.get("hidden"):
+                return  # masked as a duplicate of another entry (same TMDb id)
         if media["type"] == "movie":
             if media["status"] == "wanted" and self._movie_in_library(media["title"], media.get("year"),
                                                                        self._alt_titles(media)):
@@ -248,7 +250,31 @@ class Searcher:
         if found and found.get("tmdb"):
             self.db.execute("UPDATE media SET tmdb = ? WHERE id = ? AND tmdb IS NULL", (found["tmdb"], media["id"]))
             media = self.db.get_media(media["id"]) or media
+            media = self._hide_if_duplicate(media)
         return media
+
+    def _hide_if_duplicate(self, media: Dict[str, Any]) -> Dict[str, Any]:
+        """Local entry whose freshly found TMDb id is already used by another visible row of the same type:
+        one of them is masked + ignored (no second download). A Plex row always wins over the local entry;
+        between two local entries the older one is kept."""
+        if not media.get("tmdb") or not _is_local_key(media.get("plex_key")):
+            return media
+        other = self.db.query_one("SELECT * FROM media WHERE type = ? AND tmdb = ? AND id != ? "
+                                  "AND COALESCE(hidden, 0) = 0 ORDER BY id LIMIT 1",
+                                  (media["type"], str(media["tmdb"]), media["id"]))
+        if other is None:
+            return media
+        loser = media
+        if _is_local_key(other.get("plex_key")) and other["id"] > media["id"]:
+            loser = other
+        self.db.set_media_hidden(loser["id"], True)
+        self.db.set_media_status(loser["id"], "ignored")
+        kept = other if loser is media else media
+        log.warning("« %s » (n° %d) est un doublon de « %s » (n° %d, même identifiant TMDb %s) : masqué et ignoré",
+                    loser["title"], loser["id"], kept["title"], kept["id"], media["tmdb"])
+        self.db.add_event("watchlist", "Doublon masqué : %s (même œuvre que « %s »)" % (loser["title"], kept["title"]),
+                          "WARNING")
+        return self.db.get_media(media["id"]) or media
     # ---- end watchlist add/delete
 
     def languages_for(self, media: Optional[Dict[str, Any]]) -> List[str]:

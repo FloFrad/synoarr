@@ -386,6 +386,63 @@ class WatchlistEditTest(_AppTestBase):
         self.assertEqual(self.app.searcher.sync_watchlist(), 0)
         self.assertEqual(len(self.app.db.list_episodes(row["id"])), 2)
 
+    # ------------------------------------------------------------------ no duplicate on manual add
+    def test_manual_add_matches_existing_row_by_title_and_year(self) -> None:
+        self.world.watchlist = ["m1"]
+        self.app.searcher.sync_watchlist()
+        movie = self.app.db.get_media_by_key("m1")  # The Matrix (1999), with ids
+        for year in (1999, 2000, None):
+            with self.subTest(year=year):
+                row = self.app.add_manual("movie", "the matrix", year)
+                self.assertEqual(row["id"], movie["id"])
+                self.assertTrue(row["already_present"])
+                self.assertFalse(row["reactivated"])
+        self.assertEqual(len(self.media_rows()), 1)
+        # another work: year too far, a different id of the same kind, or another type
+        far = self.app.add_manual("movie", "The Matrix", 2010)
+        other_id = self.app.add_manual("movie", "The Matrix", 1999, imdb="tt9999999")
+        show = self.app.add_manual("show", "The Matrix", 1999)
+        self.assertEqual(len({movie["id"], far["id"], other_id["id"], show["id"]}), 4)
+        self.assertFalse(any(r["already_present"] for r in (far, other_id, show)))
+
+    def test_manual_add_matches_original_title_and_movie_year_rules(self) -> None:
+        mid = self.app.db.upsert_media("p9", "movie", "Le Fabuleux Destin d'Amélie Poulain", 2001, None, None, None,
+                                       "Amélie")
+        row = self.app.add_manual("movie", "Amelie", 2001)
+        self.assertEqual((row["id"], row["already_present"]), (mid, True))
+        # movie: an existing row without year is not matched when the add gives a year...
+        heat = self.app.db.upsert_media("p8", "movie", "Heat", None, None, None, None)
+        self.assertNotEqual(self.app.add_manual("movie", "Heat", 1995)["id"], heat)
+        # ...but an add without year matches a row with one
+        heat95 = self.app.db.get_media_by_key("p8")
+        self.assertEqual(self.app.add_manual("movie", "Heat")["id"], heat95["id"])
+
+    def test_manual_add_reactivates_hidden_show(self) -> None:
+        sid = self.app.db.upsert_media("sx", "show", "Test Show", 2015, None, None, None)
+        self.app.db.set_media_hidden(sid, True)
+        self.app.db.set_media_status(sid, "ignored")
+        row = self.app.add_manual("show", "Test Show")  # no year: shows match on title only
+        self.assertEqual(row["id"], sid)
+        self.assertTrue(row["already_present"])
+        self.assertTrue(row["reactivated"])
+        self.assertEqual((row["hidden"], row["status"]), (None, "monitored"))
+        self.assertEqual(len(self.media_rows()), 1)
+
+    def test_local_entry_resolving_to_an_existing_tmdb_id_is_not_duplicated(self) -> None:
+        sid = self.app.db.upsert_media("s5", "show", "Série locale", 2010, None, "5000", None)  # French Plex title
+        # different title (no title match) but TMDb resolves it to the same show (tmdb 5000)
+        row = self.app.add_manual("show", "Local Show")
+        self.assertEqual(row["id"], sid)
+        self.assertTrue(row["already_present"])
+        self.assertEqual([r["id"] for r in self.media_rows()], [sid])
+        # an older local entry resolving later (sync) to the id of a Plex row: masked + ignored, Plex row kept
+        lid = self.app.db.upsert_media("local:abc", "show", "Local Show", None, None, None, None)
+        self.app.searcher.sync_local_items()
+        dup = self.app.db.get_media(lid)
+        self.assertEqual((dup["tmdb"], dup["hidden"], dup["status"]), ("5000", 1, "ignored"))
+        self.assertIsNone(self.app.db.get_media(sid)["hidden"])
+        self.assertEqual([m["id"] for m in self.app.db.list_media()], [sid])
+
     # ------------------------------------------------------------------ remove
     def test_remove_plex_item_deletes_row_and_keeps_history(self) -> None:
         self.world.watchlist = ["s1"]

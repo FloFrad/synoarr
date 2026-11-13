@@ -971,13 +971,75 @@ class WebDownloadsTest(RealAppWebBase):
             self.req("/api/downloads")
         self.assertEqual(self.list_calls() - before, 1)
 
+    def test_silent_dsm_does_not_block_the_watchlist(self) -> None:
+        """DSM accepts the TCP connection but never answers: /api/media still answers quickly."""
+        import socket
+        from synoarr.downloadstation import DownloadStation
+        from synoarr.httpclient import HttpClient
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(16)
+        held = []  # type: List[socket.socket]
+        stop = threading.Event()
+
+        def accept_forever() -> None:
+            srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _addr = srv.accept()
+                except (socket.timeout, OSError):
+                    continue
+                held.append(conn)  # never read, never answer
+
+        t = threading.Thread(target=accept_forever, daemon=True)
+        t.start()
+
+        def cleanup() -> None:
+            stop.set()
+            t.join(2)
+            for c in held:
+                c.close()
+            srv.close()
+        self.addCleanup(cleanup)
+        movie = self.app.db.upsert_media("m9", "movie", "Heat", 1995, None, None, None)
+        self.app.db.add_grab(movie, None, None, "Heat.1995.1080p", "Heat.1995.1080p", "Fake", None, 10)
+        url = "http://127.0.0.1:%d" % srv.getsockname()[1]
+        self.app.ds = DownloadStation(url, "synoarr", "x", "Download", HttpClient(timeout=60, use_proxy=False))
+        self.app.invalidate_downloads()
+        results = {}  # type: Dict[str, Any]
+
+        def first() -> None:
+            t0 = time.monotonic()
+            results["first"] = self.req("/api/media")
+            results["first_elapsed"] = time.monotonic() - t0
+        th = threading.Thread(target=first)
+        th.start()
+        time.sleep(0.5)
+        t0 = time.monotonic()
+        status, ms, _ = self.req("/api/media")  # refresh in flight: answered at once, progress unknown
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertEqual(status, 200, ms)
+        self.assertEqual([m for m in ms if m["id"] == movie][0]["downloads"][0]["status"], "inconnu")
+        th.join(15)
+        self.assertFalse(th.is_alive())
+        self.assertLess(results["first_elapsed"], 10.0)
+        status, ms, _ = results["first"]
+        self.assertEqual(status, 200, ms)
+        self.assertEqual([m for m in ms if m["id"] == movie][0]["downloads"][0]["status"], "inconnu")
+        dl = self.req("/api/downloads")[1]  # error cached: immediate
+        self.assertFalse(dl["ok"])
+        self.assertIn("injoignable", dl["warning"])
+
     def test_ds_unreachable_gives_inconnu_and_one_warning(self) -> None:
         movie = self.app.db.upsert_media("m9", "movie", "Heat", 1995, None, None, None)
         self.app.db.add_grab(movie, None, None, "Heat.1995.1080p", "Heat.1995.1080p", "Fake", None, 10)
 
-        def boom() -> List[Any]:
-            raise HttpError("connexion refusée", None)
-        self.app.ds.list_tasks = boom  # type: ignore[assignment]
+        # class-level patch: the progress listing uses a dedicated quick DownloadStation client
+        patcher = mock.patch("synoarr.downloadstation.DownloadStation.list_tasks",
+                             side_effect=HttpError("connexion refusée", None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         status, ms, _ = self.req("/api/media")
         self.assertEqual(status, 200, ms)
         d = [m for m in ms if m["id"] == movie][0]["downloads"][0]
@@ -1055,6 +1117,12 @@ class WebDownloadsTest(RealAppWebBase):
         self.assertEqual(status, 200, data)
         self.assertTrue(data["ok"], data)
         self.assertNotIn("supprimée", data["message"])
+        self.assertIn("conservée", data["message"])
+        # old task kept: the old grab stays "sent" (still tracked, imported normally), its task still listed
+        kept = self.app.db.query_one("SELECT * FROM grabs WHERE id = ?", (grabs[(2, 1)]["id"],))
+        self.assertEqual(kept["status"], "sent")
+        d_old = [x for x in self.media("s1")["downloads"] if x["grab_id"] == kept["id"]][0]
+        self.assertEqual(d_old["status"], "downloading")
         new = self.app.db.query_one("SELECT * FROM grabs WHERE id = ?", (data["grab_id"],))
         self.assertEqual((new["season"], new["episode"], new["indexer"], new["release_title"]),
                          (2, 1, "manuel", "Test.Show.S02E01.MAGNET"))
@@ -1099,6 +1167,22 @@ class WebDownloadsTest(RealAppWebBase):
         self.assertIn("Échec", data["message"])
         self.assertEqual(self.app.db.query_one("SELECT status FROM grabs WHERE id = ?", (old["id"],))["status"], "sent")
         self.assertEqual((len(self.world.tasks), self.world.deleted), (n_tasks, []))
+
+    def test_keep_old_task_absent_from_ds_marks_old_grab_failed(self) -> None:
+        self.grab_all()
+        movie = self.app.db.get_media_by_key("m1")
+        old = [g for g in self.app.db.list_grabs() if g["media_id"] == movie["id"]][0]
+        with self.world.lock:
+            for tid in [k for k, t in self.world.tasks.items() if t["title"] == MOVIE]:
+                del self.world.tasks[tid]
+        status, data, _ = self.req("/api/media/%d/replace" % movie["id"], "POST",
+                                   {"grab_id": old["id"], "link": "magnet:?xt=urn:btih:%s&dn=NOTLD.KEEP" % ("cd" * 20),
+                                    "delete_old": False})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"], data)
+        row = self.app.db.query_one("SELECT status, message FROM grabs WHERE id = ?", (old["id"],))
+        self.assertEqual((row["status"], row["message"]), ("failed", "remplacé manuellement"))
+        self.assertEqual(self.world.deleted, [])
 
     def test_dry_run_changes_nothing(self) -> None:
         self.grab_all()
@@ -1363,3 +1447,146 @@ class WebWatchlistEditTest(RealAppWebBase):
         self.assertEqual(status, 200, data)
         self.assertNotIn(local, self.ids())
         self.assertEqual([p for p in self.puts if p[0].endswith("removeFromWatchlist")], [])
+        # manual add of the hidden Plex movie (no id given): same row, reactivated, no duplicate
+        n_rows = len(self.app.db.list_media(include_hidden=True))
+        status, data, _ = self.req("/api/watchlist/manual", "POST", {"type": "movie", "title": "Night of the Living Dead",
+                                                                     "year": 1968, "search_now": False})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["media"]["id"], m1)
+        self.assertTrue(data["already_present"] and data["reactivated"], data)
+        self.assertIn("réactivé", data["message"])
+        self.assertIn(m1, self.ids())
+        self.assertEqual(len(self.app.db.list_media(include_hidden=True)), n_rows)
+        # again: already visible -> "déjà dans la liste"
+        data = self.req("/api/watchlist/manual", "POST", {"type": "movie", "title": "Night of the Living Dead",
+                                                          "year": 1968, "search_now": False})[1]
+        self.assertFalse(data["reactivated"])
+        self.assertIn("déjà dans la liste", data["message"])
+
+
+class ProwlarrAutoSyncTest(RealAppWebBase):
+    """Option 1: Prowlarr stays the directory, synoarr follows it automatically."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.prowlarr = FakeProwlarr()
+        self.psrv = FakeServer(self.prowlarr).__enter__()
+        self.addCleanup(self.psrv.__exit__, None, None, None)
+
+    def test_sync_follows_prowlarr(self) -> None:
+        mgr = self.app.indexer_manager
+        self.assertFalse(self.req("/api/prowlarr")[1]["configured"])
+        self.assertIsNone(mgr.sync_prowlarr(self.app.cfg))  # not configured: no-op
+        status, data, _ = self.req("/api/indexers/import-prowlarr", "POST",
+                                   {"url": self.psrv.url, "api_key": FakeProwlarr.KEY})
+        self.assertEqual(status, 200, data)
+        st = self.req("/api/prowlarr")[1]
+        self.assertTrue(st["configured"])
+        self.assertNotIn(FakeProwlarr.KEY, json.dumps(st))
+        # a new indexer appears in Prowlarr, YTS is removed, 1337x gets a new priority
+        self.prowlarr.indexers = [
+            {"id": 4, "name": "1337x", "protocol": "torrent", "enable": True, "priority": 3},
+            {"id": 7, "name": "Nouveau", "protocol": "torrent", "enable": True, "priority": 20},
+        ]
+        status, data, _ = self.req("/api/prowlarr/sync", "POST", {})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["added"], ["Nouveau (Prowlarr)"])
+        self.assertEqual(data["disabled"], ["YTS (Prowlarr)"])
+        self.assertEqual(self.app.db.get_indexer("YTS (Prowlarr)")["enabled"], 0)
+        self.assertEqual(self.app.db.get_indexer("1337x (Prowlarr)")["priority"], 3)
+        # an indexer disabled by the user stays disabled; YTS comes back and is re-enabled by the sync
+        user_off = self.app.db.get_indexer("Nouveau (Prowlarr)")
+        mgr.set_enabled(user_off["id"], False)
+        self.prowlarr.indexers.append({"id": 1, "name": "YTS", "protocol": "torrent", "enable": True,
+                                       "priority": 10})
+        data = mgr.sync_prowlarr(self.app.cfg)
+        self.assertEqual(data["reenabled"], ["YTS (Prowlarr)"])
+        self.assertEqual(self.app.db.get_indexer("YTS (Prowlarr)")["enabled"], 1)
+        self.assertEqual(self.app.db.get_indexer("Nouveau (Prowlarr)")["enabled"], 0)
+        # Prowlarr down: no exception, error remembered, indexers untouched
+        self.app.indexer_manager.db.set_kv("prowlarr_url", "http://127.0.0.1:1")
+        res = mgr.sync_prowlarr(self.app.cfg)
+        self.assertFalse(res["ok"])
+        self.assertTrue(self.req("/api/prowlarr")[1]["last_error"])
+        self.assertEqual(self.req("/api/prowlarr/sync", "POST", {})[0], 502)
+        # forget
+        self.assertEqual(self.req("/api/prowlarr/forget", "POST", {})[0], 200)
+        self.assertFalse(self.req("/api/prowlarr")[1]["configured"])
+        self.assertEqual(self.req("/api/prowlarr/sync", "POST", {})[0], 400)
+
+    def test_config_section_takes_precedence(self) -> None:
+        self.app.cfg.prowlarr.url = self.psrv.url
+        self.app.cfg.prowlarr.api_key = FakeProwlarr.KEY
+        res = self.app.indexer_manager.sync_prowlarr(self.app.cfg)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(sorted(res["added"]), ["1337x (Prowlarr)", "YTS (Prowlarr)"])
+        self.assertTrue(self.app._start_prowlarr_sync() in (True, False))
+
+
+class FakeJackett:
+    KEY = "JKEY456"
+
+    def __init__(self, xml_list: bool = True) -> None:
+        self.xml_list = xml_list
+        self.indexers = [("yts", "YTS", True), ("1337x", "1337x", True), ("off", "Pas configuré", False)]
+
+    def __call__(self, req: Any) -> Tuple[int, Dict[str, str], Any]:
+        key = req.query.get("apikey")
+        if req.path == "/api/v2.0/indexers/all/results/torznab/api" and req.query.get("t") == "indexers":
+            if key != self.KEY:
+                return 200, {"Content-Type": "application/xml"}, '<error code="100" description="Invalid API Key"/>'
+            if not self.xml_list:
+                return 400, {}, b"unsupported"
+            items = "".join('<indexer id="%s" configured="%s"><title>%s</title><type>public</type></indexer>'
+                            % (i, "true" if c else "false", n) for i, n, c in self.indexers
+                            if c or req.query.get("configured") != "true")
+            return 200, {"Content-Type": "application/xml"}, "<indexers>%s</indexers>" % items
+        if req.path == "/api/v2.0/indexers" and not self.xml_list:
+            return 200, {}, [{"id": i, "name": n, "configured": c} for i, n, c in self.indexers]
+        if req.path.endswith("/results/torznab/api") and req.query.get("t") == "caps":
+            if key != self.KEY:
+                return 401, {}, b"bad key"
+            return 200, {"Content-Type": "application/xml"}, (
+                '<?xml version="1.0"?><caps><server title="Jackett"/><searching><search available="yes"/>'
+                '</searching></caps>')
+        return 404, {}, b"not found"
+
+
+class JackettImportTest(RealAppWebBase):
+    def start(self, jackett: "FakeJackett") -> str:
+        self.jackett = jackett
+        srv = FakeServer(jackett).__enter__()
+        self.addCleanup(srv.__exit__, None, None, None)
+        return srv.url
+
+    def test_import_sync_and_errors(self) -> None:
+        base = self.start(FakeJackett())
+        # a Torznab URL copied from Jackett is accepted as the address
+        status, data, _ = self.req("/api/indexers/import-jackett", "POST",
+                                   {"url": base + "/api/v2.0/indexers/yts/results/torznab/", "api_key": FakeJackett.KEY})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(sorted(data["added"]), ["1337x (Jackett)", "YTS (Jackett)"])
+        yts = self.app.db.get_indexer("YTS (Jackett)")
+        self.assertEqual((yts["type"], yts["url"], yts["priority"]),
+                         ("torznab", base + "/api/v2.0/indexers/yts/results/torznab/", 25))
+        ok, msg = self.app.indexer_manager.test(yts["id"])
+        self.assertTrue(ok, msg)
+        self.assertTrue(self.req("/api/jackett")[1]["configured"])
+        # user priority kept on re-sync; removed indexer disabled
+        self.app.indexer_manager.set_priority(yts["id"], 5)
+        self.jackett.indexers = [("yts", "YTS", True)]
+        status, data, _ = self.req("/api/jackett/sync", "POST", {})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["disabled"], ["1337x (Jackett)"])
+        self.assertEqual(self.app.db.get_indexer("YTS (Jackett)")["priority"], 5)
+        # wrong key
+        status, data, _ = self.req("/api/indexers/import-jackett", "POST", {"url": base, "api_key": "faux"})
+        self.assertEqual(status, 400)
+        self.assertIn("Clé API Jackett refusée", data["error"])
+        self.assertEqual(self.req("/api/jackett/forget", "POST", {})[0], 200)
+        self.assertEqual(self.req("/api/jackett/sync", "POST", {})[0], 400)
+
+    def test_json_fallback(self) -> None:
+        base = self.start(FakeJackett(xml_list=False))
+        res = self.app.indexer_manager.import_jackett(base, FakeJackett.KEY)
+        self.assertEqual(sorted(res["added"]), ["1337x (Jackett)", "YTS (Jackett)"])

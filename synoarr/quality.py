@@ -6,14 +6,15 @@
 Score layout (higher is better, each level dominates the following ones):
     resolution rank   x 1000000  (first entry of cfg.resolutions = best)
     language          0 .. 480000 (order of cfg.languages, MULTI bonus)
-    source            0 .. 60000 (10000 per step: bluray > webdl > webrip > web > hdtv > dvdrip)
+    source            0 .. 66000 (11000 per step: bluray > webdl > webrip > web > hdtv > dvdrip)
     prefer_words      15000 each (capped at 45000)
     indexer priority  0 .. 9800  ((50 - priority) x 200 ; priority 1 = most preferred, 50 = no bonus)
     seeders           0 .. 800   (log scale)
     size              0 .. 200   (reasonable size)
 
 Indexer priority (1..50, see ``evaluate(priorities=...)``): the whole range (9800) is bigger than
-seeders + size together (1000) but smaller than ONE source step (10000), so it never overrides
+seeders + size together (1000), and the whole range PLUS the largest seeders + size difference
+(9800 + 1000 = 10800) is still smaller than ONE source step (11000), so it never overrides
 resolution, language, source or prefer_words; it decides between equivalent releases, and a gap of 5
 priority levels or more (1000 points) always beats a seeders/size difference. Without ``priorities``
 (older callers) no indexer bonus is added. An indexer missing from the mapping counts as priority 25.
@@ -41,11 +42,11 @@ GB = 1024 * MB
 RESOLUTION_WEIGHT = 1000000
 LANGUAGE_MAX = 400000
 MULTI_BONUS = 80000
-SOURCE_WEIGHT = 10000
+SOURCE_WEIGHT = 11000  # > 49 x PRIORITY_STEP + SEEDERS_MAX + 200 (size): priority never beats a source step
 PREFER_WORD_BONUS = 15000
 PREFER_WORD_MAX = 45000
 PRIORITY_MIN, PRIORITY_MAX, PRIORITY_DEFAULT = 1, 50, 25
-PRIORITY_STEP = 200  # (PRIORITY_MAX - priority) * PRIORITY_STEP, max 9800 < SOURCE_WEIGHT
+PRIORITY_STEP = 200  # (PRIORITY_MAX - priority) * PRIORITY_STEP, max 9800 (+ 1000 seeders/size) < SOURCE_WEIGHT
 SEEDERS_MAX = 800
 UNKNOWN_SEEDERS_POINTS = 150  # e.g. Internet Archive webseeds: reliable but unknown count
 

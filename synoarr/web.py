@@ -233,6 +233,13 @@ class WebServer:
             ("POST", r"/api/indexers/(\d+)/enabled", self.api_indexer_enabled),
             ("POST", r"/api/indexers/(\d+)/priority", self.api_indexer_priority),
             ("POST", r"/api/indexers/import-prowlarr", self.api_indexer_import_prowlarr),
+            ("GET", r"/api/prowlarr", self.api_prowlarr_status),
+            ("POST", r"/api/prowlarr/sync", self.api_prowlarr_sync),
+            ("POST", r"/api/prowlarr/forget", self.api_prowlarr_forget),
+            ("POST", r"/api/indexers/import-jackett", self.api_indexer_import_jackett),
+            ("GET", r"/api/jackett", self.api_jackett_status),
+            ("POST", r"/api/jackett/sync", self.api_jackett_sync),
+            ("POST", r"/api/jackett/forget", self.api_jackett_forget),
             ("GET", r"/api/downloads", self.api_downloads),
             ("POST", r"/api/media/(\d+)/sources", self.api_media_sources),
             ("POST", r"/api/media/(\d+)/replace", self.api_media_replace),
@@ -478,6 +485,47 @@ class WebServer:
             raise HttpProblem(501, "Import Prowlarr non disponible")
         return func(url, key or "")
 
+    def api_prowlarr_status(self, query: Dict[str, str], body: Any = None) -> Dict[str, Any]:
+        func = getattr(self.app, "prowlarr_status", None)
+        return func() if func else {"configured": False}
+
+    def api_prowlarr_sync(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        mgr = self.app.indexer_manager
+        if not mgr.prowlarr_settings(self.app.cfg)["configured"]:
+            raise HttpProblem(400, "Prowlarr n'est pas configuré : utilisez d'abord « Importer depuis Prowlarr »")
+        res = mgr.sync_prowlarr(self.app.cfg) or {}
+        if res.get("ok") is False:
+            raise HttpProblem(502, "Synchronisation Prowlarr impossible : %s" % res.get("message"))
+        return res
+
+    def api_prowlarr_forget(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        self.app.indexer_manager.forget_prowlarr()
+        return {"ok": True, "message": "Synchronisation automatique arrêtée (les indexers déjà importés sont gardés)"}
+
+    def api_indexer_import_jackett(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+        url, key = data.get("url"), data.get("api_key")
+        if not isinstance(url, str) or (key is not None and not isinstance(key, str)):
+            raise HttpProblem(400, "L'adresse de Jackett et sa clé API sont obligatoires")
+        return self.app.indexer_manager.import_jackett(url, key or "")
+
+    def api_jackett_status(self, query: Dict[str, str], body: Any = None) -> Dict[str, Any]:
+        func = getattr(self.app, "jackett_status", None)
+        return func() if func else {"configured": False}
+
+    def api_jackett_sync(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        mgr = self.app.indexer_manager
+        if not mgr.jackett_settings(self.app.cfg)["configured"]:
+            raise HttpProblem(400, "Jackett n'est pas configuré : utilisez d'abord « Importer depuis Jackett »")
+        res = mgr.sync_jackett(self.app.cfg) or {}
+        if res.get("ok") is False:
+            raise HttpProblem(502, "Synchronisation Jackett impossible : %s" % res.get("message"))
+        return res
+
+    def api_jackett_forget(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        self.app.indexer_manager.forget_jackett()
+        return {"ok": True, "message": "Synchronisation automatique avec Jackett arrêtée (indexers gardés)"}
+
     def api_media_sources(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         self._media_or_404(media_id)
         data = self._body_dict(body)
@@ -525,7 +573,9 @@ class WebServer:
 
     def _added(self, row: Dict[str, Any], search_now: bool) -> Dict[str, Any]:
         label = "%s%s" % (row.get("title"), " (%s)" % row["year"] if row.get("year") else "")
-        if row.get("already_present"):
+        if row.get("already_present") and row.get("reactivated"):
+            msg = "« %s » réactivé (déjà connu de synoarr)" % label
+        elif row.get("already_present"):
             msg = "« %s » est déjà dans la liste" % label
         elif row.get("plex_added"):
             msg = "« %s » ajouté à la Watchlist Plex" % label
@@ -538,7 +588,8 @@ class WebServer:
             msg += " — recherche lancée"
         media = {k: row.get(k) for k in ("id", "type", "title", "year", "status", "plex_key", "imdb", "tmdb", "tvdb")}
         return {"ok": True, "message": msg, "warning": row.get("warning"), "already_present":
-                bool(row.get("already_present")), "plex_added": row.get("plex_added"), "search_started": started,
+                bool(row.get("already_present")), "reactivated": bool(row.get("reactivated")),
+                "plex_added": row.get("plex_added"), "search_started": started,
                 "media": media}
 
     def api_watchlist_add(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
@@ -742,6 +793,9 @@ def _make_handler(server: WebServer) -> type:
         def _handle(self) -> None:
             try:
                 self._handle_inner()
+            except (BrokenPipeError, ConnectionResetError) as exc:  # le navigateur a abandonné la requête
+                log.debug("web: client parti avant la réponse (%s %s) : %s", self.command,
+                          self.path.split("?")[0], exc)
             except Exception:  # ne jamais faire tomber le serveur
                 log.exception("Erreur interne de l'interface web (%s %s)", self.command, self.path.split("?")[0])
                 try:
@@ -936,13 +990,39 @@ async function prowlarr(){const u=$('#prwu').value.trim(),k=$('#prwk').value.tri
   catch(e){PRW.res=`<div class="msg ko">✖ ${esc(e.message)}</div>`;toast(e.message,true)}
   await refresh()}
 const prioCtl=i=>{const p=Math.max(1,Math.min(50,+i.priority||25));return `<div class="prio"><label for="pr${i.id}">Priorité</label><button class="sec pb" data-pd="${i.id}" data-v="${p-1}"${p<=1?' disabled':''} title="Plus prioritaire" aria-label="Plus prioritaire">−</button><input type="number" id="pr${i.id}" class="pin" min="1" max="50" step="1" value="${p}" data-prio="${i.id}" aria-label="Priorité de ${esc(i.name)} (1 = le plus prioritaire)"><button class="sec pb" data-pd="${i.id}" data-v="${p+1}"${p>=50?' disabled':''} title="Moins prioritaire" aria-label="Moins prioritaire">+</button></div>`};
-V.idx=async()=>{const [ix,cat]=await Promise.all([api('indexers'),api('catalog')]);
+const JKT={url:'http://127.0.0.1:9117',key:'',res:''};
+async function jackett(){const u=$('#jktu').value.trim(),k=$('#jktk').value.trim();JKT.url=u;JKT.key=k;
+  if(!u||!k){toast('Saisissez l\'adresse et la clé API de Jackett',true);return}
+  const b=$('#jktf button');b.disabled=true;b.textContent='Import…';
+  try{const r=await api('indexers/import-jackett','POST',{url:u,api_key:k});JKT.key='';
+    const li=(t,a)=>a&&a.length?`<div class="small"><b>${t}</b><ul>${a.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`:'';
+    JKT.res=`<div class="msg ok">✔ ${esc(r.message)}</div>${li('Ajoutés',r.added)}${li('Mis à jour',r.updated)}${li('Ignorés',r.skipped)}`;toast(r.message)}
+  catch(e){JKT.res=`<div class="msg ko">✖ ${esc(e.message)}</div>`;toast(e.message,true)}
+  await refresh()}
+const jktState=p=>{if(!p||!p.configured)return '<p class="mut small">Synchronisation automatique : inactive. Elle démarre dès le premier import.</p>';
+  return `<div class="msg ok small">Synchronisation automatique avec <b>${esc(p.url)}</b> : ${p.interval_hours>0?'toutes les '+p.interval_hours+' h':'désactivée'}${p.last_sync?' · dernière : '+esc(p.last_sync):''}</div>${p.last_error?`<div class="msg ko small">Dernière erreur : ${esc(p.last_error)}</div>`:''}
+  <div class="row"><button class="sec" data-jkts="1">Synchroniser maintenant</button><button class="danger" data-jktx="1">Arrêter la synchro</button></div>`};
+async function jktSync(){try{const r=await api('jackett/sync','POST',{});toast(r.message||'Synchronisé')}catch(e){toast(e.message,true)}await refresh()}
+async function jktForget(){if(!confirm('Arrêter la synchronisation automatique avec Jackett ? Les indexers déjà importés sont gardés.'))return;
+  try{const r=await api('jackett/forget','POST',{});toast(r.message)}catch(e){toast(e.message,true)}await refresh()}
+const prwState=p=>{if(!p||!p.configured)return '<p class="mut small">Synchronisation automatique : inactive. Elle démarre dès le premier import.</p>';
+  const every=p.interval_hours>0?`toutes les ${p.interval_hours} h`:'désactivée ([prowlarr] sync_interval_hours = 0)';
+  return `<div class="msg ok small">Synchronisation automatique avec <b>${esc(p.url)}</b> : ${every}${p.last_sync?' · dernière : '+esc(p.last_sync):''}${p.running?' · en cours…':''}</div>${p.last_error?`<div class="msg ko small">Dernière erreur : ${esc(p.last_error)}</div>`:''}
+  <div class="row"><button class="sec" data-prws="1">Synchroniser maintenant</button><button class="danger" data-prwx="1">Arrêter la synchro</button></div>
+  <p class="mut small">Un indexer ajouté dans Prowlarr apparaît ici automatiquement ; supprimé ou désactivé dans Prowlarr, il est désactivé ici ; les priorités suivent celles de Prowlarr.</p>`};
+async function prwSync(){try{const r=await api('prowlarr/sync','POST',{});toast(r.message||'Synchronisé')}catch(e){toast(e.message,true)}await refresh()}
+async function prwForget(){if(!confirm('Arrêter la synchronisation automatique avec Prowlarr ? Les indexers déjà importés sont gardés.'))return;
+  try{const r=await api('prowlarr/forget','POST',{});toast(r.message)}catch(e){toast(e.message,true)}await refresh()}
+V.idx=async()=>{const [ix,cat,prw,jkt]=await Promise.all([api('indexers'),api('catalog'),api('prowlarr').catch(()=>null),api('jackett').catch(()=>null)]);
   return `<div class="card"><h3>Indexers configurés</h3>${ix.length?`<p class="mut small">Priorité : 1 = le plus prioritaire, 50 = le moins. Les indexers sont interrogés dans cet ordre et, à qualité égale (résolution, langue, source), la release de l'indexer le plus prioritaire est choisie.</p>`:''}${ix.length?ix.map(i=>`<div class="item it"><div><b>${esc(i.name)}</b> ${badge(i.type)} ${i.enabled?'<span class="b b-done">Actif</span>':'<span class="b b-ignored">Désactivé</span>'}
   <div class="meta mut"><span class="url">${esc(i.url)}</span>${i.api_key?' · clé '+esc(i.api_key):''}${i.categories?' · catégories '+esc(i.categories):''}</div><div class="tres" id="tr${i.id}"></div></div>
   <div class="acts">${prioCtl(i)}<button data-test="${i.id}">Tester</button><button class="sec" data-en="${i.id}" data-v="${i.enabled?0:1}">${i.enabled?'Désactiver':'Activer'}</button><button class="danger" data-del="${i.id}" data-n="${esc(i.name)}">Supprimer</button></div></div>`).join(''):'<p class="mut">Aucun indexer : ajoutez-en un depuis le catalogue ou par URL.</p>'}</div>
-  <div class="card"><h3>Importer depuis Prowlarr</h3><p class="mut small">Ajoute chaque indexer torrent actif de Prowlarr comme indexer Torznab (avec sa priorité). La clé API se trouve dans Prowlarr > Settings > General > API Key.</p>
+  <div class="card"><h3>Importer depuis Prowlarr</h3><p class="mut small">Ajoute chaque indexer torrent actif de Prowlarr comme indexer Torznab (avec sa priorité). La clé API se trouve dans Prowlarr > Settings > General > API Key. <b>Utilisez Prowlarr OU Jackett, pas les deux.</b></p>
   <form id="prwf" class="row" autocomplete="off"><input id="prwu" name="url" type="text" spellcheck="false" value="${esc(PRW.url)}" placeholder="http://127.0.0.1:9696" aria-label="Adresse de Prowlarr">
-  <input id="prwk" name="api_key" type="password" autocomplete="new-password" placeholder="Clé API Prowlarr" aria-label="Clé API Prowlarr" value="${esc(PRW.key)}"><button type="submit">Importer</button></form><div id="prwr">${PRW.res}</div></div>
+  <input id="prwk" name="api_key" type="password" autocomplete="new-password" placeholder="Clé API Prowlarr" aria-label="Clé API Prowlarr" value="${esc(PRW.key)}"><button type="submit">Importer</button></form><div id="prwr">${PRW.res}</div>${prwState(prw)}</div>
+  <div class="card"><h3>Importer depuis Jackett</h3><p class="mut small">Même principe que Prowlarr : chaque indexer configuré dans Jackett devient un indexer Torznab, puis synoarr suit Jackett automatiquement. La clé API est en haut à droite de la page Jackett. <b>Utilisez Prowlarr OU Jackett, pas les deux</b> (sinon chaque site serait interrogé deux fois).</p>
+  <form id="jktf" class="row" autocomplete="off"><input id="jktu" name="url" type="text" spellcheck="false" value="${esc(JKT.url)}" placeholder="http://127.0.0.1:9117" aria-label="Adresse de Jackett">
+  <input id="jktk" name="api_key" type="password" autocomplete="new-password" placeholder="Clé API Jackett" aria-label="Clé API Jackett" value="${esc(JKT.key)}"><button type="submit">Importer</button></form><div id="jktr">${JKT.res}</div>${jktState(jkt)}</div>
   <div class="card"><h3>Catalogue (sources légales)</h3>${cat.map(c=>`<div class="item it"><div><b>${esc(c.name)}</b> ${badge(c.type)}<div class="meta mut">${esc(c.description||'')}</div></div>
   <div class="acts">${c.installed?'<span class="b b-done">Installé</span>':`<button data-cat="${esc(c.id)}">Ajouter</button>`}</div></div>`).join('')||'<p class="mut">Catalogue vide.</p>'}</div>`};
 V.hist=async()=>{const [g,ev]=await Promise.all([api('grabs'),api('events?limit=100')]);
@@ -1086,6 +1166,7 @@ app.addEventListener('change',e=>{const t=e.target,id=t.id;
   else if(id==='ln'||id==='lv'){LG[id==='ln'?'lines':'level']=t.value;saveLG();loadLogs(true)}
   else if(id==='la'){LG.auto=t.checked;saveLG();loadLogs()}});
 app.addEventListener('submit',e=>{if(e.target.id==='prwf'){e.preventDefault();prowlarr();return}
+  if(e.target.id==='jktf'){e.preventDefault();jackett();return}
   if(e.target.id==='sf'){e.preventDefault();const q=$('#sq').value.trim();if(q)startJob({command:'search',query:q})}});
 app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const d=b.dataset;
   if(d.run)act(()=>api('run/'+d.run,'POST'));
@@ -1093,6 +1174,10 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.wadd)openAdd();
   else if(d.wdel)openDel(d);
   else if(d.pd)setPrio(d.pd,d.v);
+  else if(d.prws)prwSync();
+  else if(d.prwx)prwForget();
+  else if(d.jkts)jktSync();
+  else if(d.jktx)jktForget();
   else if(d.cmd)startJob({command:d.cmd,force:d.cmd==='search_all'&&!!($('#force')&&$('#force').checked)});
   else if(d.plex)plexLogin();
   else if(d.restart)restart();

@@ -133,6 +133,7 @@ class HttpClient:
         self.backoff = backoff
         self.verify_ssl = verify_ssl
         self.user_agent = user_agent
+        self.use_proxy = use_proxy
         self.cookies = http.cookiejar.CookieJar()
         handlers: List[Any] = [urllib.request.HTTPCookieProcessor(self.cookies), _NoRedirectToOtherSchemes()]
         if not verify_ssl:

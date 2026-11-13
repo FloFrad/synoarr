@@ -13,9 +13,10 @@ from __future__ import annotations
 #     candidate = un candidat ci-dessus tel quel, ou au minimum {"type", "title"} (+ year, imdb, tmdb, tvdb,
 #     rating_key, original_title). Avec rating_key et add_to_plex : ajout à la Watchlist Plex puis import ;
 #     sinon (ou si Plex échoue) entrée locale (plex_key "local:...", jamais retirée par la synchro).
-#     Déjà présent (même clé Plex ou même imdb/tmdb/tvdb) → ligne existante réactivée (démasquée, "ignored" →
+#     Déjà présent (même clé Plex, même imdb/tmdb/tvdb, ou à défaut même type + même titre (titre original
+#     compris) + année ±1, lignes masquées comprises) → ligne existante réactivée (démasquée, "ignored" →
 #     wanted/monitored). Retour : ligne de la table media + "plex_added": bool|None,
-#     "already_present": bool, "warning": str|None. Appels réseau synchrones (Plex, TMDb : quelques s).
+#     "already_present": bool, "reactivated": bool (ligne masquée/ignorée réactivée), "warning": str|None. Appels réseau synchrones (Plex, TMDb : quelques s).
 #     Ensuite, pour chercher tout de suite : app.search_now(row["id"]).
 # app.add_manual(type_: str, title: str, year=None, imdb=None, tmdb=None) -> dict   (idem, entrée locale)
 # app.remove_from_watchlist(media_id: int, remove_from_plex: bool = True, delete_downloads: bool = False)
@@ -221,9 +222,14 @@ class IndexerManager:
                 path = path[:-len(suffix)]
         return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, "", "")).rstrip("/"), key
 
-    def import_prowlarr(self, base_url: str, api_key: str = "") -> Dict[str, Any]:
+    def import_prowlarr(self, base_url: str, api_key: str = "", remember: bool = True,
+                        prune: bool = True) -> Dict[str, Any]:
         """Ajoute (ou met à jour) un indexer Torznab « <nom> (Prowlarr) » pour chaque indexer torrent actif de
-        Prowlarr (API v1). Lève ValueError (message français : clé refusée, Prowlarr injoignable...)."""
+        Prowlarr (API v1). Lève ValueError (message français : clé refusée, Prowlarr injoignable...).
+
+        remember : mémorise l'adresse et la clé pour la synchronisation automatique.
+        prune    : désactive les indexers importés de Prowlarr qui n'y existent plus ou y sont désactivés
+                   (et réactive ceux que la synchro avait désactivés quand ils reviennent)."""
         from .quality import clamp_priority
         base, key_in_url = self.normalize_prowlarr_url(base_url)
         key = (api_key or "").strip() or key_in_url
@@ -277,14 +283,257 @@ class IndexerManager:
             new_id = self.db.add_indexer(name, "torznab", url, key, "", priority=prio)
             by_url[url.lower()] = self.db.get_indexer(new_id) or {}
             added.append(name)
+        disabled, reenabled = [], []  # type: List[str], List[str]
+        if prune:
+            disabled, reenabled = self._prune_prowlarr(base, rows)
+        if remember:
+            self.db.set_kv("prowlarr_url", base)
+            self.db.set_kv("prowlarr_api_key", key)
+        self.db.set_kv("prowlarr_last_sync", now_iso())
+        self.db.set_kv("prowlarr_last_error", "")
         parts = ["%d ajouté(s)" % len(added), "%d mis à jour" % len(updated)]
+        if disabled:
+            parts.append("%d désactivé(s) (absents ou désactivés dans Prowlarr)" % len(disabled))
+        if reenabled:
+            parts.append("%d réactivé(s)" % len(reenabled))
         if skipped:
             parts.append("%d ignoré(s)" % len(skipped))
         message = "Import Prowlarr : " + ", ".join(parts)
         if not rows:
             message = "Aucun indexer configuré dans Prowlarr"
-        self.db.add_event("indexer", message)
-        return {"ok": True, "added": added, "updated": updated, "skipped": skipped, "message": message}
+        if self.db.get_kv("jackett_url") and remember:
+            message += " — attention : Jackett est aussi synchronisé ; utilisez l'un OU l'autre (doublons)"
+        if added or disabled or reenabled or not remember:
+            self.db.add_event("indexer", message)
+        return {"ok": True, "added": added, "updated": updated, "skipped": skipped, "disabled": disabled,
+                "reenabled": reenabled, "message": message}
+
+    def _prune_prowlarr(self, base: str, rows: List[Any]) -> Tuple[List[str], List[str]]:
+        """Disable our "(Prowlarr)" indexers that Prowlarr no longer lists as enabled torrent indexers;
+        re-enable the ones this sync had disabled when they come back. Indexers disabled by the user stay so."""
+        active_urls = set()
+        for item in rows:
+            if isinstance(item, dict) and item.get("id") not in (None, "") and item.get("enable") is not False \
+                    and str(item.get("protocol") or "torrent").lower() == "torrent":
+                active_urls.add(("%s/%s/api" % (base, item["id"])).lower())
+        return self._prune_source("prowlarr", base, active_urls, lambda u: u.endswith("/api"))
+
+    def _prune_source(self, source: str, base: str, active_urls: Any,
+                      is_ours: Any) -> Tuple[List[str], List[str]]:
+        """Shared by Prowlarr and Jackett syncs: disable our indexers of *source* (URL under *base*, shape
+        accepted by *is_ours*) missing from *active_urls*; re-enable those this sync had disabled."""
+        import json as _json
+        kv = "%s_disabled_by_sync" % source
+        try:
+            by_sync = set(_json.loads(self.db.get_kv(kv) or "[]"))
+        except ValueError:
+            by_sync = set()
+        prefix = (base + "/").lower()
+        active_urls = {u.rstrip("/").lower() for u in active_urls}
+        disabled, reenabled = [], []  # type: List[str], List[str]
+        for r in self.db.list_indexers():
+            url = (r.get("url") or "").rstrip("/").lower()
+            if r.get("type") != "torznab" or not url.startswith(prefix) or not is_ours(url):
+                continue
+            if url in active_urls:
+                if not r["enabled"] and url in by_sync:
+                    self.db.update_indexer(r["id"], enabled=1)
+                    by_sync.discard(url)
+                    reenabled.append(r["name"])
+            elif r["enabled"]:
+                self.db.update_indexer(r["id"], enabled=0)
+                by_sync.add(url)
+                disabled.append(r["name"])
+        self.db.set_kv(kv, _json.dumps(sorted(by_sync)))
+        return disabled, reenabled
+
+    def prowlarr_settings(self, cfg: Optional[Config] = None) -> Dict[str, Any]:
+        """Adresse/clé utilisées pour la synchro automatique : [prowlarr] de config.ini, sinon celles mémorisées
+        lors du dernier import. La clé n'est jamais renvoyée en clair."""
+        url = (getattr(cfg.prowlarr, "url", "") if cfg is not None else "") or self.db.get_kv("prowlarr_url") or ""
+        key = (getattr(cfg.prowlarr, "api_key", "") if cfg is not None else "") or \
+            self.db.get_kv("prowlarr_api_key") or ""
+        hours = float(getattr(cfg.prowlarr, "sync_interval_hours", 6.0)) if cfg is not None else 6.0
+        return {"url": url, "configured": bool(url and key), "has_key": bool(key), "interval_hours": hours,
+                "last_sync": self.db.get_kv("prowlarr_last_sync") or None,
+                "last_error": self.db.get_kv("prowlarr_last_error") or None, "_key": key}
+
+    def sync_prowlarr(self, cfg: Optional[Config] = None) -> Optional[Dict[str, Any]]:
+        """Synchronisation automatique (démon). None si Prowlarr n'est pas configuré. Ne lève jamais."""
+        st = self.prowlarr_settings(cfg)
+        if not st["configured"]:
+            return None
+        try:
+            res = self.import_prowlarr(st["url"], st["_key"], remember=False, prune=True)
+            log.info(res["message"])
+            return res
+        except Exception as exc:  # Prowlarr arrêté, clé changée... : réessayé au prochain cycle
+            self.db.set_kv("prowlarr_last_error", "%s %s" % (now_iso(), exc))
+            log.warning("Synchronisation Prowlarr impossible : %s", exc)
+            return {"ok": False, "message": str(exc)}
+
+    # ---- Jackett (même principe que Prowlarr : soit l'un, soit l'autre) -------------------------
+    JACKETT_DEFAULT_URL = "http://127.0.0.1:9117"
+    _JACKETT_PATH = "/api/v2.0/indexers/%s/results/torznab"
+
+    @staticmethod
+    def normalize_jackett_url(base_url: str) -> Tuple[str, str]:
+        """(URL de base de Jackett, clé trouvée dans « ?apikey= » ou ""). Accepte aussi une URL Torznab copiée
+        depuis Jackett (…/api/v2.0/indexers/xxx/results/torznab/). Lève ValueError."""
+        import urllib.parse
+        raw = (base_url or "").strip()
+        if not raw:
+            raise ValueError("Saisissez l'adresse de Jackett (ex. %s)" % IndexerManager.JACKETT_DEFAULT_URL)
+        if "://" not in raw:
+            raw = "http://" + raw
+        try:
+            parts = urllib.parse.urlsplit(raw)
+        except ValueError:
+            parts = None
+        if parts is None or parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            raise ValueError("Adresse de Jackett invalide (ex. %s)" % IndexerManager.JACKETT_DEFAULT_URL)
+        key = ""
+        for k, v in urllib.parse.parse_qsl(parts.query):
+            if k.lower() == "apikey" and v.strip():
+                key = v.strip()
+        path = parts.path.rstrip("/")
+        low = path.lower()
+        idx = low.find("/api/v2.0")
+        if idx >= 0:
+            path = path[:idx]
+        elif low.endswith("/ui/dashboard"):
+            path = path[:-len("/ui/dashboard")]
+        return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc, path, "", "")).rstrip("/"), key
+
+    def _jackett_list(self, base: str, key: str) -> List[Dict[str, str]]:
+        """Configured Jackett indexers [{id, name}]: Torznab « t=indexers » on the « all » endpoint (API key),
+        else the UI JSON API (works when Jackett has no admin password). Raises ValueError (French)."""
+        from xml.etree import ElementTree as ET
+        http = self.http if not is_local_url(base) else HttpClient(timeout=30, use_proxy=False)
+        url = base + self._JACKETT_PATH % "all" + "/api"
+        try:
+            resp = http.get(url, params={"apikey": key, "t": "indexers", "configured": "true"},
+                            raise_for_status=False, timeout=30)
+        except HttpError as exc:
+            raise ValueError("Jackett injoignable à %s (%s). Vérifiez l'adresse, par exemple %s si Jackett tourne "
+                             "sur le NAS." % (base, exc, self.JACKETT_DEFAULT_URL))
+        body = resp.body or b""
+        if resp.status in (401, 403) or b"Invalid API Key" in body or b'code="100"' in body:
+            raise ValueError("Clé API Jackett refusée (en haut à droite de la page Jackett : « API Key »)")
+        out = []  # type: List[Dict[str, str]]
+        if resp.ok:
+            try:
+                root = ET.fromstring(body)
+                for el in root.iter():
+                    if el.tag.rsplit("}", 1)[-1] != "indexer" or not el.get("id"):
+                        continue
+                    if (el.get("configured") or "true").lower() != "true":
+                        continue
+                    title = el.findtext("title") or el.get("id")
+                    if el.get("id") != "all":
+                        out.append({"id": el.get("id"), "name": title.strip()})
+                if out or root.tag.rsplit("}", 1)[-1] == "indexers":
+                    return out
+            except ET.ParseError:
+                pass
+        # fallback: JSON UI API (no admin password set)
+        try:
+            resp = http.get(base + "/api/v2.0/indexers", params={"configured": "true", "apikey": key},
+                            headers={"Accept": "application/json"}, raise_for_status=False, timeout=30)
+            rows = resp.json() if resp.ok else None
+        except (HttpError, ValueError):
+            rows = None
+        if isinstance(rows, list):
+            for r in rows:
+                if isinstance(r, dict) and r.get("id") and r.get("configured", True):
+                    out.append({"id": str(r["id"]), "name": str(r.get("name") or r["id"])})
+            return out
+        if resp.status == 404:
+            raise ValueError("Pas de Jackett à %s (HTTP 404) : vérifiez l'adresse, par exemple %s"
+                             % (base, self.JACKETT_DEFAULT_URL))
+        raise ValueError("Impossible de lister les indexers de Jackett à %s (HTTP %s)" % (base, resp.status))
+
+    def import_jackett(self, base_url: str, api_key: str = "", remember: bool = True,
+                       prune: bool = True) -> Dict[str, Any]:
+        """Ajoute (ou met à jour) un indexer Torznab « <nom> (Jackett) » par indexer configuré dans Jackett.
+        Même logique que import_prowlarr (Jackett n'a pas de priorité : 25 par défaut, modifiable ici)."""
+        base, key_in_url = self.normalize_jackett_url(base_url)
+        key = (api_key or "").strip() or key_in_url
+        if not key:
+            raise ValueError("Saisissez la clé API de Jackett (en haut à droite de la page Jackett : « API Key »)")
+        items = self._jackett_list(base, key)
+        by_url = {(r["url"] or "").rstrip("/").lower(): r for r in self.db.list_indexers()}
+        added, updated, skipped = [], [], []  # type: List[str], List[str], List[str]
+        active = []
+        for it in items:
+            name = "%s (Jackett)" % it["name"]
+            url = base + self._JACKETT_PATH % it["id"] + "/"
+            active.append(url)
+            row = by_url.get(url.rstrip("/").lower()) or self.db.get_indexer(name)
+            if row is not None and row.get("type") == "torznab":
+                self.db.update_indexer(row["id"], url=url, api_key=key)  # priority: user's choice, kept
+                updated.append(row["name"])
+                continue
+            if row is not None:
+                skipped.append("%s : un indexer nommé « %s » existe déjà" % (it["name"], row["name"]))
+                continue
+            new_id = self.db.add_indexer(name, "torznab", url, key, "", priority=25)
+            by_url[url.rstrip("/").lower()] = self.db.get_indexer(new_id) or {}
+            added.append(name)
+        disabled, reenabled = [], []  # type: List[str], List[str]
+        if prune:
+            disabled, reenabled = self._prune_source("jackett", base, active,
+                                                     lambda u: "/api/v2.0/indexers/" in u)
+        if remember:
+            self.db.set_kv("jackett_url", base)
+            self.db.set_kv("jackett_api_key", key)
+        self.db.set_kv("jackett_last_sync", now_iso())
+        self.db.set_kv("jackett_last_error", "")
+        parts = ["%d ajouté(s)" % len(added), "%d mis à jour" % len(updated)]
+        if disabled:
+            parts.append("%d désactivé(s) (absents de Jackett)" % len(disabled))
+        if reenabled:
+            parts.append("%d réactivé(s)" % len(reenabled))
+        if skipped:
+            parts.append("%d ignoré(s)" % len(skipped))
+        message = "Import Jackett : " + ", ".join(parts) if items else "Aucun indexer configuré dans Jackett"
+        if self.db.get_kv("prowlarr_url") and remember:
+            message += " — attention : Prowlarr est aussi synchronisé ; utilisez l'un OU l'autre (doublons)"
+        if added or disabled or reenabled or not remember:
+            self.db.add_event("indexer", message)
+        return {"ok": True, "added": added, "updated": updated, "skipped": skipped, "disabled": disabled,
+                "reenabled": reenabled, "message": message}
+
+    def jackett_settings(self, cfg: Optional[Config] = None) -> Dict[str, Any]:
+        url = (getattr(getattr(cfg, "jackett", None), "url", "") if cfg is not None else "") or \
+            self.db.get_kv("jackett_url") or ""
+        key = (getattr(getattr(cfg, "jackett", None), "api_key", "") if cfg is not None else "") or \
+            self.db.get_kv("jackett_api_key") or ""
+        hours = float(getattr(getattr(cfg, "prowlarr", None), "sync_interval_hours", 6.0)) if cfg is not None else 6.0
+        return {"url": url, "configured": bool(url and key), "has_key": bool(key), "interval_hours": hours,
+                "last_sync": self.db.get_kv("jackett_last_sync") or None,
+                "last_error": self.db.get_kv("jackett_last_error") or None, "_key": key}
+
+    def sync_jackett(self, cfg: Optional[Config] = None) -> Optional[Dict[str, Any]]:
+        st = self.jackett_settings(cfg)
+        if not st["configured"]:
+            return None
+        try:
+            res = self.import_jackett(st["url"], st["_key"], remember=False, prune=True)
+            log.info(res["message"])
+            return res
+        except Exception as exc:
+            self.db.set_kv("jackett_last_error", "%s %s" % (now_iso(), exc))
+            log.warning("Synchronisation Jackett impossible : %s", exc)
+            return {"ok": False, "message": str(exc)}
+
+    def forget_jackett(self) -> None:
+        for k in ("jackett_url", "jackett_api_key", "jackett_last_sync", "jackett_last_error"):
+            self.db.set_kv(k, None)
+
+    def forget_prowlarr(self) -> None:
+        for k in ("prowlarr_url", "prowlarr_api_key", "prowlarr_last_sync", "prowlarr_last_error"):
+            self.db.set_kv(k, None)
 
     def active(self) -> List[Any]:
         out = []
@@ -449,6 +698,14 @@ def _check_year(year: Any) -> Optional[int]:
     if not 1870 <= y <= 2200:
         raise ValueError("Année invalide : %s" % year)
     return y
+
+
+def _to_year(year: Any) -> Optional[int]:
+    """Année tolérante (None si absente ou invalide), pour comparer des lignes existantes."""
+    try:
+        return _check_year(year)
+    except ValueError:
+        return None
 
 
 def _clean_fields(data: Any) -> Dict[str, Any]:
@@ -919,31 +1176,69 @@ class App:
     # ------------------------------------- téléchargements en cours / changer de source (onglet Watchlist)
     DOWNLOADS_CACHE_SECONDS = 5.0     # l'interface se rafraîchit toutes les 5 à 15 s : DSM n'est pas sollicité plus
     DOWNLOADS_ERROR_CACHE_SECONDS = 30.0
-    _dl_lock = threading.Lock()
+    DOWNLOADS_TIMEOUT = 6.0  # listing de la progression : un DSM muet ne bloque jamais la Watchlist longtemps
+    _dl_lock = threading.Lock()  # protège le cache ci-dessous ; jamais tenu pendant un appel réseau
     _dl_cache = None  # type: Optional[Tuple[Any, float, Optional[List[Any]], Optional[str]]]
+    _dl_gen = 0  # incrémenté par invalidate_downloads : un rafraîchissement plus ancien n'écrit pas le cache
+    _dl_refreshing = None  # type: Optional[Tuple[Any, object]]  # (ds, jeton) du rafraîchissement en cours
+    _dl_client = None  # type: Optional[Tuple[Tuple[Any, ...], Any]]  # (clé, client DS à délai court)
 
     def invalidate_downloads(self) -> None:
-        self._dl_cache = None
+        with self._dl_lock:
+            self._dl_cache = None
+            self._dl_gen += 1
+
+    def _ds_progress_client(self, ds: Any) -> Any:
+        """Client Download Station dédié à la progression (mêmes identifiants, délai court, sans nouvelle
+        tentative). Appelé sous _dl_lock. Les doublures de test sans quick_client() sont utilisées telles quelles."""
+        key = (id(ds), getattr(ds, "url", None), getattr(ds, "username", None), getattr(ds, "password", None))
+        cached = self._dl_client
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        make = getattr(ds, "quick_client", None)
+        client = ds
+        if callable(make):
+            try:
+                client = make(self.DOWNLOADS_TIMEOUT)
+            except Exception as exc:  # pragma: no cover - défensif
+                log.debug("Client Download Station rapide impossible (%s) : client principal utilisé", exc)
+        self._dl_client = (key, client)
+        return client
 
     def _ds_tasks(self, force: bool = False) -> Tuple[Optional[List[Any]], Optional[str]]:
-        """(tâches Download Station, avertissement) avec un cache court. tâches None = DS indisponible."""
-        if self.ds is None:
+        """(tâches Download Station, avertissement) avec un cache court. tâches None = DS indisponible.
+        Si un rafraîchissement est déjà en cours (DSM lent), renvoie aussitôt le cache précédent, ou
+        « inconnu » + un avertissement, au lieu d'attendre (sauf *force*, qui interroge DSM lui-même)."""
+        ds = self.ds
+        if ds is None:
             return None, "Download Station n'est pas configuré : progression des téléchargements indisponible"
         with self._dl_lock:
             cache = self._dl_cache
-            if cache is not None and cache[0] is self.ds and not force:
+            usable = cache is not None and cache[0] is ds
+            if usable and not force:
                 ttl = self.DOWNLOADS_CACHE_SECONDS if cache[3] is None else self.DOWNLOADS_ERROR_CACHE_SECONDS
                 if time.time() - cache[1] < ttl:
                     return cache[2], cache[3]
-            ds = self.ds
-            try:
-                tasks = list(ds.list_tasks() or [])  # type: Optional[List[Any]]
-                warning = None  # type: Optional[str]
-            except Exception as exc:
-                log.debug("Download Station injoignable pour la progression : %s", exc)
-                tasks, warning = None, "Download Station injoignable : %s" % exc
-            self._dl_cache = (ds, time.time(), tasks, warning)
-            return tasks, warning
+            if not force and self._dl_refreshing is not None and self._dl_refreshing[0] is ds:
+                if usable:
+                    return cache[2], cache[3]
+                return None, "Download Station ne répond pas encore : progression des téléchargements inconnue"
+            token = object()
+            self._dl_refreshing = (ds, token)
+            gen = self._dl_gen
+            client = self._ds_progress_client(ds)
+        try:
+            tasks = list(client.list_tasks() or [])  # type: Optional[List[Any]]
+            warning = None  # type: Optional[str]
+        except Exception as exc:
+            log.debug("Download Station injoignable pour la progression : %s", exc)
+            tasks, warning = None, "Download Station injoignable : %s" % exc
+        with self._dl_lock:
+            if self._dl_refreshing is not None and self._dl_refreshing[1] is token:
+                self._dl_refreshing = None
+            if self._dl_gen == gen and self.ds is ds:
+                self._dl_cache = (ds, time.time(), tasks, warning)
+        return tasks, warning
 
     @staticmethod
     def _download_entry(g: Dict[str, Any], task: Any, medias: Dict[int, Dict[str, Any]],
@@ -1092,9 +1387,10 @@ class App:
                        torrent: Optional[bytes] = None, delete_old: bool = True, blocklist_old: bool = False,
                        accept_rejected: bool = False) -> Dict[str, Any]:
         """Envoie une autre source pour un film / une saison / un épisode : résultat de start_source_search
-        (*job_id* + *index*), lien magnet ou URL .torrent (*link*) ou fichier .torrent (*torrent*). L'ancien
-        téléchargement (*grab_id*) passe en échec « remplacé manuellement », sa tâche Download Station est
-        supprimée si *delete_old* et sa release bloquée si *blocklist_old*. Lève ValueError (saisie
+        (*job_id* + *index*), lien magnet ou URL .torrent (*link*) ou fichier .torrent (*torrent*). La tâche
+        Download Station de l'ancien téléchargement (*grab_id*) est supprimée si *delete_old* et sa release
+        bloquée si *blocklist_old* ; il passe en échec « remplacé manuellement » si sa tâche est supprimée ou
+        introuvable, sinon (tâche conservée) il reste suivi et sera importé normalement. Lève ValueError (saisie
         invalide) ; renvoie {"ok": False, "message"} si l'envoi échoue (l'ancien téléchargement est conservé)."""
         from . import bencode
         old = None
@@ -1146,11 +1442,17 @@ class App:
             raise ValueError("Download Station n'est pas configuré ([downloadstation] username/password)")
         old_active = old is not None and old.get("status") == "sent"
         old_task = None
-        if old_active and delete_old:
+        tasks_known = False
+        if old_active:
             from .searcher import TaskIndex
             tasks, _warning = self._ds_tasks(force=True)
+            tasks_known = tasks is not None
             old_task = TaskIndex(tasks).find(old) if tasks is not None else None
-        if old_active:  # libère l'info hash de l'ancien envoi (renvoi du même torrent possible)
+        # L'ancien envoi ne passe en échec (info hash libéré : renvoi du même torrent possible) que si sa tâche
+        # va être supprimée ou est introuvable. Une tâche conservée reste « sent » : toujours suivie (progression)
+        # et importée normalement, et son info hash n'est pas renvoyé une seconde fois à Download Station.
+        retire_old = old_active and (delete_old or (tasks_known and old_task is None))
+        if retire_old:
             self.db.set_grab_status(old["id"], "failed", "remplacé manuellement")
         errors = []  # type: List[str]
         last_id = (self.db.query_one("SELECT MAX(id) AS m FROM grabs") or {}).get("m") or 0
@@ -1160,11 +1462,11 @@ class App:
             else:
                 ok = self.searcher.grab_torrent_bytes(torrent or b"", media, season, episode, error_out=errors)
         except BaseException:
-            if old_active:
+            if retire_old:
                 self.db.set_grab_status(old["id"], "sent", old.get("message"))
             raise
         if not ok:
-            if old_active:
+            if retire_old:
                 self.db.set_grab_status(old["id"], "sent", old.get("message"))
             self.invalidate_downloads()
             return {"ok": False, "message": "Échec de l'envoi à Download Station : %s" % (
@@ -1181,6 +1483,10 @@ class App:
                 except Exception as exc:
                     log.warning("Suppression de la tâche %s impossible : %s", old_task.id, exc)
                     notes.append("suppression de l'ancienne tâche impossible : %s" % exc)
+                    # la tâche continue : l'ancien envoi reste suivi
+                    self.db.set_grab_status(old["id"], "sent", old.get("message"))
+        elif old_active and old_task is not None:
+            notes.append("ancienne tâche conservée dans Download Station (toujours suivie)")
         if old is not None and blocklist_old:
             self.db.block_release(old["release_title"], "remplacé manuellement")
             notes.append("ancienne release bloquée")
@@ -1520,7 +1826,41 @@ class App:
         if row is None:
             row = self.db.find_media_by_ids(fields.get("type"), fields.get("imdb"), fields.get("tmdb"),
                                             fields.get("tvdb"))
+        if row is None:
+            row = self._find_by_title(fields)
         return row
+
+    def _find_by_title(self, fields: Dict[str, Any], exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Ligne de même type et même titre (titre original compris) qu'un ajout sans correspondance d'id,
+        lignes masquées comprises : évite un doublon (et donc un second téléchargement) quand « Dune (2021) »
+        venu de Plex est ajouté à la main. Années ±1 si les deux sont connues ; une seule connue : un film
+        dont l'ajout précise l'année n'est pas rapproché d'une ligne sans année, une série si. Deux ids
+        différents du même type (imdb, tmdb, tvdb) = deux œuvres distinctes (remake homonyme)."""
+        from .parser import titles_match
+        type_, title = fields.get("type"), (fields.get("title") or "").strip()
+        if type_ not in ("movie", "show") or not title:
+            return None
+        names = [title] + ([fields["original_title"]] if fields.get("original_title") else [])
+        year = _to_year(fields.get("year"))
+        best = None  # type: Optional[Tuple[Tuple[int, int, int], Dict[str, Any]]]
+        for row in self.db.list_media(type_, include_hidden=True):
+            if exclude_id is not None and row["id"] == exclude_id:
+                continue
+            if any(fields.get(k) and row.get(k) and str(fields[k]) != str(row[k]) for k in ("imdb", "tmdb", "tvdb")):
+                continue
+            alts = [row["original_title"]] if row.get("original_title") else []
+            if not any(titles_match(n, row.get("title") or "", alts) for n in names):
+                continue
+            ryear = _to_year(row.get("year"))
+            if year and ryear:
+                if abs(year - ryear) > 1:
+                    continue
+            elif type_ == "movie" and year and not ryear:
+                continue
+            rank = (0 if year and ryear == year else 1, 1 if row.get("hidden") else 0, row["id"])
+            if best is None or rank < best[0]:
+                best = (rank, row)
+        return best[1] if best is not None else None
 
     def add_to_watchlist(self, candidate: Dict[str, Any], add_to_plex: bool = True) -> Dict[str, Any]:
         """Ajoute un candidat (search_titles) ou des champs saisis. Retourne la ligne media + "plex_added",
@@ -1575,7 +1915,8 @@ class App:
             if changed:
                 self.db.add_event("watchlist", "Réactivé : %s" % label)
             row = self.db.get_media(existing["id"]) or existing
-            row.update({"plex_added": plex_added, "already_present": True, "warning": warning})
+            row.update({"plex_added": plex_added, "already_present": True, "reactivated": changed,
+                        "warning": warning})
             return row
 
         media = None  # type: Optional[Dict[str, Any]]
@@ -1601,7 +1942,16 @@ class App:
             media = self._add_local(f, label)
         assert media is not None
         row = self.db.get_media(media["id"]) or media
-        row.update({"plex_added": plex_added, "already_present": False, "warning": warning})
+        if row.get("hidden") and row.get("tmdb") and str(row.get("plex_key")).startswith("local:"):
+            # masked by the local sync: same TMDb id as another entry -> drop the brand-new duplicate
+            other = self.db.find_media_by_ids(row["type"], tmdb=row["tmdb"], include_hidden=False)
+            if other is not None and other["id"] != row["id"]:
+                self.db.delete_media(row["id"])
+                kept = self.db.get_media(other["id"]) or other
+                kept.update({"plex_added": None, "already_present": True, "reactivated": False,
+                             "warning": warning})
+                return kept
+        row.update({"plex_added": plex_added, "already_present": False, "reactivated": False, "warning": warning})
         return row
 
     def _local_key(self, f: Dict[str, Any]) -> str:
@@ -1754,6 +2104,7 @@ class App:
                 log.error("Interface web impossible sur le port %s : %s", self.cfg.web.port, exc)
         next_watch = time.time() + 5
         next_process = time.time() + 2
+        next_prowlarr = time.time() + 1  # before the first search: indexers are up to date
         while not self._stop.is_set():
             try:
                 now = time.time()
@@ -1765,6 +2116,10 @@ class App:
                 if now >= next_process:
                     self.job_process()
                     next_process = time.time() + process_every
+                prowlarr_hours = float(self.cfg.prowlarr.sync_interval_hours or 0)
+                if prowlarr_hours > 0 and now >= next_prowlarr and not self._stop.is_set():
+                    next_prowlarr = time.time() + max(0.25, prowlarr_hours) * 3600
+                    self._start_prowlarr_sync()
                 if now >= next_watch and not self._stop.is_set():
                     self._start_watchlist_thread()
                     next_watch = time.time() + watch_every
@@ -1772,6 +2127,36 @@ class App:
                 log.exception("Boucle principale : erreur inattendue : %s", exc)
             self._stop.wait(2)
         self.shutdown()
+
+    def _start_prowlarr_sync(self) -> bool:
+        """Synchronise the Prowlarr indexers in a background thread (no-op if not configured or running)."""
+        if getattr(self, "_prowlarr_running", False):
+            return False
+        mgr = self.indexer_manager
+        if not mgr.prowlarr_settings(self.cfg)["configured"] and not mgr.jackett_settings(self.cfg)["configured"]:
+            return False
+        self._prowlarr_running = True
+
+        def run() -> None:
+            try:
+                self.indexer_manager.sync_prowlarr(self.cfg)
+                self.indexer_manager.sync_jackett(self.cfg)
+            finally:
+                self._prowlarr_running = False
+        threading.Thread(target=run, name="prowlarr-sync", daemon=True).start()
+        return True
+
+    def jackett_status(self) -> Dict[str, Any]:
+        st = dict(self.indexer_manager.jackett_settings(self.cfg))
+        st.pop("_key", None)
+        st["running"] = bool(getattr(self, "_prowlarr_running", False))
+        return st
+
+    def prowlarr_status(self) -> Dict[str, Any]:
+        st = dict(self.indexer_manager.prowlarr_settings(self.cfg))
+        st.pop("_key", None)
+        st["running"] = bool(getattr(self, "_prowlarr_running", False))
+        return st
 
     def shutdown(self, timeout: float = 60.0) -> None:
         """Stop the web server, let running jobs finish (a file move is never cut), close the database."""
