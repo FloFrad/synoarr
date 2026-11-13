@@ -68,6 +68,45 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(titles_match("", "X"))
 
 
+class ParserReviewTests(unittest.TestCase):
+    def test_french_release_names(self):
+        cases = [
+            ("Lupin.S01.COMPLETE.FRENCH.1080p.WEB.x264", "Lupin", [1], [], True, ["fr"]),
+            ("Kaamelott Saison 1 FRENCH DVDRIP", "Kaamelott", [1], [], True, ["fr"]),
+            ("Les.Revenants.S02E03.VFF.720p.HDTV", "Les Revenants", [2], [3], False, ["fr"]),
+            ("Le.Bureau.des.Legendes.S05.MULTi.1080p.WEB.H264-FRATERNiTY", "Le Bureau des Legendes", [5], [],
+             True, ["multi"]),
+            ("Intouchables.2011.TRUEFRENCH.1080p.BluRay.x264", "Intouchables", [], [], False, ["fr"]),
+            ("Mr.Robot.Saison.1.VOSTFR", "Mr Robot", [1], [], True, ["vostfr"]),
+            ("Amelie.MULTi.VFF.1080p", "Amelie", [], [], False, ["multi"]),
+            ("Kaamelott.FRENCH.HDLight", "Kaamelott", [], [], False, ["fr"]),
+        ]
+        for name, title, seasons, episodes, pack, langs in cases:
+            p = parse(name)
+            self.assertEqual((p.title, p.seasons, p.episodes, p.is_season_pack, p.languages),
+                             (title, seasons, episodes, pack, langs), name)
+        p = parse("Kaamelott.iNTEGRALE.FRENCH.DVDRiP.XviD")
+        self.assertEqual((p.title, p.is_complete), ("Kaamelott", True))
+
+    def test_language_words_inside_titles(self):
+        self.assertEqual(parse("The.French.Dispatch.2021.1080p").title, "The French Dispatch")
+        self.assertEqual(parse("The.French.Dispatch.MULTi.x264-GRP").title, "The French Dispatch")
+        self.assertEqual(parse("The.French.Connection.1971.FRENCH.1080p").languages, ["fr"])
+
+    def test_future_number_is_not_a_year(self):
+        p = parse("Blade.Runner.2049.1080p.BluRay")
+        self.assertEqual((p.title, p.year), ("Blade Runner 2049", None))
+        self.assertFalse(titles_match(p.title, "Blade Runner"))
+
+    def test_titles_apostrophes_and_country(self):
+        self.assertTrue(titles_match(parse("L.Arme.Fatale.1987.FRENCH").title, "L'Arme fatale"))
+        self.assertTrue(titles_match("LArme Fatale", "L'Arme fatale"))
+        self.assertTrue(titles_match("Greys Anatomy", "Grey's Anatomy"))
+        self.assertTrue(titles_match("The Office US", "The Office"))
+        self.assertTrue(titles_match("The Office", "The Office (US)"))
+        self.assertFalse(titles_match("The Office UK", "The Office (US)"))
+
+
 class ConfigTests(unittest.TestCase):
     def test_example_config_is_valid(self):
         cfg = config_mod.load_config(os.path.join(ROOT, "config.example.ini"))
@@ -105,6 +144,46 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(len(config_mod.load_config(p).validate()), 2)
         with self.assertRaises(config_mod.ConfigError):
             config_mod.load_config("/nonexistent/config.ini")
+
+    def _write(self, d, data):
+        p = os.path.join(d, "c.ini")
+        with open(p, "wb") as fh:
+            fh.write(data)
+        return p
+
+    def test_windows_edited_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = ("[downloadstation]\r\n; utilisateur dédié\r\nusername = flo\r\npassword = p@ss #1;x\r\n"
+                    "[paths]\r\nmovies_dir = \"/volume1/Vidéos/Films/\"\r\n[web]\r\nport = 8778\r\n")
+            for data in (text.encode("utf-8"), b"\xef\xbb\xbf" + text.encode("utf-8"), text.encode("utf-16"),
+                         text.encode("cp1252")):
+                cfg = config_mod.load_config(self._write(d, data))
+                self.assertEqual(cfg.downloadstation.username, "flo")
+                self.assertEqual(cfg.downloadstation.password, "p@ss #1;x")  # secrets kept verbatim
+                self.assertEqual(cfg.paths.movies_dir, "/volume1/Vidéos/Films")
+                self.assertEqual(cfg.web.port, 8778)
+
+    def test_password_starting_with_comment_char(self):
+        with tempfile.TemporaryDirectory() as d:
+            for pwd in ("#secret%x", ";abc", "abc ;def", "a #b"):
+                cfg = config_mod.load_config(self._write(d, ("[downloadstation]\npassword = %s\n" % pwd).encode()))
+                self.assertEqual(cfg.downloadstation.password, pwd)
+
+    def test_defaults_match_example(self):
+        example = config_mod.load_config(os.path.join(ROOT, "config.example.ini"))
+        default = config_mod.Config()
+        self.assertEqual(default.paths.movies_dir, example.paths.movies_dir)
+        self.assertEqual(default.paths.series_dir, example.paths.series_dir)
+
+    def test_missing_share_root(self):
+        self.assertEqual(config_mod.missing_share_root("/volume99/Videos/Films"), "/volume99/Videos")
+        self.assertIsNone(config_mod.missing_share_root("/tmp/x/y"))
+
+    def test_unknown_keys_are_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = config_mod.load_config(self._write(d, b"[paths]\nmovie_dir = /x\n[Plex]\ntoken = a\n"))
+            self.assertEqual(len(cfg.warnings), 2, cfg.warnings)
+            self.assertIn("movie_dir", cfg.warnings[0] + cfg.warnings[1])
 
 
 class DbTests(unittest.TestCase):

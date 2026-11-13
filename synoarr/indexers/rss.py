@@ -9,7 +9,8 @@ import logging
 from typing import List, Tuple
 
 from ..models import Release, SearchRequest
-from ..parser import parse, titles_match
+from ..parser import titles_match
+from ..quality import parse_for_request
 from .base import Indexer, feed_items, is_feed, local_name, parse_feed, parse_xml
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ class RssIndexer(Indexer):
         out = []
         for rel in self._fetch():
             try:
-                parsed = parse(rel.title)
+                parsed = parse_for_request(rel.title, request)
             except Exception:  # pragma: no cover - parser is defensive already
                 continue
             if titles_match(parsed.title, request.title, request.alt_titles):

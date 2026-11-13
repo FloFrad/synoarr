@@ -5,13 +5,15 @@ import datetime as _dt
 import logging
 import os
 import re
+import threading
+import unicodedata
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from . import bencode, quality
-from .db import Database, parse_iso
+from .db import Database, now_iso, parse_iso, release_file_lock, try_file_lock
 from .httpclient import HttpClient, HttpError, redact
 from .models import EpisodeInfo, Release, SearchRequest, WatchItem
-from .parser import parse, titles_match
+from .parser import normalize_title, parse, titles_match
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import Config
@@ -23,6 +25,37 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 VIDEO_EXT = {"mkv", "mp4", "avi", "m4v", "mov", "wmv", "ts", "m2ts", "mpg", "mpeg", "webm"}
+
+
+class _AlreadyGrabbed(Exception):
+    """The torrent (same info hash) was already sent to Download Station."""
+
+
+def _is_ds_error(exc: BaseException) -> bool:
+    try:
+        from .downloadstation import DownloadStationError
+    except Exception:  # pragma: no cover
+        return False
+    return isinstance(exc, DownloadStationError)
+
+
+def _data_dir(cfg: Any) -> str:
+    try:
+        return cfg.data_dir
+    except Exception:  # pragma: no cover
+        return ""
+
+
+def _ext(name: str) -> str:
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFC", text).strip().casefold()
+
+
+def _strip_torrent_ext(text: str) -> str:
+    return text[:-8] if text.lower().endswith(".torrent") else text
 
 
 def _today() -> str:
@@ -45,6 +78,23 @@ class Searcher:
         self.ds = ds
         self.tmdb = tmdb
         self.indexers_provider = indexers_provider
+        # set by the daemon on shutdown: a long search cycle stops between two items
+        self.stop_event = None  # type: Optional[threading.Event]
+
+    def _touch_media(self, media_id: int) -> None:
+        if not self.cfg.general.dry_run:  # a simulation must not delay the real searches
+            self.db.touch_media_search(media_id)
+
+    def _touch_episode(self, episode_id: int) -> None:
+        if not self.cfg.general.dry_run:
+            self.db.touch_episode_search(episode_id)
+
+    def _stopping(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def _video_exts(self) -> set:
+        exts = getattr(getattr(self.cfg, "naming", None), "video_extensions", None) or VIDEO_EXT
+        return set(e.lower().lstrip(".") for e in exts)
 
     # ================================================================ watchlist sync
     def sync_watchlist(self) -> int:
@@ -81,7 +131,8 @@ class Searcher:
         media = self.db.get_media(media_id)
         assert media is not None
         if item.type == "movie":
-            if media["status"] == "wanted" and self._movie_in_library(item.title, item.year):
+            if media["status"] == "wanted" and self._movie_in_library(item.title, item.year,
+                                                                       self._alt_titles(media)):
                 self.db.set_media_status(media_id, "done")
                 log.info("%s est déjà présent dans %s", item.title, self.cfg.paths.movies_dir)
         else:
@@ -109,13 +160,18 @@ class Searcher:
         added_on = (media.get("added_at") or _today())[:10]
         aired_seasons = sorted({e.season for e in episodes if e.season > 0 and _is_aired(e.air_date)})
         latest = aired_seasons[-1] if aired_seasons else max([e.season for e in episodes] or [1])
-        in_library = self._episodes_in_library(media["title"])
+        in_library = self._episodes_in_library(media["title"], self._alt_titles(media))
+        # downloads already sent (e.g. season packs grabbed while no episode list was known)
+        active = self.db.query("SELECT season, episode FROM grabs WHERE media_id = ? AND status = 'sent' "
+                               "AND season IS NOT NULL", (media["id"],))
         for ep in episodes:
             if ep.season <= 0:
                 continue  # specials
             status = "wanted"
             if (ep.season, ep.episode) in in_library:
                 status = "done"
+            elif any(g["season"] == ep.season and g["episode"] in (None, ep.episode) for g in active):
+                status = "grabbed"
             elif policy == "future" and first_sync and ep.air_date and ep.air_date[:10] < added_on:
                 status = "skipped"
             elif policy == "latest_season" and ep.season < latest:
@@ -125,7 +181,7 @@ class Searcher:
                 self.db.set_episode_status(media["id"], ep.season, ep.episode, "done", only_if=("wanted",))
 
     # ------------------------------------------------------------ library checks
-    def _movie_in_library(self, title: str, year: Optional[int]) -> bool:
+    def _movie_in_library(self, title: str, year: Optional[int], alt_titles: Optional[List[str]] = None) -> bool:
         root = self.cfg.paths.movies_dir
         if not os.path.isdir(root):
             return False
@@ -133,21 +189,26 @@ class Searcher:
             names = os.listdir(root)
         except OSError:
             return False
+        vexts = self._video_exts()
         for name in names:
+            if name.startswith((".", "@", "#")):
+                continue
             p = parse(name)
-            if not titles_match(p.title, title):
+            if not titles_match(p.title, title, alt_titles):
                 continue
             if year and p.year and abs(p.year - year) > 1:
                 continue
             path = os.path.join(root, name)
             if os.path.isfile(path):
-                return name.rsplit(".", 1)[-1].lower() in VIDEO_EXT
+                if _ext(name) in vexts:  # a stray "Title.nfo" must not hide the "Title (Year)/" folder
+                    return True
+                continue
             for _dirpath, _dirs, files in os.walk(path):
-                if any(f.rsplit(".", 1)[-1].lower() in VIDEO_EXT for f in files):
+                if any(_ext(f) in vexts for f in files):
                     return True
         return False
 
-    def _episodes_in_library(self, show_title: str) -> set:
+    def _episodes_in_library(self, show_title: str, alt_titles: Optional[List[str]] = None) -> set:
         found = set()
         root = self.cfg.paths.series_dir
         if not os.path.isdir(root):
@@ -156,12 +217,16 @@ class Searcher:
             names = os.listdir(root)
         except OSError:
             return found
+        vexts = self._video_exts()
         for name in names:
-            if not titles_match(parse(name).title or name, show_title) and not titles_match(name, show_title):
+            if name.startswith((".", "@", "#")):
+                continue
+            if not titles_match(parse(name).title or name, show_title, alt_titles) and \
+                    not titles_match(name, show_title, alt_titles):
                 continue
             for _dirpath, _dirs, files in os.walk(os.path.join(root, name)):
                 for f in files:
-                    if f.rsplit(".", 1)[-1].lower() not in VIDEO_EXT:
+                    if _ext(f) not in vexts:
                         continue
                     p = parse(f)
                     for s in p.seasons[:1]:
@@ -172,6 +237,16 @@ class Searcher:
     # ================================================================ search cycle
     def run_once(self, media_id: Optional[int] = None, force: bool = False) -> Dict[str, int]:
         """Search every wanted item (or only *media_id*). Returns counters."""
+        lock = try_file_lock(_data_dir(self.cfg), "search.lock")
+        if lock is False:
+            log.info("Une autre recherche est en cours (démon ou commande) : recherche ignorée")
+            return {"searched": 0, "grabbed": 0}
+        try:
+            return self._run_once(media_id, force)
+        finally:
+            release_file_lock(lock)
+
+    def _run_once(self, media_id: Optional[int], force: bool) -> Dict[str, int]:
         stats = {"searched": 0, "grabbed": 0}
         indexers = self.indexers_provider()
         if not indexers:
@@ -182,6 +257,9 @@ class Searcher:
         for media in medias:
             if not media:
                 continue
+            if self._stopping():
+                log.info("Arrêt demandé : recherche interrompue")
+                break
             try:
                 if media["type"] == "movie" and media["status"] == "wanted":
                     self._search_movie(media, indexers, force or bool(media_id), stats)
@@ -215,11 +293,13 @@ class Searcher:
             return
         req = SearchRequest(kind="movie", title=media["title"], year=media.get("year"), imdb=media.get("imdb"),
                             tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media))
-        self.db.touch_media_search(media["id"])
+        self._touch_media(media["id"])
         stats["searched"] += 1
         best = self._find_best(req, indexers)
         if best and self.grab(best, media, None, None):
-            self.db.set_media_status(media["id"], "grabbed")
+            # conditional: the organizer may have imported it meanwhile (status done)
+            self.db.execute("UPDATE media SET status = 'grabbed', updated_at = ? WHERE id = ? AND status = 'wanted'",
+                            (now_iso(), media["id"]))
             stats["grabbed"] += 1
 
     def _search_show(self, media: Dict[str, Any], indexers: List["Indexer"], force: bool,
@@ -251,18 +331,25 @@ class Searcher:
                     self.db.set_episode_status(media["id"], season, None, "grabbed", only_if=("wanted",))
                     stats["grabbed"] += 1
                     for e in due_eps:
-                        self.db.touch_episode_search(e["id"])
+                        self._touch_episode(e["id"])
                     continue
             # 2) episode by episode
             for e in due_eps:
+                if self._stopping():
+                    return
+                current = self.db.get_episode(media["id"], season, e["episode"])
+                if current is not None and current["status"] != "wanted":
+                    continue  # covered by a multi-episode release grabbed just before
                 req = SearchRequest(kind="episode", title=media["title"], year=media.get("year"), season=season,
                                     episode=e["episode"], imdb=media.get("imdb"), tvdb=media.get("tvdb"),
                                     tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media))
-                self.db.touch_episode_search(e["id"])
+                self._touch_episode(e["id"])
                 stats["searched"] += 1
                 best = self._find_best(req, indexers)
                 if best and self.grab(best, media, season, e["episode"]):
-                    self.db.set_episode_status(media["id"], season, e["episode"], "grabbed")
+                    grabbed_eps = set(parse(best.title).episodes) | {e["episode"]}
+                    for ep_num in grabbed_eps:  # "S01E01E02": both episodes are coming
+                        self.db.set_episode_status(media["id"], season, ep_num, "grabbed", only_if=("wanted",))
                     stats["grabbed"] += 1
 
     def _search_show_without_episodes(self, media: Dict[str, Any], indexers: List["Indexer"], force: bool,
@@ -270,24 +357,33 @@ class Searcher:
         """No episode list (no Plex/TMDb data): grab the best season pack of every season found."""
         if not self._due(media.get("last_search_at"), force):
             return
-        self.db.touch_media_search(media["id"])
-        grabbed_seasons = {g["season"] for g in self.db.query(
-            "SELECT season FROM grabs WHERE media_id = ? AND status != 'failed'", (media["id"],))}
+        self._touch_media(media["id"])
+        grabbed_seasons = set()
+        for g in self.db.query("SELECT season, release_title FROM grabs WHERE media_id = ? AND status != 'failed'",
+                               (media["id"],)):
+            grabbed_seasons.add(g["season"])
+            pr = parse(g["release_title"] or "")
+            if pr.is_season_pack:
+                grabbed_seasons.update(pr.seasons)  # "S01-S03" pack covers 3 seasons
         base = SearchRequest(kind="season", title=media["title"], year=media.get("year"),
                              alt_titles=self._alt_titles(media))
         stats["searched"] += 1
         results = self._collect(SearchRequest(kind="season", title=media["title"], season=None,
                                               alt_titles=base.alt_titles), indexers)
-        seasons = sorted({s for r in results for s in parse(r.title).seasons
-                          if parse(r.title).is_season_pack})
-        for season in seasons:
+        seasons = set()
+        for r in results:
+            pr = parse(r.title)
+            if pr.is_season_pack:
+                seasons.update(pr.seasons)
+        for season in sorted(seasons):
             if season in grabbed_seasons:
                 continue
             req = SearchRequest(kind="season", title=media["title"], year=media.get("year"), season=season,
                                 alt_titles=base.alt_titles)
-            best = quality.pick_best(results, req, self.cfg.quality, self.db.is_blocked)
+            best = quality.pick_best(results, req, self.cfg.quality, self._is_excluded)
             if best and self.grab(best, media, season, None):
                 stats["grabbed"] += 1
+                grabbed_seasons.update(parse(best.title).seasons)  # "S01-S03" pack covers 3 seasons
 
     # ------------------------------------------------------------ indexer queries
     def _collect(self, req: SearchRequest, indexers: List["Indexer"]) -> List[Release]:
@@ -304,12 +400,25 @@ class Searcher:
 
     def _find_best(self, req: SearchRequest, indexers: List["Indexer"]) -> Optional[Release]:
         results = self._collect(req, indexers)
-        best = quality.pick_best(results, req, self.cfg.quality, self.db.is_blocked)
+        best = quality.pick_best(results, req, self.cfg.quality, self._is_excluded)
         if best is None:
             log.info("Rien de satisfaisant pour %s (%d résultat(s) examiné(s))", req.describe(), len(results))
         else:
             log.info("Meilleur résultat pour %s : %s [%s]", req.describe(), best.title, best.indexer)
         return best
+
+    def _is_excluded(self, release_title: str) -> bool:
+        """Blocklisted, or already sent / imported (releases without info hash are recognised by title)."""
+        if self.db.is_blocked(release_title):
+            return True
+        return self.db.query_one("SELECT 1 AS x FROM grabs WHERE lower(release_title) = lower(?) "
+                                 "AND status != 'failed'", (release_title,)) is not None
+
+    def _hash_already_grabbed(self, info_hash: Optional[str]) -> bool:
+        if not info_hash:
+            return False
+        return self.db.query_one("SELECT 1 AS x FROM grabs WHERE lower(info_hash) = lower(?) AND status != 'failed'",
+                                 (info_hash,)) is not None
 
     def search_report(self, req: SearchRequest) -> List[Tuple[Release, Optional[int], str]]:
         """Used by the CLI: every result with its score / rejection reason."""
@@ -328,9 +437,7 @@ class Searcher:
              episode: Optional[int]) -> bool:
         """Send *release* to Download Station and record it. Returns True on success."""
         label = media["title"] if media else release.title
-        if release.info_hash and self.db.query_one(
-                "SELECT 1 AS x FROM grabs WHERE lower(info_hash) = lower(?) AND status != 'failed'",
-                (release.info_hash,)):
+        if self._hash_already_grabbed(release.info_hash):
             log.info("Déjà envoyé : %s", release.title)
             return False
         if self.cfg.general.dry_run:
@@ -342,13 +449,18 @@ class Searcher:
             return False
         try:
             torrent_name, info_hash = self._send(release)
+        except _AlreadyGrabbed:
+            log.info("Déjà envoyé (même info hash) : %s", release.title)
+            return False
         except Exception as exc:
             log.warning("Échec de l'envoi de %s : %s", release.title, exc)
             self.db.add_event("grab", "Échec de l'envoi de %s : %s" % (release.title, exc), "ERROR")
-            if not isinstance(exc, HttpError) or (exc.status is not None and exc.status < 500):
-                # broken link / not a torrent: do not retry this release forever
-                if "Download Station" not in str(exc):
-                    self.db.block_release(release.title, str(exc)[:200])
+            # Only a release that is itself broken is blocklisted (dead link, not a torrent). A Download
+            # Station problem (session, permissions, destination...), a network error, an indexer that
+            # refuses the API key or rate-limits (401/403/429) must not blocklist every release.
+            broken = isinstance(exc, ValueError) or (isinstance(exc, HttpError) and exc.status in (404, 410))
+            if broken and not _is_ds_error(exc):
+                self.db.block_release(release.title, str(exc)[:200])
             return False
         self.db.add_grab(media["id"] if media else None, season, episode, release.title,
                          torrent_name or release.title, release.indexer, info_hash or release.info_hash,
@@ -376,6 +488,8 @@ class Searcher:
                         return self._send_magnet(release.magnet)
                     raise ValueError("le lien ne renvoie pas un fichier .torrent valide (%s)"
                                      % redact(release.download_url))
+                if self._hash_already_grabbed(info_hash):
+                    raise _AlreadyGrabbed()
                 filename = re.sub(r"[^\w.\- ()\[\]]+", "_", name or "release")[:150] + ".torrent"
                 self.ds.add_torrent_file(resp.body, filename)
                 return name, info_hash
@@ -390,6 +504,8 @@ class Searcher:
     def _send_magnet(self, magnet: str) -> Tuple[Optional[str], Optional[str]]:
         assert self.ds is not None
         name, info_hash = bencode.magnet_info(magnet)
+        if self._hash_already_grabbed(info_hash):
+            raise _AlreadyGrabbed()
         self.ds.add_url(magnet)
         return name, info_hash
 
@@ -406,9 +522,19 @@ class Searcher:
         except Exception as exc:
             log.debug("Download Station indisponible pour vérifier les erreurs : %s", exc)
             return
-        by_title = {t.title.lower(): t for t in tasks}
+        by_title = {}  # type: Dict[str, Any]
+        by_norm = {}  # type: Dict[str, Any]
+        for t in tasks:
+            by_title.setdefault(_fold(t.title or ""), t)
+            by_norm.setdefault(normalize_title(_strip_torrent_ext(t.title or "")), t)
         for g in sent:
-            task = by_title.get((g.get("torrent_name") or "").lower()) or by_title.get(g["release_title"].lower())
+            task = None
+            for key in (g.get("torrent_name"), g.get("release_title")):
+                if key and task is None:
+                    task = by_title.get(_fold(key))
+            for key in (g.get("torrent_name"), g.get("release_title")):
+                if key and task is None:
+                    task = by_norm.get(normalize_title(_strip_torrent_ext(key))) or None
             if task is None or task.status != "error":
                 continue
             reason = task.error or "erreur Download Station"
@@ -426,7 +552,7 @@ class Searcher:
                     self.db.set_media_status(media["id"], "wanted")
                     self.db.execute("UPDATE media SET last_search_at = NULL WHERE id = ?", (media["id"],))
                 elif media and g.get("season") is not None:
-                    self.db.set_episode_status(media["id"], g["season"], g.get("episode"), "wanted",
-                                               only_if=("grabbed",))
+                    # back to wanted, except episodes another active download still covers
+                    self.db.reset_grab_episodes(g)
                     self.db.execute("UPDATE episodes SET last_search_at = NULL WHERE media_id = ? AND season = ?",
                                     (media["id"], g["season"]))

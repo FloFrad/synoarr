@@ -1,4 +1,4 @@
 #!/bin/sh
 DIR="$(cd "$(dirname "$0")" && pwd)"
-"$DIR/stop.sh"
-"$DIR/start.sh" "$@"
+sh "$DIR/stop.sh"
+sh "$DIR/start.sh" "$@"

@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import unicodedata
 from typing import Callable, List, Optional, Set, Tuple
 
 from .config import QualityConfig
@@ -24,7 +25,7 @@ from .parser import normalize_title, parse, titles_match
 
 log = logging.getLogger(__name__)
 
-__all__ = ["evaluate", "pick_best", "rank_releases"]
+__all__ = ["evaluate", "pick_best", "rank_releases", "parse_for_request"]
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -65,6 +66,51 @@ def _tail_after_title(release_title: str, parsed_title: str) -> str:
     if pt and norm.startswith(pt):
         return norm[len(pt):].strip()
     return norm
+
+
+_PLACEHOLDER = "Zqxw"
+_RE_LEADING_TAGS = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
+
+
+def _strip_title_prefix(release_title: str, wanted: str) -> Optional[str]:
+    """If *release_title* starts with the *wanted* title (ignoring case, accents, punctuation), return
+    the remainder, starting at the separator that follows the title. None otherwise."""
+    wn = normalize_title(wanted)
+    if not wn:
+        return None
+    raw = _RE_LEADING_TAGS.sub("", release_title)
+    for i in range(1, len(raw) + 1):
+        if i < len(raw):
+            ch = raw[i]
+            # the title must end on a separator (apostrophes belong to words: "Grey's")
+            if ch.isalnum() or ch in "'’`" or unicodedata.combining(ch):
+                continue
+        prefix = normalize_title(raw[:i])
+        if prefix == wn:
+            return raw[i:]
+        if len(prefix) > len(wn):
+            return None
+    return None
+
+
+def parse_for_request(title: str, request: SearchRequest) -> ParsedName:
+    """parse() the release title, knowing which title we look for.
+
+    The generic parser cuts titles on words such as "French" ("The French Dispatch") and takes a
+    number in the title for a year ("Blade Runner 2049", "1917"). When the release name starts with the
+    wanted title (or an alternative title), the rest of the name is parsed on its own instead.
+    """
+    for wanted in [request.title] + list(request.alt_titles or []):
+        rest = _strip_title_prefix(title, wanted or "")
+        if rest is None:
+            continue
+        q = parse(_PLACEHOLDER + rest)
+        if normalize_title(q.title) != _PLACEHOLDER.lower():
+            continue  # something else follows the wanted title ("Dune Part Two", "The Office UK")
+        q.raw = title
+        q.title = wanted
+        return q
+    return parse(title)
 
 
 def _language_points(langs: List[str], wanted: List[str]) -> Tuple[Optional[int], str]:
@@ -161,7 +207,7 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig) -> Tu
     title = (release.title or "").strip()
     if not title:
         return None, "titre vide"
-    p = parse(title)
+    p = parse_for_request(title, request)
 
     if p.is_sample:
         return None, "échantillon (sample)"

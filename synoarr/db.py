@@ -13,9 +13,11 @@ kv        : misc key/value settings (plex client id, ...)
 from __future__ import annotations
 
 import datetime as _dt
+import errno
 import os
 import sqlite3
 import threading
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional
 
 SCHEMA = """
@@ -92,6 +94,47 @@ CREATE INDEX IF NOT EXISTS idx_episodes_media ON episodes(media_id);
 """
 
 
+try:  # POSIX only (DSM, Docker)
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None  # type: ignore
+
+
+def try_file_lock(directory: str, name: str) -> Any:
+    """Non-blocking inter-process lock (flock) on <directory>/<name>, so that a manual command
+    (``sudo python3 synoarr.py process``) never races the daemon.
+
+    Returns an fd to pass to release_file_lock(), None when locking is impossible (no fcntl, missing or
+    read-only folder: proceed without lock) or False when another process holds the lock."""
+    if _fcntl is None or not directory or not os.path.isdir(directory):
+        return None
+    try:
+        fd = os.open(os.path.join(directory, name), os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError:
+        return None
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        return fd
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            return False
+        return None
+
+
+def release_file_lock(fd: Any) -> None:
+    if fd is None or fd is False:
+        return
+    try:
+        os.close(fd)  # closing the descriptor releases the flock
+    except OSError:
+        pass
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFC", text or "").strip().casefold()
+
+
 def now_iso() -> str:
     return _dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
 
@@ -129,8 +172,16 @@ class Database:
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
         """Run a write statement, commit, return lastrowid (or rowcount for UPDATE/DELETE)."""
         with self._lock:
-            cur = self._conn.execute(sql, tuple(params))
-            self._conn.commit()
+            try:
+                cur = self._conn.execute(sql, tuple(params))
+                self._conn.commit()
+            except BaseException:
+                # never leave an implicit transaction open (it would hold the write lock / be committed later)
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
             if sql.lstrip().upper().startswith("INSERT"):
                 return int(cur.lastrowid or 0)
             return int(cur.rowcount)
@@ -301,9 +352,40 @@ class Database:
 
     def find_grab_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """Find the most recent grab whose torrent name or release title matches *name* (case-insensitive)."""
-        return self.query_one(
+        row = self.query_one(
             "SELECT * FROM grabs WHERE lower(torrent_name) = lower(?) OR lower(release_title) = lower(?) "
             "ORDER BY id DESC LIMIT 1", (name, name))
+        if row is not None or not name:
+            return row
+        # SQLite lower() only folds ASCII, and macOS clients may write names in NFD: compare in Python
+        wanted = _fold(name)
+        for g in self.query("SELECT * FROM grabs ORDER BY id DESC LIMIT 1000"):
+            if wanted in (_fold(g.get("torrent_name") or ""), _fold(g.get("release_title") or "")):
+                return g
+        return None
+
+    def reset_grab_episodes(self, grab: Dict[str, Any]) -> int:
+        """Episodes of *grab* still marked 'grabbed' go back to 'wanted' (failed download, or imported
+        season pack that did not contain them), unless another active download covers them."""
+        media_id, season, episode = grab.get("media_id"), grab.get("season"), grab.get("episode")
+        if not media_id or season is None:
+            return 0
+        sql = ("UPDATE episodes SET status = 'wanted', last_search_at = NULL "
+               "WHERE media_id = ? AND season = ? AND status = 'grabbed'")
+        params = [media_id, season]  # type: List[Any]
+        if episode is not None:
+            eps = {int(episode)}
+            from .parser import parse  # local import: parser does not depend on db
+            parsed = parse(grab.get("release_title") or "")
+            if parsed.season == season:
+                eps.update(parsed.episodes)  # "S01E01E02" grabbed for E01 also covers E02
+            sql += " AND episode IN (%s)" % ",".join("?" * len(eps))
+            params.extend(sorted(eps))
+        sql += (" AND NOT EXISTS (SELECT 1 FROM grabs g WHERE g.id != ? AND g.status = 'sent' "
+                "AND g.media_id = episodes.media_id AND g.season = episodes.season "
+                "AND (g.episode IS NULL OR g.episode = episodes.episode))")
+        params.append(grab.get("id") or 0)
+        return self.execute(sql, params)
 
     def list_grabs(self, status: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
         sql, params = "SELECT * FROM grabs", []  # type: str, List[Any]

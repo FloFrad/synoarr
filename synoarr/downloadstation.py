@@ -121,7 +121,10 @@ def map_status(value: Any) -> str:
 class DownloadStation:
     def __init__(self, url: str, username: str, password: str, destination: str, http: HttpClient):
         self.url = (url or "").strip().rstrip("/")
-        if self.url.endswith("/webapi"):
+        if self.url and not re.match(r"^https?://", self.url, re.I):
+            # "192.168.1.10:5000" would make urllib raise ValueError (unknown url type)
+            self.url = "http://" + self.url
+        if self.url.lower().endswith("/webapi"):
             self.url = self.url[: -len("/webapi")]
         self.username = username or ""
         self.password = password or ""
@@ -308,11 +311,12 @@ class DownloadStation:
                 payload = self._raw(info["path"], fields)
             else:
                 query: Dict[str, Any] = {}
-                # DSM accepts _sid either in the query string or in the body depending on the API/version:
-                # send it in both places to be safe.
-                fields["_sid"] = sid
+                # Same as Sonarr's DownloadStation proxies: SYNO.DownloadStation2.Task wants _sid in the
+                # query string (api/version/method + params in the body), the legacy APIs in the body.
                 if sid_in_query:
                     query["_sid"] = sid
+                else:
+                    fields["_sid"] = sid
                 payload = self._raw(info["path"], query, method="POST", data=fields, files=files)
             if payload.get("success"):
                 return payload.get("data")

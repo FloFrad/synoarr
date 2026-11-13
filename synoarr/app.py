@@ -41,6 +41,24 @@ def setup_logging(cfg: Config, console: bool = True) -> None:
         root.warning("Impossible d'écrire le journal dans %s : %s", cfg.data_dir, exc)
 
 
+def is_local_url(url: str) -> bool:
+    """Loopback / LAN address (DSM seen from the NAS): such requests must bypass any HTTP proxy."""
+    import ipaddress
+    import urllib.parse
+    try:
+        host = (urllib.parse.urlsplit(url if "://" in url else "http://" + url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host or host == "localhost" or host.endswith((".local", ".lan", ".home", ".localdomain")) \
+            or "." not in host:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
 class IndexerManager:
     """CRUD on indexers (used by the CLI and the web UI)."""
 
@@ -134,7 +152,8 @@ class App:
         os.makedirs(cfg.data_dir, exist_ok=True)
         self.db = Database(os.path.join(cfg.data_dir, "synoarr.db"))
         self.http = HttpClient(timeout=30)
-        self.ds_http = HttpClient(timeout=60, verify_ssl=cfg.downloadstation.verify_ssl)
+        self.ds_http = HttpClient(timeout=60, verify_ssl=cfg.downloadstation.verify_ssl,
+                                  use_proxy=not is_local_url(cfg.downloadstation.url))
         self.indexer_manager = IndexerManager(self.db, self.http)
 
         client_id = self.db.get_kv("plex_client_id")
@@ -162,8 +181,13 @@ class App:
                                    on_imported=_refresh)
         self.searcher = Searcher(cfg, self.db, self.http, self.plex, self.ds,
                                  self.tmdb if self.tmdb.enabled else None, self.indexer_manager.active)
-        self._job_lock = threading.Lock()
+        # One lock per job: a long search (many indexers, slow timeouts) must never delay imports.
+        # Searcher and organizer only share the database (thread-safe) and Download Station (locked).
+        self._watch_lock = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._watch_thread = None  # type: Optional[threading.Thread]
         self._stop = threading.Event()
+        self.searcher.stop_event = self._stop
         self._last: Dict[str, Optional[str]] = {"watchlist": None, "process": None}
         self._errors: List[str] = []
         self.web: Any = None
@@ -190,7 +214,9 @@ class App:
 
     def job_watchlist(self, media_id: Optional[int] = None, force: bool = False) -> None:
         """Sync the Plex Watchlist then search everything that is wanted."""
-        with self._job_lock:
+        with self._watch_lock:
+            if self._stop.is_set():
+                return
             try:
                 if media_id is None:
                     try:
@@ -206,7 +232,7 @@ class App:
                 self._last["watchlist"] = now_iso()
 
     def job_process(self, dry_run: Optional[bool] = None) -> List[Dict[str, Any]]:
-        with self._job_lock:
+        with self._process_lock:
             try:
                 return self.organizer.run_once(dry_run=self.cfg.general.dry_run if dry_run is None else dry_run)
             except Exception as exc:
@@ -216,18 +242,34 @@ class App:
             finally:
                 self._last["process"] = now_iso()
 
-    def _background(self, target: Any, *args: Any) -> None:
-        threading.Thread(target=target, args=args, daemon=True).start()
+    def _background(self, target: Any, *args: Any) -> threading.Thread:
+        t = threading.Thread(target=target, args=args, daemon=True, name="synoarr-job")
+        t.start()
+        return t
 
     # web UI hooks
-    def run_watchlist_now(self) -> None:
+    def run_watchlist_now(self) -> bool:
+        """Start a sync + search in the background. False if one is already running (no queue of clicks)."""
+        if self._watch_lock.locked():
+            return False
         self._background(self.job_watchlist)
+        return True
 
-    def run_process_now(self) -> None:
+    def run_process_now(self) -> bool:
+        if self._process_lock.locked():
+            return False
         self._background(self.job_process)
+        return True
 
     def search_now(self, media_id: int) -> None:
         self._background(self.job_watchlist, int(media_id), True)
+
+    def _start_watchlist_thread(self) -> None:
+        """Daemon loop: the sync/search cycle runs in its own thread so imports keep going meanwhile."""
+        if self._watch_thread is not None and self._watch_thread.is_alive():
+            return
+        self._watch_thread = threading.Thread(target=self.job_watchlist, daemon=True, name="synoarr-watchlist")
+        self._watch_thread.start()
 
     def set_media_status(self, media_id: int, status: str) -> None:
         if status not in ("wanted", "ignored", "monitored", "done"):
@@ -283,17 +325,43 @@ class App:
         next_watch = time.time() + 5
         next_process = time.time() + 2
         while not self._stop.is_set():
-            now = time.time()
-            if now >= next_process:
-                self.job_process()
-                next_process = time.time() + process_every
-            if now >= next_watch:
-                self.job_watchlist()
-                next_watch = time.time() + watch_every
+            try:
+                now = time.time()
+                if now >= next_process:
+                    self.job_process()
+                    next_process = time.time() + process_every
+                if now >= next_watch and not self._stop.is_set():
+                    self._start_watchlist_thread()
+                    next_watch = time.time() + watch_every
+            except Exception as exc:  # pragma: no cover - jobs already catch everything; never die
+                log.exception("Boucle principale : erreur inattendue : %s", exc)
             self._stop.wait(2)
+        self.shutdown()
+
+    def shutdown(self, timeout: float = 60.0) -> None:
+        """Stop the web server, let running jobs finish (a file move is never cut), close the database."""
+        self._stop.set()
         if self.web is not None:
-            self.web.stop()
-        self.db.close()
+            try:
+                self.web.stop()
+            except Exception as exc:  # pragma: no cover
+                log.debug("Arrêt de l'interface web : %s", exc)
+        deadline = time.time() + timeout
+        if self._watch_thread is not None and self._watch_thread.is_alive():
+            log.info("Attente de la fin de la recherche en cours…")
+            self._watch_thread.join(max(0.0, deadline - time.time()))
+        got_watch = self._watch_lock.acquire(timeout=max(0.1, deadline - time.time()))
+        got_process = self._process_lock.acquire(timeout=max(0.1, deadline - time.time()))
+        try:
+            if got_watch and got_process:
+                self.db.close()
+            else:  # a job is still running: closing the database under it would only raise errors
+                log.warning("Arrêt sans attendre la fin du traitement en cours")
+        finally:
+            if got_process:
+                self._process_lock.release()
+            if got_watch:
+                self._watch_lock.release()
         log.info("synoarr arrêté")
 
     def run_once(self) -> None:

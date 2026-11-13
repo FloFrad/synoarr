@@ -10,7 +10,7 @@ from synoarr.indexers import CATALOG, Indexer, create_indexer, detect_type
 from synoarr.indexers.base import parse_categories, parse_size
 from synoarr.indexers.internet_archive import InternetArchiveIndexer
 from synoarr.indexers.rss import RssIndexer
-from synoarr.indexers.torznab import TorznabIndexer, endpoint_candidates
+from synoarr.indexers.torznab import TorznabIndexer, clean_query, endpoint_candidates
 from synoarr.models import SearchRequest
 from tests.fakes import FakeServer
 
@@ -221,6 +221,23 @@ class TorznabTests(unittest.TestCase):
             movie_calls = [c for c in calls if c.get("t") == "movie"]
             self.assertEqual(len(movie_calls), 2)
             self.assertEqual(movie_calls[1]["q"], "Night of the Living Dead 1968")
+
+    def test_unrelated_id_results_fall_back_to_query(self):
+        # a tracker ignoring imdbid answers with its latest releases: the text search must still run
+        with TorznabServer(empty_for=()) as srv:
+            orig = srv.handle
+
+            def handle(req):
+                if req.query.get("t") == "movie" and "imdbid" in req.query:
+                    return 200, XML, torznab_feed([{"title": "Some.Other.Movie.2023.1080p.WEB", "n": 9,
+                                                    "size": 1000, "seeders": 1, "peers": 1, "hash": "c" * 40,
+                                                    "base": srv.url}])
+                return orig(req)
+            srv.server.handler = handle
+            idx = self.make(srv.url + "/api")
+            titles = [r.title for r in idx.search(MOVIE)]
+            self.assertIn("Night.of.the.Living.Dead.1968.1080p.BluRay.x264-GRP", titles)
+            self.assertEqual(len([q for q in srv.requests if q.query.get("t") == "movie"]), 2)
 
     def test_fallback_to_generic_search(self):
         with TorznabServer(empty_for=("movie",)) as srv:
@@ -607,6 +624,13 @@ class DetectAndFactoryTests(unittest.TestCase):
         self.assertEqual(parse_size(None), 0)
         self.assertEqual(parse_categories("2000,abc, 5000,2000"), [2000, 5000])
         self.assertEqual(parse_categories(None), [])
+
+    def test_clean_query(self):
+        self.assertEqual(clean_query("Ocean's Eleven 2001"), "Oceans Eleven 2001")
+        self.assertEqual(clean_query("Les Misérables"), "Les Miserables")
+        self.assertEqual(clean_query("Spider-Man: No Way Home"), "Spider-Man No Way Home")
+        self.assertEqual(clean_query("Fast & Furious"), "Fast and Furious")
+        self.assertEqual(clean_query("The Office (US) S01E02"), "The Office US S01E02")
 
 
 if __name__ == "__main__":

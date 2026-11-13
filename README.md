@@ -32,6 +32,8 @@ cd /volume1/docker && wget -O synoarr.tar.gz https://github.com/VOTRE-COMPTE/syn
 sudo python3 synoarr.py init
 ```
 
+Éditez `config.ini` (identifiants Download Station, chemins des dossiers), puis :
+
 ```bash
 sudo python3 synoarr.py plex-login
 ```

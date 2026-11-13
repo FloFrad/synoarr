@@ -5,10 +5,12 @@ les commandes.
 
 Deux méthodes :
 
-- **Méthode A — native (recommandée, marche sur tous les modèles)** : utilise le Python déjà présent dans DSM 7.
+- **Méthode A — native (recommandée, fonctionne sur tous les modèles)** : utilise le Python déjà présent dans DSM 7.
 - **Méthode B — Docker / Container Manager** : seulement si votre modèle propose Container Manager.
 
 Dans les commandes, remplacez `VOTRE-COMPTE` par votre nom d'utilisateur GitHub.
+
+> Déjà installé ? Allez directement à « Mise à jour » en bas de page.
 
 ---
 
@@ -16,27 +18,33 @@ Dans les commandes, remplacez `VOTRE-COMPTE` par votre nom d'utilisateur GitHub.
 
 1. **Installer Download Station** : Centre de paquets → rechercher « Download Station » → Installer.
 2. **Activer SSH** : Panneau de configuration → Terminal & SNMP → cocher « Activer le service SSH » → Appliquer.
-3. **Créer un utilisateur dédié** (conseillé, car la double authentification bloque l'API) :
+3. **Créer un utilisateur dédié** (conseillé : la validation en 2 étapes bloque l'accès par programme) :
    Panneau de configuration → Utilisateur et groupe → Créer :
-   - Nom : `synoarr`, un mot de passe solide (évitez les espaces suivis de `;` ou `#`).
+   - Nom : `synoarr`, un mot de passe solide.
    - Groupe : `users` suffit.
    - Permissions des dossiers partagés : **Lecture/Écriture** sur `Download` et `Vidéos`.
    - Applications : **Autoriser** Download Station.
-   - Ne pas activer la double authentification pour ce compte.
+   - Ne pas activer la validation en 2 étapes pour ce compte.
 4. **Noter les chemins exacts de vos dossiers** : File Station → clic droit sur le dossier `Download` →
-   Propriétés → « Emplacement » (ex. `/volume1/Download`). Faites de même pour `Vidéos`.
+   Propriétés → « Emplacement » (ex. `/volume1/Download`). Faites de même pour `Vidéos`. Attention aux accents
+   et aux majuscules : `Vidéos` et `Videos` sont deux dossiers différents.
 5. **Créer le dossier d'installation** : si vous n'avez pas de dossier partagé `docker`, créez-le
-   (Panneau de configuration → Dossier partagé → Créer → nom `docker`). Il servira aussi à éditer la config
+   (Panneau de configuration → Dossier partagé → Créer → nom `docker`). Il permet aussi d'éditer la configuration
    depuis File Station.
+6. **Ouvrir le port de l'interface web** (seulement si le pare-feu DSM est activé) :
+   Panneau de configuration → Sécurité → Pare-feu → Modifier les règles → Créer → Ports : Personnalisé → TCP
+   `8778` → OK.
 
 ## Étape 2 — Télécharger synoarr (2 min)
 
-Connectez-vous en SSH depuis votre ordinateur (Terminal sur Mac/Linux, PowerShell sur Windows) avec votre compte
-administrateur DSM :
+Connectez-vous en SSH depuis votre ordinateur (Terminal sur Mac/Linux, PowerShell sur Windows) avec **votre compte
+administrateur DSM** (celui que vous utilisez pour vous connecter à DSM ; le compte `admin` est désactivé par défaut) :
 
 ```bash
-ssh admin@IP-DU-NAS
+ssh VOTRE-ADMIN@IP-DU-NAS
 ```
+
+Le mot de passe ne s'affiche pas pendant la saisie : c'est normal, tapez-le puis Entrée.
 
 Puis :
 
@@ -50,11 +58,12 @@ Vérifiez Python :
 python3 --version
 ```
 
-Il faut **3.8 ou plus**. Si la commande est introuvable : Centre de paquets → installer « Python 3.9 » (ou plus
+Il faut **3.8 ou plus**. Si la commande est introuvable : Centre de paquets → installer « Python 3 » (3.9 ou plus
 récent), puis recommencez.
 
 > Toutes les commandes suivantes se lancent depuis `/volume1/docker/synoarr` **avec `sudo`** (le service tourne
-> en root ; sans `sudo` la base de données ne serait plus modifiable ensuite).
+> en root ; sans `sudo` la base de données ne serait plus modifiable ensuite). `sudo` redemande votre mot de passe
+> administrateur.
 
 ## Étape 3 — Configurer (5 min)
 
@@ -79,11 +88,16 @@ movies_dir = /volume1/Vidéos/Films
 series_dir = /volume1/Vidéos/Séries
 ```
 
-Règle importante : `download_dir` doit être le chemin complet du dossier indiqué dans `destination`
-(`destination = Download` ↔ `download_dir = /volume1/Download`).
+Règles importantes :
 
-Les autres réglages (qualité 1080p puis 720p, langues anglais/français, format des noms façon Plex) ont déjà les
-bonnes valeurs par défaut.
+- `download_dir` est le chemin complet du dossier indiqué dans `destination`
+  (`destination = Download` ↔ `download_dir = /volume1/Download`).
+- Les dossiers partagés (`Download`, `Vidéos`) doivent exister ; les sous-dossiers `Films` et `Séries` sont créés
+  automatiquement.
+- Enregistrez le fichier en UTF-8 (c'est le cas par défaut avec l'Éditeur de texte de DSM).
+
+Les autres réglages ont déjà les bonnes valeurs : qualité 1080p puis 720p, langues anglais ou français
+(MULTI accepté), noms au format Plex.
 
 ## Étape 4 — Connecter Plex (2 min)
 
@@ -111,7 +125,7 @@ Ajouter Internet Archive (films et séries du domaine public) :
 sudo python3 synoarr.py indexer add internet_archive
 ```
 
-Ajouter n'importe quel indexer par son URL (flux **Torznab** ou **RSS**, le type est détecté tout seul) :
+Ajouter n'importe quel indexer par son URL (flux **Torznab** ou **RSS** ; le type est détecté automatiquement) :
 
 ```bash
 sudo python3 synoarr.py indexer add-url "Mon indexer" "https://exemple.org/api" --api-key VOTRE_CLE
@@ -119,22 +133,30 @@ sudo python3 synoarr.py indexer add-url "Mon indexer" "https://exemple.org/api" 
 
 Les indexers se gèrent aussi depuis l'interface web (onglet Indexers).
 
-## Étape 6 — Tout vérifier (1 min)
+## Étape 6 — Tout vérifier (3 min)
 
 ```bash
 sudo python3 synoarr.py check
 ```
 
-Chaque ligne doit commencer par `[OK]`. Sinon, le message indique quoi corriger (voir « Problèmes fréquents »).
+- `[OK]` : bon.
+- `[!]` : facultatif ou simple avertissement (par exemple TMDb sans clé).
+- `[ERR]` : à corriger avant de continuer (voir « Problèmes fréquents »).
 
-Test à blanc, sans rien télécharger ni déplacer :
-
-```bash
-sudo python3 synoarr.py search --dry-run
-```
+**Important — regardez ce qui sera déplacé au premier démarrage.** synoarr range aussi les vidéos déjà présentes
+dans `Download` :
 
 ```bash
 sudo python3 synoarr.py process --dry-run
+```
+
+Si des fichiers personnels apparaissent dans la liste, déplacez-les ailleurs, ou mettez
+`only_known_downloads = true` dans `[paths]` (seuls les téléchargements lancés par synoarr seront alors traités).
+
+Test de recherche, sans rien télécharger :
+
+```bash
+sudo python3 synoarr.py search --dry-run
 ```
 
 ## Étape 7 — Démarrage automatique (3 min)
@@ -147,13 +169,16 @@ Panneau de configuration → **Planificateur de tâches** :
      ```
      sh /volume1/docker/synoarr/scripts/start.sh
      ```
-2. Créer → Tâche planifiée → Script défini par l'utilisateur (redémarre synoarr s'il s'est arrêté).
+2. Créer → Tâche planifiée → Script défini par l'utilisateur (relance synoarr s'il s'est arrêté).
    - Général : nom `synoarr-surveillance`, utilisateur **root**.
-   - Planification : tous les jours, toutes les **10 minutes**.
+   - Planification : tous les jours, de 00:00 à 23:50, toutes les **10 minutes**.
    - Même commande que ci-dessus.
 3. Sélectionnez la tâche `synoarr` → **Exécuter** pour la lancer tout de suite.
 
 Ouvrez l'interface : **http://IP-DU-NAS:8778**
+
+Conseil : protégez l'interface par un mot de passe (`[web] username` et `password` dans `config.ini`, puis
+redémarrez).
 
 Arrêter / redémarrer :
 
@@ -170,16 +195,17 @@ sudo sh scripts/restart.sh
 ## Méthode B — Docker (Container Manager)
 
 1. Faites les étapes 1 et 2 ci-dessus.
-2. Créez le dossier `config` et la configuration :
+2. Préparez le projet :
    ```bash
-   cd /volume1/docker/synoarr && mkdir -p config && cp config.example.ini config/config.ini
+   cd /volume1/docker/synoarr && cp docker-compose.example.yml docker-compose.yml && mkdir -p config && cp config.example.ini config/config.ini
    ```
 3. Éditez `config/config.ini` comme à l'étape 3. Les chemins sont **identiques** en Docker
-   (`/volume1/Download`, `/volume1/Vidéos/...`), grâce aux montages du fichier `docker-compose.yml`. Si vos dossiers
-   ont un autre chemin, modifiez aussi les lignes `volumes:` de `docker-compose.yml`.
-4. Container Manager → Projet → Créer : nom `synoarr`, chemin `/docker/synoarr`, source « Utiliser le
-   docker-compose.yml existant » → Suivant → Terminé. L'image se construit (1 à 2 min) puis démarre.
-5. Connexion Plex et indexers (en SSH) :
+   (`/volume1/Download`, `/volume1/Vidéos/...`) grâce aux montages de `docker-compose.yml`. Si vos dossiers ont un
+   autre chemin, modifiez aussi les lignes `source:` et `target:` de `docker-compose.yml`.
+4. Container Manager → Projet → Créer : nom `synoarr`, chemin `/docker/synoarr`. DSM détecte le
+   `docker-compose.yml` existant : choisissez de l'utiliser → Suivant → Terminé. L'image se construit (1 à 2 min)
+   puis démarre.
+5. Connexion Plex, indexers et vérification (en SSH) :
    ```bash
    sudo docker exec -it synoarr python3 /app/synoarr.py plex-login
    ```
@@ -189,6 +215,11 @@ sudo sh scripts/restart.sh
    ```bash
    sudo docker exec -it synoarr python3 /app/synoarr.py check
    ```
+   ```bash
+   sudo docker exec -it synoarr python3 /app/synoarr.py process --dry-run
+   ```
+
+En Docker, le journal est dans `config/data/synoarr.log`.
 
 ---
 
@@ -197,16 +228,17 @@ sudo sh scripts/restart.sh
 1. Toutes les 15 minutes, synoarr lit votre **Watchlist Plex**.
 2. Pour chaque film ou épisode manquant (déjà présent dans `Vidéos` → ignoré), il interroge vos indexers et choisit
    la meilleure release : 1080p puis 720p, anglais ou français (MULTI accepté), assez de sources, pas de CAM.
-3. Le `.torrent` (ou magnet) est envoyé à **Download Station**, dans le dossier `Download`.
-4. Toutes les 2 minutes, synoarr regarde le dossier `Download` : chaque téléchargement terminé est renommé au
+3. Le `.torrent` (ou le lien magnet) est envoyé à **Download Station**, dans le dossier `Download`.
+4. Toutes les 2 minutes, synoarr regarde le dossier `Download`. Chaque téléchargement terminé est renommé au
    format Plex puis déplacé :
    - `Vidéos/Films/Titre (Année)/Titre (Année).mkv`
    - `Vidéos/Séries/Série/Season 01/Série - S01E02.mkv`
-   La tâche Download Station est ensuite supprimée et Plex rafraîchi (si `server_url` est renseigné).
+   La tâche Download Station est ensuite supprimée, puis Plex est rafraîchi si `server_url` est renseigné.
 5. Un téléchargement en erreur est mis sur liste noire et une autre release est recherchée.
 
-Les fichiers que vous déposez vous-même dans `Download` sont aussi renommés et rangés
-(désactivable : `[paths] only_known_downloads = true`).
+Les vidéos que vous déposez vous-même dans `Download` sont aussi renommées et rangées
+(désactivable : `[paths] only_known_downloads = true`). Les autres fichiers (documents, photos…) ne sont jamais
+supprimés.
 
 ## Commandes utiles
 
@@ -226,22 +258,29 @@ Journal : `data/synoarr.log` (consultable dans File Station).
 
 | Message | Solution |
 |---|---|
-| `Download Station : identifiants refusés` | vérifiez `username` / `password` dans `[downloadstation]` |
-| `... double authentification ...` | utilisez un compte sans 2FA (utilisateur dédié, étape 1.3) |
-| `... API Download Station introuvable` | Download Station n'est pas installé ou pas démarré |
-| `... dossier de destination ...` | `destination` doit être un dossier partagé existant, sans `/` au début |
-| `Dossier ... non accessible en écriture` | lancez la commande avec `sudo`, vérifiez le chemin dans File Station |
+| `Identifiants DSM refusés pour l'utilisateur ...` | vérifiez `username` / `password` dans `[downloadstation]` |
+| `... validation en 2 étapes (2FA) activée ...` | utilisez un compte sans 2FA (utilisateur dédié, étape 1.3) |
+| `API Download Station absente sur le NAS ...` | Download Station n'est pas installé ou pas démarré |
+| `... Vérifiez [downloadstation] destination ...` | `destination` doit être un dossier partagé existant, sans `/` au début |
+| `Dossier partagé ... introuvable` | corrigez le chemin dans `[paths]` (File Station → Propriétés → Emplacement) |
+| `... Relancez la commande avec sudo` | ajoutez `sudo` devant la commande |
 | `Plex : aucun jeton` | `sudo python3 synoarr.py plex-login` |
 | Rien n'est trouvé | `sudo python3 synoarr.py search "Titre Année"` montre pourquoi chaque résultat est rejeté |
-| L'interface web ne s'ouvre pas | port 8778 bloqué par le pare-feu DSM, ou changez `[web] port` |
+| L'interface web ne s'ouvre pas | port 8778 bloqué par le pare-feu (étape 1.6), ou port déjà utilisé : changez `[web] port` |
+| synoarr ne démarre pas | lisez `data/console.log` et `data/synoarr.log` |
 
 ## Mise à jour
 
+Installation native :
+
 ```bash
-cd /volume1/docker/synoarr && sudo sh scripts/stop.sh && wget -O /tmp/s.tar.gz https://github.com/VOTRE-COMPTE/synoarr/archive/refs/heads/main.tar.gz && tar xzf /tmp/s.tar.gz -C /tmp && cp -r /tmp/synoarr-main/. . && rm -rf /tmp/s.tar.gz /tmp/synoarr-main && sudo sh scripts/start.sh
+cd /volume1/docker/synoarr && sudo sh scripts/update.sh VOTRE-COMPTE
 ```
 
-`config.ini` et `data/` ne sont pas écrasés (ils ne font pas partie de l'archive).
+`config.ini` et `data/` sont conservés.
+
+Docker : mettez d'abord les fichiers à jour avec la même commande (elle ne touche ni `config/` ni votre
+`docker-compose.yml`), puis Container Manager → Projet → `synoarr` → Arrêter → Action → Construire → Démarrer.
 
 ## Désinstallation
 

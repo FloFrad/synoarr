@@ -251,6 +251,22 @@ class DownloadStationTest(unittest.TestCase):
         self.assertEqual(req.path, "/webapi/entry.cgi")
         self.assertIn("multipart/form-data", req.headers["content-type"])
 
+    def test_ds2_sid_only_in_query_string(self):
+        # Sonarr's DownloadStationTaskProxyV2: _sid in the query, api/version/method + params in the body
+        self.ds().add_torrent_file(TORRENT, "x.torrent")
+        req = [r for r in self.srv.requests if r.method == "POST" and r.path == "/webapi/entry.cgi"
+               and r.query.get("_sid")][-1]
+        body_fields = {k for k, v in req.multipart.items() if not v[0]}
+        self.assertNotIn("_sid", body_fields)
+        self.assertTrue({"api", "version", "method", "type", "file", "destination", "create_list"} <= body_fields)
+
+    def test_url_without_scheme(self):
+        host = self.srv.url.split("://", 1)[1]
+        ds = DownloadStation(host, "synoarr", self.dsm.password, "Download", HttpClient(timeout=5, retries=0))
+        self.assertTrue(ds.url.startswith("http://"))
+        ok_, msg = ds.test()
+        self.assertTrue(ok_, msg)
+
     def test_add_url_ds2_unicode_destination(self):
         ds = self.ds(destination="Vidéos")
         magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Film+%C3%A9t%C3%A9"

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -12,6 +14,7 @@ from typing import List, Optional
 
 from . import __version__
 from .config import Config, ConfigError, load_config
+from .httpclient import HttpError
 
 log = logging.getLogger("synoarr")
 
@@ -45,7 +48,38 @@ def _load(args: argparse.Namespace) -> Config:
     cfg = load_config(args.config)
     if getattr(args, "dry_run", False):
         cfg.general.dry_run = True
+    for w in getattr(cfg, "warnings", []) or []:
+        _out(WARN + w)
     return cfg
+
+
+def _not_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() != 0
+
+
+def _sudo_hint() -> str:
+    if not _not_root():
+        return ""
+    return ("      Le dossier de données a sans doute été créé par root (démon lancé avec sudo ou tâche "
+            "planifiée DSM en root) : relancez la commande avec sudo, ex. : sudo python3 synoarr.py "
+            + " ".join(sys.argv[1:]))
+
+
+def _check_data_dir(cfg: Config) -> Optional[str]:
+    """None if the data folder and the database are writable, else a French explanation."""
+    d = cfg.data_dir
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, probe = tempfile.mkstemp(prefix=".synoarr-probe-", dir=d)
+        os.close(fd)
+        os.remove(probe)
+    except OSError as exc:
+        return "Dossier de données %s non accessible en écriture (%s)" % (d, exc.strerror or exc)
+    for name in ("synoarr.db", "synoarr.db-wal", "synoarr.db-shm"):
+        path = os.path.join(d, name)
+        if os.path.exists(path) and not os.access(path, os.R_OK | os.W_OK):
+            return "Base de données %s non accessible en écriture" % path
+    return None
 
 
 def _app(args: argparse.Namespace, console: bool = True):  # -> App
@@ -89,6 +123,18 @@ def cmd_check(args: argparse.Namespace) -> int:
         _out(KO + p)
         errors += 1
 
+    # data folder (database, log): the most common first-run problem is a root-owned folder
+    problem = _check_data_dir(cfg)
+    if problem:
+        _out(KO + problem)
+        hint = _sudo_hint()
+        if hint:
+            _out(hint)
+        _out("")
+        _out("Impossible de poursuivre la vérification sans base de données.")
+        return 1
+    _out(OK + "Dossier de données : %s" % cfg.data_dir)
+
     # folders
     pc = cfg.paths
     if os.path.isdir(pc.download_dir) and os.access(pc.download_dir, os.R_OK | os.W_OK):
@@ -130,7 +176,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         _out(KO + "Download Station : [downloadstation] username/password non renseignés")
         errors += 1
     else:
-        ok, msg = app.ds.test()
+        ok, msg = _safe_test(app.ds.test)
         _out((OK if ok else KO) + "Download Station : " + msg)
         errors += 0 if ok else 1
 
@@ -139,7 +185,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         _out(KO + "Plex : aucun jeton. Lancez : python3 synoarr.py plex-login")
         errors += 1
     else:
-        ok, msg = app.plex.test()
+        ok, msg = _safe_test(app.plex.test)
         _out((OK if ok else KO) + "Plex : " + msg)
         errors += 0 if ok else 1
         if ok:
@@ -177,11 +223,27 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _safe_test(func) -> "tuple":
+    try:
+        ok, msg = func()
+        return bool(ok), str(msg)
+    except Exception as exc:  # a test must report, never crash the check
+        return False, "erreur : %s" % exc
+
+
 def cmd_plex_login(args: argparse.Namespace) -> int:
     app = _app(args)
     from .plex import PlexClient
+    if app.cfg.plex.token:
+        _out(WARN + "[plex] token est renseigné dans config.ini : il reste prioritaire sur le jeton obtenu ici. "
+             "Videz cette ligne pour utiliser le nouveau jeton.")
     client = PlexClient("", app.plex_client_id, app.http)
-    pin_id, code = client.start_pin_login()
+    try:
+        pin_id, code = client.start_pin_login()
+    except HttpError as exc:
+        _out(KO + "plex.tv injoignable : %s" % exc)
+        _out("      Vérifiez la connexion Internet du NAS puis relancez la commande.")
+        return 1
     _out("")
     _out("  1. Ouvrez https://plex.tv/link dans un navigateur (connecté à votre compte Plex)")
     _out("  2. Saisissez le code :  %s" % code)
@@ -189,7 +251,11 @@ def cmd_plex_login(args: argparse.Namespace) -> int:
     _out("En attente de la validation (5 minutes max)...")
     deadline = time.time() + 300
     while time.time() < deadline:
-        token = client.check_pin(pin_id)
+        try:
+            token = client.check_pin(pin_id)
+        except HttpError as exc:  # transient network error: keep polling until the deadline
+            log.debug("Vérification du code Plex : %s", exc)
+            token = None
         if token:
             app.save_plex_token(token)
             ok, msg = app.plex.test()
@@ -256,7 +322,7 @@ def cmd_indexer(args: argparse.Namespace) -> int:
 def cmd_watchlist(args: argparse.Namespace) -> int:
     app = _app(args)
     if not args.no_sync:
-        app.searcher.sync_watchlist()
+        _sync(app)
     for m in app.db.list_media():
         extra = ""
         if m["type"] == "show":
@@ -269,6 +335,13 @@ def cmd_watchlist(args: argparse.Namespace) -> int:
             m["id"], "film" if m["type"] == "movie" else "série", m["title"][:40], m["year"] or "",
             m["status"], "" if m["on_watchlist"] else " (retiré)", extra))
     return 0
+
+
+def _sync(app) -> None:
+    try:
+        app.searcher.sync_watchlist()
+    except HttpError as exc:
+        _out(WARN + "Watchlist Plex illisible (%s) : affichage des données déjà connues" % exc)
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -293,7 +366,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 "?" if rel.seeders is None else rel.seeders, rel.indexer[:16], reason))
         return 0
     if not args.no_sync:
-        app.searcher.sync_watchlist()
+        _sync(app)
     stats = app.searcher.run_once(media_id=args.media, force=args.force)
     _out("%d recherche(s), %d envoi(s) vers Download Station" % (stats["searched"], stats["grabbed"]))
     return 0
@@ -400,3 +473,50 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except SystemExit:
+        raise
+    except Exception as exc:  # never a traceback for the user: a French explanation + hint
+        return _report_error(exc, args)
+
+
+def _report_error(exc: BaseException, args: argparse.Namespace) -> int:
+    from .downloadstation import DownloadStationError
+    log.debug("Détail de l'erreur", exc_info=True)
+    text = str(exc)
+    low = text.lower()
+    if isinstance(exc, sqlite3.Error):
+        if any(k in low for k in ("readonly", "read-only", "unable to open", "permission", "disk i/o")):
+            _out(KO + "Base de données de synoarr non accessible en écriture (%s)." % text)
+            hint = _sudo_hint()
+            _out(hint or "      Vérifiez les droits du dossier de données ([general] data_dir).")
+        elif "locked" in low:
+            _out(KO + "Base de données occupée par un autre processus synoarr (%s). Réessayez dans un instant."
+                 % text)
+        elif "malformed" in low or "not a database" in low:
+            _out(KO + "Base de données endommagée (%s). Arrêtez synoarr et renommez data/synoarr.db pour "
+                 "repartir de zéro (les indexers et la Watchlist seront à recréer)." % text)
+        else:
+            _out(KO + "Erreur de base de données : %s" % text)
+        return 1
+    if isinstance(exc, PermissionError) or (isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EPERM,
+                                                                                          errno.EROFS)):
+        _out(KO + "Permission refusée : %s" % exc)
+        _out(_sudo_hint() or "      Vérifiez les droits des dossiers configurés.")
+        return 1
+    if isinstance(exc, DownloadStationError):
+        _out(KO + "Download Station : %s" % text)
+        return 1
+    if isinstance(exc, HttpError):
+        _out(KO + "Erreur réseau : %s" % text)
+        _out("      Vérifiez la connexion du NAS et les adresses dans config.ini (python3 synoarr.py check).")
+        return 1
+    if isinstance(exc, OSError):
+        _out(KO + "Erreur système : %s" % exc)
+        return 1
+    _out(KO + "Erreur inattendue : %s: %s" % (type(exc).__name__, text))
+    if getattr(args, "verbose", False):
+        import traceback
+        traceback.print_exc()
+    else:
+        _out("      Relancez avec --verbose pour le détail technique (à joindre à un rapport de bug).")
+    return 1

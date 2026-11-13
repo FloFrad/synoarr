@@ -1,0 +1,29 @@
+# Projet pour Container Manager (DSM 7.2+) ou « docker compose ».
+# Copiez ce fichier en docker-compose.yml (cp docker-compose.example.yml docker-compose.yml)
+# et adaptez les chemins des dossiers si besoin : votre copie n'est jamais écrasée par une mise à jour.
+# Les dossiers sont montés AU MÊME CHEMIN que sur le NAS : config.ini est identique en natif et en Docker.
+services:
+  synoarr:
+    build: .
+    image: synoarr:latest
+    container_name: synoarr
+    restart: unless-stopped
+    # réseau de l'hôte : Download Station reste joignable sur 127.0.0.1:5000
+    network_mode: host
+    environment:
+      - TZ=Europe/Paris
+      - SYNOARR_CONFIG=/config/config.ini
+    volumes:
+      # config.ini + data/ (créé automatiquement au premier démarrage)
+      - ./config:/config
+      # dossiers partagés : la source doit EXISTER (vérifiez dans File Station > Propriétés > Emplacement)
+      - type: bind
+        source: /volume1/Download
+        target: /volume1/Download
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /volume1/Vidéos
+        target: /volume1/Vidéos
+        bind:
+          create_host_path: false

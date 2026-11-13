@@ -9,6 +9,7 @@ import unittest
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
+from synoarr import db as db_mod
 from synoarr import organizer as organizer_mod
 from synoarr.config import Config
 from synoarr.db import Database
@@ -79,6 +80,10 @@ class OrganizerTestBase(unittest.TestCase):
         o.min_video_size = 0
         return o
 
+    def grab(self, name: str, media_id: Optional[int] = None) -> int:
+        """Record *name* as a download sent by synoarr (only those leftover folders may be deleted)."""
+        return self.db.add_grab(media_id, None, None, name, name, "idx", None, 1000)
+
     def make(self, rel: str, size: int = 1000, fill: bytes = b"v", base: Optional[str] = None) -> str:
         path = os.path.join(base or self.dl, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -117,6 +122,7 @@ class MovieTests(OrganizerTestBase):
         self.make(entry + "/Subs/2_English.srt", 10)
         self.make(entry + "/Subs/3_French.srt", 11)
         self.make(entry + "/Subs/4_French.forced.srt", 12)
+        self.grab(entry)
         o = self.org()
         o.min_video_size = 1000
         actions = o.run_once()
@@ -194,6 +200,7 @@ class MovieTests(OrganizerTestBase):
     def test_multi_part_movie(self) -> None:
         self.make("Old.Movie.1980/Old.Movie.1980.CD1.avi", 2000)
         self.make("Old.Movie.1980/Old.Movie.1980.CD2.avi", 1900)
+        self.grab("Old.Movie.1980")
         self.org().run_once()
         self.assertTrue(os.path.isfile(self.movie_path("Old Movie (1980)", "Old Movie (1980) - pt1.avi")))
         self.assertTrue(os.path.isfile(self.movie_path("Old Movie (1980)", "Old Movie (1980) - pt2.avi")))
@@ -244,7 +251,8 @@ class GrabMetadataTests(OrganizerTestBase):
         self.assertTrue(os.path.isfile(self.series_path("The Office (US)", "Season 02",
                                                         "The Office (US) - S02E02 - Ep 2.mkv")))
         statuses = {e["episode"]: e["status"] for e in self.db.list_episodes(mid)}
-        self.assertEqual(statuses, {1: "done", 2: "done", 3: "grabbed"})
+        # E03 was not in the season pack: back to "wanted" so that the searcher looks for it again
+        self.assertEqual(statuses, {1: "done", 2: "done", 3: "wanted"})
         self.assertEqual(self.db.query_one("SELECT status FROM grabs WHERE id = ?", (gid,))["status"], "imported")
 
     def test_single_episode_grab_with_obfuscated_file_name(self) -> None:
@@ -275,6 +283,7 @@ class SeriesTests(OrganizerTestBase):
         self.make(entry + "/Season 1/Breaking.Bad.S01E03E04.1080p.BluRay.mkv")
         self.make(entry + "/Season 1/Breaking.Bad.S01E02.1080p.BluRay.en.srt", 5)
         self.make(entry + "/Breaking.Bad.S01.nfo", 5)
+        self.grab(entry)
         actions = self.org().run_once()
         season = self.series_path("Breaking Bad", "Season 01")
         self.assertEqual(sorted(os.listdir(season)), [
@@ -585,8 +594,67 @@ class LeftoverTests(OrganizerTestBase):
         self.make("Movie.2010/Movie.2010.mkv")
         self.make("Movie.2010/Extras/poster.jpg", 5)
         self.make("Movie.2010/Movie.2010.nfo", 5)
+        self.grab("Movie.2010")
         self.org().run_once()
         self.assertFalse(os.path.exists(os.path.join(self.dl, "Movie.2010")))
+
+    def test_unknown_folder_is_never_deleted(self) -> None:
+        # QA case: a personal folder dropped in Download must keep its other files
+        self.make("My Holiday 2019/clip.mp4", 3000)
+        self.make("My Holiday 2019/taxes.pdf", 10)
+        self.make("My Holiday 2019/notes.nfo", 10)
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, "My Holiday 2019", "taxes.pdf")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, "My Holiday 2019", "notes.nfo")))
+
+    def test_grabbed_folder_with_non_junk_file_is_kept(self) -> None:
+        self.make("Movie.2010/Movie.2010.mkv")
+        self.make("Movie.2010/Movie.2010.nfo", 5)
+        self.make("Movie.2010/bonus.pdf", 5)
+        self.grab("Movie.2010")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("Movie (2010)", "Movie (2010).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, "Movie.2010", "bonus.pdf")))
+
+    def test_trailers_and_extras_are_not_the_movie(self) -> None:
+        self.make("Trailer.Pack.2020/Big.Movie.2020.Trailer.1080p.mkv", 3000)
+        actions = self.org().run_once()
+        self.assertFalse(os.path.exists(self.movies), actions)
+        self.make("Big.Movie.2020.1080p/Big.Movie.2020.1080p.mkv", 2000)
+        self.make("Big.Movie.2020.1080p/Featurettes/Making.Of.mkv", 3000)
+        self.org().run_once()
+        self.assertEqual(os.listdir(self.movie_path("Big Movie (2020)")), ["Big Movie (2020).mkv"])
+        self.make("Trailer.Park.Boys.S01E01.mkv")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.series_path("Trailer Park Boys", "Season 01",
+                                                        "Trailer Park Boys - S01E01.mkv")))
+
+    def test_missing_share_is_never_created(self) -> None:
+        from unittest import mock
+        self.make("Movie.2010/Movie.2010.mkv")
+        with mock.patch.object(organizer_mod, "missing_share_root", return_value="/volume1/Videos"):
+            actions = self.org().run_once()
+        self.assertEqual([a["status"] for a in actions], ["error"])
+        self.assertIn("/volume1/Videos", actions[0]["message"])
+        self.assertFalse(os.path.exists(self.movies))
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, "Movie.2010", "Movie.2010.mkv")))
+
+    def test_movie_named_sample_extra_not_treated_as_junk(self) -> None:
+        self.make("The.Sample.2020.1080p/The.Sample.2020.1080p.mkv", 3000)
+        self.make("The.Sample.2020.1080p/The.Sample.2020.Extras.mkv", 2000)
+        self.make("The.Sample.2020.1080p/Sample/the.sample.2020.sample.mkv", 10)
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("The Sample (2020)", "The Sample (2020).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, "The.Sample.2020.1080p", "The.Sample.2020.Extras.mkv")))
+
+    def test_sample_word_in_download_dir_path_is_harmless(self) -> None:
+        self.dl = os.path.join(self.tmp, "sample")
+        os.makedirs(self.dl)
+        self.cfg.paths.download_dir = self.dl
+        self.make("Movie.2010/Movie.2010.mkv", 3000)
+        self.make("Movie.2010/Bonus.mkv", 2000)
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, "Movie.2010", "Bonus.mkv")))
 
     def test_leftovers_kept_when_video_in_subfolder(self) -> None:
         self.make("Movie.2010/Movie.2010.mkv", 3000)
@@ -625,3 +693,88 @@ class NamingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixesTests(OrganizerTestBase):
+    """Interplay with the searcher: grab association, failed downloads, DS down, concurrency."""
+
+    def test_failed_grab_is_never_imported(self) -> None:
+        mid = self.db.upsert_media("plex://movie/9", "movie", "Dune", 2021, None, None, None)
+        name = "Dune.2021.1080p.WEB-DL.x264-GRP"
+        gid = self.db.add_grab(mid, None, None, name, name, "idx", None, 1000)
+        self.db.set_grab_status(gid, "failed", "broken")
+        self.make(name + "/Dune.2021.1080p.mkv")
+        actions = self.org().run_once()
+        self.assertEqual(self.by_status(actions, "imported"), [])
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, name, "Dune.2021.1080p.mkv")))
+        self.assertEqual(self.db.get_media(mid)["status"], "wanted")
+
+    def test_ds_down_keeps_our_downloads_but_imports_manual_ones(self) -> None:
+        name = "Dune.2021.1080p.WEB-DL.x264-GRP"
+        self.db.add_grab(None, None, None, name, name, "idx", None, 1000)
+        self.make(name + "/Dune.2021.1080p.mkv")
+        self.make("Heat.1995.1080p.BluRay.mkv")
+        actions = self.org(ds=FakeDS(fail=True)).run_once()
+        self.assertTrue(os.path.isfile(os.path.join(self.dl, name, "Dune.2021.1080p.mkv")))
+        self.assertTrue(os.path.isfile(self.movie_path("Heat (1995)", "Heat (1995).mkv")), actions)
+
+    def test_magnet_grab_without_dn_is_associated_by_parsing(self) -> None:
+        mid = self.db.upsert_media("plex://show/7", "show", "Le Bureau des Légendes", 2015, None, None, None)
+        self.db.upsert_episode(mid, 5, 3, "Titre", None, status="grabbed")
+        # indexer title != torrent name (magnet without dn: torrent_name falls back to the release title)
+        gid = self.db.add_grab(mid, 5, 3, "Le Bureau des Legendes S05E03 FRENCH 1080p",
+                               "Le Bureau des Legendes S05E03 FRENCH 1080p", "idx", "ab" * 20, 1000)
+        self.make("Le.Bureau.des.Legendes.S05E03.FRENCH.1080p.WEB.H264-FRATERNiTY.mkv")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.series_path("Le Bureau des Légendes", "Season 05",
+                                                        "Le Bureau des Légendes - S05E03.mkv")))
+        self.assertEqual(self.db.get_episode(mid, 5, 3)["status"], "done")
+        self.assertEqual(self.db.query_one("SELECT status FROM grabs WHERE id = ?", (gid,))["status"], "imported")
+
+    def test_guess_does_not_take_a_pack_grab_for_an_episode(self) -> None:
+        mid = self.db.upsert_media("plex://show/7", "show", "Lupin", 2021, None, None, None)
+        gid = self.db.add_grab(mid, 1, None, "Lupin S01 pack", "Lupin S01 pack", "idx", None, 1000)
+        org = self.org()
+        self.assertIsNone(org._guess_grab("Lupin.S01E02.1080p.mkv", False))
+        self.assertEqual(org._guess_grab("Lupin.S01.FRENCH.1080p.WEB", True)["id"], gid)
+
+    def test_manual_download_uses_watchlist_title_and_marks_done(self) -> None:
+        mid = self.db.upsert_media("plex://movie/3", "movie", "L'Arme fatale", 1987, None, None, None)
+        self.make("L.Arme.Fatale.1987.FRENCH.1080p.BluRay.mkv")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("L'Arme fatale (1987)", "L'Arme fatale (1987).mkv")),
+                        os.listdir(self.movies))
+        self.assertEqual(self.db.get_media(mid)["status"], "done")
+
+    def test_manual_download_ambiguous_title_is_not_associated(self) -> None:
+        self.db.upsert_media("plex://movie/1", "movie", "Dune", 1984, None, None, None)
+        self.db.upsert_media("plex://movie/2", "movie", "Dune", 2021, None, None, None)
+        self.make("Dune.1080p.mkv")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("Dune", "Dune.mkv")), os.listdir(self.movies))
+        self.assertEqual({m["status"] for m in self.db.list_media()}, {"wanted"})
+
+    def test_nfd_entry_name_matches_nfc_grab(self) -> None:
+        import unicodedata
+        mid = self.db.upsert_media("plex://movie/4", "movie", "Amélie", 2001, None, None, None)
+        nfc = "Amélie.2001.1080p.BluRay"
+        self.db.add_grab(mid, None, None, nfc, nfc, "idx", None, 1000)
+        self.make(unicodedata.normalize("NFD", nfc) + "/movie.mkv")
+        self.org().run_once()
+        self.assertEqual(self.db.get_media(mid)["status"], "done")
+
+    def test_second_organizer_is_locked_out(self) -> None:
+        if db_mod._fcntl is None:  # pragma: no cover
+            self.skipTest("fcntl indisponible")
+        os.makedirs(self.cfg.data_dir)
+        self.make("Heat.1995.1080p.BluRay.mkv")
+        first = self.org()
+        fd = first._lock()
+        self.assertNotIn(fd, (None, False))
+        try:
+            self.assertEqual(self.org().run_once(), [])
+            self.assertTrue(os.path.isfile(os.path.join(self.dl, "Heat.1995.1080p.BluRay.mkv")))
+        finally:
+            os.close(fd)
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(self.movie_path("Heat (1995)", "Heat (1995).mkv")))

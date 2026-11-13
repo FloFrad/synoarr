@@ -1,0 +1,406 @@
+"""Unit tests of the Sonarr/Radarr-like logic of searcher.py, with fake Plex, Download Station and indexers."""
+from __future__ import annotations
+
+import datetime as _dt
+import os
+import shutil
+import tempfile
+import threading
+import unittest
+from typing import Any, Dict, List, Optional
+
+from synoarr.bencode import bencode, torrent_info
+from synoarr.config import Config
+from synoarr.db import Database
+from synoarr.downloadstation import DownloadStationError
+from synoarr.httpclient import HttpError, Response
+from synoarr.models import DSTask, EpisodeInfo, Release, WatchItem
+from synoarr.searcher import Searcher
+
+GiB = 1024 ** 3
+TODAY = _dt.date.today()
+
+
+def day(offset: int) -> str:
+    return (TODAY + _dt.timedelta(days=offset)).isoformat()
+
+
+def torrent(name: str) -> bytes:
+    info = {b"name": name.encode("utf-8"), b"piece length": 16384, b"pieces": b"\0" * 20, b"length": 1000}
+    return bencode({b"announce": b"http://tracker.invalid/announce", b"info": info})
+
+
+class FakePlex:
+    def __init__(self) -> None:
+        self.items = []  # type: List[WatchItem]
+        self.episodes = {}  # type: Dict[str, List[EpisodeInfo]]
+        self.fail = False
+
+    def watchlist(self) -> List[WatchItem]:
+        if self.fail:
+            raise HttpError("plex down", None)
+        return list(self.items)
+
+    def get_guids(self, key: str) -> Dict[str, str]:
+        return {}
+
+    def show_episodes(self, key: str) -> List[EpisodeInfo]:
+        return list(self.episodes.get(key, []))
+
+
+class FakeDS:
+    def __init__(self) -> None:
+        self.added = []  # type: List[str]
+        self.tasks = []  # type: List[DSTask]
+        self.deleted = []  # type: List[str]
+        self.fail_add = None  # type: Optional[Exception]
+
+    def add_torrent_file(self, data: bytes, filename: str) -> None:
+        if self.fail_add:
+            raise self.fail_add
+        name, _ = torrent_info(data)
+        self.added.append(name)
+        self.tasks.append(DSTask(id="t%d" % len(self.tasks), title=name, status="downloading"))
+
+    def add_url(self, url: str) -> None:
+        if self.fail_add:
+            raise self.fail_add
+        self.added.append(url)
+
+    def list_tasks(self) -> List[DSTask]:
+        return list(self.tasks)
+
+    def delete_task(self, task_id: str) -> None:
+        self.deleted.append(task_id)
+        self.tasks = [t for t in self.tasks if t.id != task_id]
+
+
+class FakeHttp:
+    """Serves the .torrent of every release; status overrides per URL."""
+
+    def __init__(self) -> None:
+        self.status = {}  # type: Dict[str, int]
+        self.names = {}  # type: Dict[str, str]
+
+    def get(self, url: str, **kw: Any) -> Response:
+        status = self.status.get(url, 200)
+        if status != 200:
+            return Response(status, {}, b"error", url)
+        name = self.names.get(url) or url.rsplit("/", 1)[-1][:-len(".torrent")]
+        return Response(200, {"content-type": "application/x-bittorrent"}, torrent(name), url)
+
+
+class FakeIndexer:
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.releases = []  # type: List[Release]
+        self.requests = []  # type: List[Any]
+
+    def add(self, title: str, size: float = 2.0, seeders: int = 20, info_hash: Optional[str] = None) -> Release:
+        r = Release(title=title, indexer=self.name, download_url="http://idx/dl/%s.torrent" % title,
+                    size=int(size * GiB), seeders=seeders, info_hash=info_hash)
+        self.releases.append(r)
+        return r
+
+    def search(self, req: Any) -> List[Release]:
+        self.requests.append(req)
+        return list(self.releases)
+
+
+class SearcherTestBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="synoarr-search-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = Config()
+        self.cfg.paths.movies_dir = os.path.join(self.tmp, "Films")
+        self.cfg.paths.series_dir = os.path.join(self.tmp, "Séries")
+        os.makedirs(self.cfg.paths.movies_dir)
+        os.makedirs(self.cfg.paths.series_dir)
+        self.db = Database(":memory:")
+        self.addCleanup(self.db.close)
+        self.plex = FakePlex()
+        self.ds = FakeDS()
+        self.http = FakeHttp()
+        self.idx = FakeIndexer()
+        self.searcher = Searcher(self.cfg, self.db, self.http, self.plex, self.ds, None,  # type: ignore[arg-type]
+                                 lambda: [self.idx])
+
+    def movie(self, key: str = "m1", title: str = "Heat", year: int = 1995) -> WatchItem:
+        item = WatchItem(rating_key=key, type="movie", title=title, year=year)
+        self.plex.items.append(item)
+        return item
+
+    def show(self, key: str = "s1", title: str = "Lupin", year: int = 2021,
+             episodes: Optional[List[EpisodeInfo]] = None) -> WatchItem:
+        item = WatchItem(rating_key=key, type="show", title=title, year=year)
+        self.plex.items.append(item)
+        self.plex.episodes[key] = episodes or []
+        return item
+
+    def media(self, key: str) -> Dict[str, Any]:
+        m = self.db.get_media_by_key(key)
+        assert m is not None
+        return m
+
+    def statuses(self, key: str) -> Dict[Any, str]:
+        return {(e["season"], e["episode"]): e["status"] for e in self.db.list_episodes(self.media(key)["id"])}
+
+    def touch(self, rel: str) -> None:
+        path = os.path.join(self.tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"x")
+
+
+class WatchlistSyncTests(SearcherTestBase):
+    def test_new_removed_and_readded_items(self) -> None:
+        self.movie()
+        self.assertEqual(self.searcher.sync_watchlist(), 1)
+        self.assertEqual(self.media("m1")["status"], "wanted")
+        self.plex.items = []
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["on_watchlist"], 0)
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.assertEqual(self.searcher.run_once()["searched"], 0)  # removed from the watchlist: not searched
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["on_watchlist"], 1)
+        self.assertEqual(self.searcher.run_once()["grabbed"], 1)
+
+    def test_plex_down_keeps_the_watchlist(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.plex.fail = True
+        with self.assertRaises(HttpError):
+            self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["on_watchlist"], 1)
+
+    def test_movie_already_in_library(self) -> None:
+        self.touch("Films/Heat.nfo")  # a stray file listed first must not hide the folder
+        self.touch("Films/Heat (1995)/Heat (1995).mkv")
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["status"], "done")
+
+    def test_movie_with_same_title_other_year_is_not_in_library(self) -> None:
+        self.touch("Films/Dune (1984)/Dune (1984).mkv")
+        self.movie(title="Dune", year=2021)
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.media("m1")["status"], "wanted")
+
+    def test_monitor_all_and_library_detection(self) -> None:
+        self.touch("Séries/Lupin/Season 01/Lupin - S01E01.mkv")
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-400)), EpisodeInfo(1, 2, "b", day(-393)),
+                            EpisodeInfo(2, 1, "c", day(-10)), EpisodeInfo(0, 1, "special", day(-5))])
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.statuses("s1"), {(1, 1): "done", (1, 2): "wanted", (2, 1): "wanted"})
+
+    def test_monitor_future(self) -> None:
+        self.cfg.series.monitor = "future"
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-400)), EpisodeInfo(1, 2, "b", day(5))])
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.statuses("s1"), {(1, 1): "skipped", (1, 2): "wanted"})
+        # later, new episodes appear in the metadata: they are wanted
+        self.plex.episodes["s1"].append(EpisodeInfo(2, 1, "c", day(30)))
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.statuses("s1")[(2, 1)], "wanted")
+        self.assertEqual(self.statuses("s1")[(1, 1)], "skipped")
+
+    def test_monitor_latest_season(self) -> None:
+        self.cfg.series.monitor = "latest_season"
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-400)), EpisodeInfo(2, 1, "b", day(-3)),
+                            EpisodeInfo(3, 1, "c", day(60))])
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.statuses("s1"), {(1, 1): "skipped", (2, 1): "wanted", (3, 1): "wanted"})
+
+    def test_new_episode_covered_by_an_active_pack_grab(self) -> None:
+        self.show(episodes=[])
+        self.searcher.sync_watchlist()
+        mid = self.media("s1")["id"]
+        self.db.add_grab(mid, 1, None, "Lupin.S01.1080p", "Lupin.S01.1080p", "fake", None, 1)
+        self.plex.episodes["s1"] = [EpisodeInfo(1, 1, "a", day(-400)), EpisodeInfo(2, 1, "b", day(-3))]
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.statuses("s1"), {(1, 1): "grabbed", (2, 1): "wanted"})
+
+
+class SearchTests(SearcherTestBase):
+    def test_movie_grab_then_research_interval(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.idx.add("Heat.1995.720p.BluRay.x264-LOW")
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.assertEqual(self.searcher.run_once(), {"searched": 1, "grabbed": 1})
+        self.assertEqual(self.ds.added, ["Heat.1995.1080p.BluRay.x264-GRP"])
+        self.assertEqual(self.media("m1")["status"], "grabbed")
+        self.assertEqual(self.searcher.run_once()["searched"], 0)
+
+    def test_nothing_found_waits_for_research_interval(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.assertEqual(self.searcher.run_once(), {"searched": 1, "grabbed": 0})
+        self.assertEqual(self.searcher.run_once()["searched"], 0)
+        self.assertEqual(self.searcher.run_once(force=True)["searched"], 1)
+
+    def test_season_pack_when_season_complete_else_episodes(self) -> None:
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-30)), EpisodeInfo(1, 2, "b", day(-23)),
+                            EpisodeInfo(2, 1, "c", day(-2)), EpisodeInfo(2, 2, "d", day(5))])
+        self.searcher.sync_watchlist()
+        self.idx.add("Lupin.S01.FRENCH.1080p.WEB.x264-GRP", size=8)
+        self.idx.add("Lupin.S02E01.FRENCH.1080p.WEB.x264-GRP", size=1)
+        self.idx.add("Lupin.S02E02.FRENCH.1080p.WEB.x264-GRP", size=1)  # not aired yet: never grabbed
+        self.searcher.run_once()
+        self.assertEqual(sorted(self.ds.added), ["Lupin.S01.FRENCH.1080p.WEB.x264-GRP",
+                                                 "Lupin.S02E01.FRENCH.1080p.WEB.x264-GRP"])
+        self.assertEqual(self.statuses("s1"), {(1, 1): "grabbed", (1, 2): "grabbed", (2, 1): "grabbed",
+                                               (2, 2): "wanted"})
+        grabs = {(g["season"], g["episode"]) for g in self.db.list_grabs()}
+        self.assertEqual(grabs, {(1, None), (2, 1)})
+
+    def test_multi_episode_release_covers_both_episodes(self) -> None:
+        self.cfg.series.season_packs = False
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-30)), EpisodeInfo(1, 2, "b", day(-30))])
+        self.searcher.sync_watchlist()
+        self.idx.add("Lupin.S01E01E02.1080p.WEB.x264-GRP", size=2)
+        self.searcher.run_once()
+        self.assertEqual(self.ds.added, ["Lupin.S01E01E02.1080p.WEB.x264-GRP"])
+        self.assertEqual(self.statuses("s1"), {(1, 1): "grabbed", (1, 2): "grabbed"})
+
+    def test_already_grabbed_release_is_not_grabbed_again(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        best = self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.idx.add("Heat.1995.720p.BluRay.x264-LOW")
+        mid = self.media("m1")["id"]
+        self.db.add_grab(mid, None, None, best.title, best.title, "fake", None, 1)  # imported earlier
+        self.searcher.run_once()
+        self.assertEqual(self.ds.added, ["Heat.1995.720p.BluRay.x264-LOW"])
+
+    def test_same_info_hash_under_another_title_is_not_sent(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        mid = self.media("m1")["id"]
+        _, info_hash = torrent_info(torrent("Heat.1995.1080p.BluRay.x264-GRP"))
+        self.db.add_grab(mid, None, None, "Heat 1995 1080p (autre indexer)", "x", "other", info_hash, 1)
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")  # no info hash in the indexer answer
+        self.searcher.run_once()
+        self.assertEqual(self.ds.added, [])
+        self.assertFalse(self.db.is_blocked("Heat.1995.1080p.BluRay.x264-GRP"))
+
+    def test_failed_download_is_blocklisted_and_replaced(self) -> None:
+        self.cfg.series.season_packs = False
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-30))])
+        self.searcher.sync_watchlist()
+        self.idx.add("Lupin.S01E01.1080p.WEB.x264-GRP", seeders=50)
+        self.idx.add("Lupin.S01E01.720p.WEB.x264-OTHER", seeders=5)
+        self.searcher.run_once()
+        self.assertEqual(self.ds.added, ["Lupin.S01E01.1080p.WEB.x264-GRP"])
+        self.ds.tasks[0].status = "error"
+        self.ds.tasks[0].error = "broken_link"
+        self.searcher.run_once()
+        self.assertTrue(self.db.is_blocked("Lupin.S01E01.1080p.WEB.x264-GRP"))
+        self.assertEqual(self.ds.deleted, ["t0"])
+        self.assertEqual(self.ds.added[-1], "Lupin.S01E01.720p.WEB.x264-OTHER")
+        self.assertEqual(self.statuses("s1"), {(1, 1): "grabbed"})
+        statuses = sorted(g["status"] for g in self.db.list_grabs())
+        self.assertEqual(statuses, ["failed", "sent"])
+
+    def test_failed_pack_keeps_episodes_of_other_active_grabs(self) -> None:
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-30)), EpisodeInfo(1, 2, "b", day(-30))])
+        self.searcher.sync_watchlist()
+        mid = self.media("s1")["id"]
+        self.db.set_episode_status(mid, 1, None, "grabbed")
+        self.db.add_grab(mid, 1, 1, "Lupin.S01E01.1080p", "Lupin.S01E01.1080p", "fake", None, 1)
+        self.db.add_grab(mid, 1, None, "Lupin.S01.1080p", "Lupin.S01.1080p", "fake", None, 1)
+        self.ds.tasks = [DSTask("a", "Lupin.S01E01.1080p", "downloading"), DSTask("b", "Lupin.S01.1080p", "error")]
+        self.searcher.check_failed_downloads()
+        self.assertEqual(self.statuses("s1"), {(1, 1): "grabbed", (1, 2): "wanted"})
+
+    def test_download_station_errors_do_not_blocklist(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        rel = self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.ds.fail_add = DownloadStationError("Dossier de destination introuvable", 403)
+        self.searcher.run_once()
+        self.assertFalse(self.db.is_blocked(rel.title))
+        self.assertEqual(self.media("m1")["status"], "wanted")
+        self.ds.fail_add = None
+        self.http.status[rel.download_url] = 429  # indexer rate limit: temporary
+        self.searcher.run_once(force=True)
+        self.assertFalse(self.db.is_blocked(rel.title))
+        self.http.status[rel.download_url] = 404  # dead link: blocklisted
+        self.searcher.run_once(force=True)
+        self.assertTrue(self.db.is_blocked(rel.title))
+
+    def test_discovery_mode_without_episode_list(self) -> None:
+        self.show(episodes=[])
+        self.searcher.sync_watchlist()
+        self.idx.add("Lupin.S01-S03.MULTi.1080p.WEB.x264-GRP", size=20)
+        self.idx.add("Lupin.S02.MULTi.1080p.WEB.x264-GRP", size=8)
+        self.idx.add("Lupin.S04.MULTi.1080p.WEB.x264-GRP", size=8)
+        self.searcher.run_once()
+        self.assertEqual(sorted(self.ds.added), ["Lupin.S01-S03.MULTi.1080p.WEB.x264-GRP",
+                                                 "Lupin.S04.MULTi.1080p.WEB.x264-GRP"])
+        self.searcher.run_once(force=True)  # nothing new
+        self.assertEqual(len(self.ds.added), 2)
+
+    def test_dry_run_sends_nothing(self) -> None:
+        self.cfg.general.dry_run = True
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.searcher.run_once()
+        self.assertEqual(self.ds.added, [])
+        self.assertEqual(self.media("m1")["status"], "wanted")
+
+    def test_dry_run_does_not_delay_real_searches(self) -> None:
+        self.cfg.general.dry_run = True
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-30))])
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.searcher.run_once()
+        self.assertIsNone(self.media("m1")["last_search_at"])
+        self.assertEqual({e["last_search_at"] for e in self.db.list_episodes(self.media("s1")["id"])}, {None})
+        self.cfg.general.dry_run = False
+        self.assertEqual(self.searcher.run_once()["searched"], 2)
+
+    def test_concurrent_search_process_is_locked_out(self) -> None:
+        from synoarr import db as db_mod
+        if db_mod._fcntl is None:  # pragma: no cover
+            self.skipTest("fcntl indisponible")
+        self.cfg.general.data_dir = self.tmp
+        self.movie()
+        self.searcher.sync_watchlist()
+        fd = db_mod.try_file_lock(self.tmp, "search.lock")
+        try:
+            self.assertEqual(self.searcher.run_once()["searched"], 0)
+        finally:
+            db_mod.release_file_lock(fd)
+        self.assertEqual(self.searcher.run_once()["searched"], 1)
+
+    def test_stop_event_interrupts_the_cycle(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.searcher.stop_event = threading.Event()
+        self.searcher.stop_event.set()
+        self.assertEqual(self.searcher.run_once()["searched"], 0)
+
+    def test_grabbed_status_does_not_overwrite_done(self) -> None:
+        self.movie()
+        self.searcher.sync_watchlist()
+        mid = self.media("m1")["id"]
+        self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        original = self.searcher.grab
+
+        def grab_and_import(*a: Any, **kw: Any) -> bool:
+            ok = original(*a, **kw)
+            self.db.set_media_status(mid, "done")  # the organizer imports meanwhile
+            return ok
+        self.searcher.grab = grab_and_import  # type: ignore[assignment]
+        self.searcher.run_once()
+        self.assertEqual(self.media("m1")["status"], "done")
+
+
+if __name__ == "__main__":
+    unittest.main()

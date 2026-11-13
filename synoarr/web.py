@@ -7,8 +7,9 @@ Interface ``App`` attendue (fournie par ``app.py``) ::
     class App(Protocol):
         cfg: Config
         db: Database
-        def run_watchlist_now(self) -> None          # lance en arrière-plan, retourne tout de suite
-        def run_process_now(self) -> None            # idem (traitement des téléchargements)
+        def run_watchlist_now(self) -> bool          # lance en arrière-plan, retourne tout de suite
+                                                     # (False = déjà en cours)
+        def run_process_now(self) -> bool            # idem (traitement des téléchargements)
         def search_now(self, media_id: int) -> None  # recherche d'un élément de la Watchlist, en arrière-plan
         def set_media_status(self, media_id: int, status: str) -> None  # "ignored" | "wanted" | "monitored"
         def status(self) -> dict  # JSON : version, started_at, last_watchlist_run, last_process_run,
@@ -41,7 +42,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
-from .httpclient import redact
+from .httpclient import HttpError, redact
 
 log = logging.getLogger(__name__)
 
@@ -293,11 +294,13 @@ class WebServer:
         return self.app.db.recent_events(self._limit(query, 100))
 
     def api_run_watchlist(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
-        self.app.run_watchlist_now()
+        if self.app.run_watchlist_now() is False:
+            return {"ok": True, "message": "Une synchronisation de la Watchlist est déjà en cours"}
         return {"ok": True, "message": "Synchronisation de la Watchlist lancée"}
 
     def api_run_process(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
-        self.app.run_process_now()
+        if self.app.run_process_now() is False:
+            return {"ok": True, "message": "Un traitement des téléchargements est déjà en cours"}
         return {"ok": True, "message": "Traitement des téléchargements lancé"}
 
 
@@ -366,14 +369,25 @@ def _make_handler(server: WebServer) -> type:
                 status, payload = exc.status, {"error": exc.message}
             except ValueError as exc:  # erreurs métier (indexer_manager...) en français
                 status, payload = 400, {"error": str(exc)}
+            except HttpError as exc:  # indexer injoignable pendant l'ajout (détection du type...)
+                status, payload = 502, {"error": "Service distant injoignable : %s" % exc}
             self._send(status, payload)
 
         def _same_origin(self) -> bool:
+            """Protection CSRF. Accepté : pas d'en-tête Origin (outils, anciens navigateurs), Origin égal à Host
+            ou X-Forwarded-Host (proxy inverse DSM/nginx), ou corps JSON : un navigateur n'envoie un
+            Content-Type application/json vers une autre origine qu'après une requête préalable (CORS
+            preflight) que ce serveur n'accepte jamais. Un formulaire piégé (text/plain, urlencoded) est refusé."""
             origin = self.headers.get("Origin")
             if not origin:
                 return True
-            host = self.headers.get("Host", "")
-            return urllib.parse.urlsplit(origin).netloc.lower() == host.lower()
+            netloc = urllib.parse.urlsplit(origin).netloc.lower()
+            hosts = [self.headers.get("Host", "")]
+            hosts += (self.headers.get("X-Forwarded-Host") or "").split(",")
+            if netloc and netloc in [h.strip().lower() for h in hosts if h.strip()]:
+                return True
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            return ctype == "application/json"
 
         def _read_json(self) -> Any:
             try:

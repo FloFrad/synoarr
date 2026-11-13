@@ -313,5 +313,39 @@ class WebAuthTest(WebTestBase):
         self.assertEqual(self.req("/api/run/watchlist", "POST")[0], 200)
 
 
+class WebCsrfAndJobsTest(WebTestBase):
+    def test_cross_site_form_post_is_refused(self) -> None:
+        status, _, _ = self.req("/api/run/process", "POST", raw=b'{"x": 1}',
+                                headers={"Origin": "http://evil.example", "Content-Type": "text/plain"})
+        self.assertEqual(status, 403)
+        status, _, _ = self.req("/api/indexers/%d" % self.ids["indexer"], "DELETE",
+                                headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.app.calls, [])
+
+    def test_reverse_proxy_origin_is_accepted(self) -> None:
+        # DSM / nginx reverse proxy: the browser talks to https://media.example.org, synoarr sees Host=127.0.0.1
+        status, _, _ = self.req("/api/run/process", "POST", raw=b"",
+                                headers={"Origin": "https://media.example.org",
+                                         "X-Forwarded-Host": "media.example.org"})
+        self.assertEqual(status, 200)
+        # proxy that forwards neither Host nor X-Forwarded-Host: the JSON body of the page is still accepted
+        status, _, _ = self.req("/api/run/watchlist", "POST", body={},
+                                headers={"Origin": "https://media.example.org"})
+        self.assertEqual(status, 200)
+        self.assertEqual([c[0] for c in self.app.calls], ["process", "watchlist"])
+
+    def test_same_origin_by_ip_and_port(self) -> None:
+        host = "127.0.0.1:%d" % self.server.port
+        status, _, _ = self.req("/api/run/process", "POST", raw=b"", headers={"Origin": "http://" + host})
+        self.assertEqual(status, 200)
+
+    def test_job_already_running_message(self) -> None:
+        self.app.run_watchlist_now = lambda: False  # type: ignore[assignment]
+        status, data, _ = self.req("/api/run/watchlist", "POST", body={})
+        self.assertEqual(status, 200)
+        self.assertIn("déjà en cours", data["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

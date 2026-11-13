@@ -6,12 +6,16 @@ is tried as-is first, then with ``/api`` appended. The working endpoint is remem
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..httpclient import HttpClient, HttpError
 from ..models import Release, SearchRequest
+from ..parser import titles_match
+from ..quality import parse_for_request
 from .base import Indexer, categories_for, is_feed, local_name, parse_feed, parse_xml, xml_error
 
 log = logging.getLogger(__name__)
@@ -40,6 +44,20 @@ class TorznabError(Exception):
         super().__init__(msg)
         self.code = code
         self.description = description
+
+
+def clean_query(text: str) -> str:
+    """Search text as release names spell it: "Ocean's Eleven" -> "Oceans Eleven",
+    "Les Misérables" -> "Les Miserables", "Spider-Man: No Way Home" -> "Spider-Man No Way Home",
+    "Fast & Furious" -> "Fast and Furious". Most trackers match q against release names (ASCII, no
+    apostrophes): searching the raw title can return nothing."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = t.replace("&", " and ")
+    t = re.sub(r"['’`]", "", t)
+    t = re.sub(r"[^\w.\-]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip(" .-")
+    return t or (text or "").strip()
 
 
 def endpoint_candidates(url: str) -> List[str]:
@@ -145,7 +163,8 @@ class TorznabIndexer(Indexer):
     # --------------------------------------------------------------- search
     def _attempts(self, request: SearchRequest, caps: Optional[Dict[str, Set[str]]]) -> List[List[Tuple[str, Any]]]:
         attempts: List[List[Tuple[str, Any]]] = []
-        title = request.title
+        title = clean_query(request.title)
+        query = clean_query(request.query_string())
         if request.kind == "movie":
             mode = caps.get("movie-search") if caps is not None else {"q"}
             if mode is not None:
@@ -155,7 +174,7 @@ class TorznabIndexer(Indexer):
                     if digits.isdigit():
                         attempts.append([("t", "movie"), ("imdbid", digits)])
                 if "q" in mode:
-                    attempts.append([("t", "movie"), ("q", request.query_string())])
+                    attempts.append([("t", "movie"), ("q", query)])
         else:
             mode = caps.get("tv-search") if caps is not None else {"q", "season", "ep"}
             if mode is not None and request.season is None:
@@ -175,9 +194,9 @@ class TorznabIndexer(Indexer):
                     if ep_params and len(ep_params) == (2 if request.kind == "episode" else 1):
                         attempts.append([("t", "tvsearch"), ("q", title)] + ep_params)
                     else:
-                        attempts.append([("t", "tvsearch"), ("q", request.query_string())])
+                        attempts.append([("t", "tvsearch"), ("q", query)])
         if caps is None or "search" in caps or not attempts:
-            attempts.append([("t", "search"), ("q", request.query_string())])
+            attempts.append([("t", "search"), ("q", query)])
         return attempts
 
     def _search(self, request: SearchRequest) -> List[Release]:
@@ -194,6 +213,7 @@ class TorznabIndexer(Indexer):
         cats = categories_for(request, self.categories)
         last_exc: Optional[Exception] = None
         failures = 0
+        collected: List[Release] = []
         attempts = self._attempts(request, caps)
         for params in attempts:
             full = params + [("cat", ",".join(str(c) for c in cats)), ("extended", "1"), ("limit", "100")]
@@ -213,10 +233,24 @@ class TorznabIndexer(Indexer):
             releases = parse_feed(root, self.name, base)
             if releases:
                 log.info("Indexer « %s » : %d résultat(s) pour « %s »", self.name, len(releases), request.describe())
-                return releases
+                if any(self._matches(r, request) for r in releases):
+                    return collected + releases
+                # e.g. a tracker that ignores imdbid/tvdbid and answers with its latest releases:
+                # keep them but also try the next (text) search
+                log.debug("Indexer « %s » : aucun résultat ne correspond au titre, essai suivant", self.name)
+                collected.extend(releases)
+        if collected:
+            return collected
         if failures == len(attempts) and last_exc is not None:
             raise last_exc
         return []
+
+    @staticmethod
+    def _matches(release: Release, request: SearchRequest) -> bool:
+        try:
+            return titles_match(parse_for_request(release.title, request).title, request.title, request.alt_titles)
+        except Exception:  # pragma: no cover - defensive
+            return True
 
     # ----------------------------------------------------------------- test
     def _test(self) -> Tuple[bool, str]:

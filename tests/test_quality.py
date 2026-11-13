@@ -264,5 +264,37 @@ class PickBestTests(unittest.TestCase):
         self.assertIsNotNone(pick_best([r], req, self.cfg))
 
 
+    def test_title_containing_language_word(self):
+        req = SearchRequest(kind="movie", title="The French Dispatch", year=2021)
+        s, reason = evaluate(rel("The.French.Dispatch.2021.1080p.WEB-DL.DDP5.1.H.264-EVO"), req, self.cfg)
+        self.assertIsNotNone(s, reason)
+        self.assertIn("VO", reason)  # "French" belongs to the title, not a language tag
+        s, reason = evaluate(rel("The.French.Dispatch.2021.MULTi.VFF.1080p.WEB"), req, self.cfg)
+        self.assertIn("multi", reason)
+
+    def test_number_in_title_is_not_a_year(self):
+        br = SearchRequest(kind="movie", title="Blade Runner 2049", year=2017)
+        self.assertIsNotNone(evaluate(rel("Blade.Runner.2049.1080p.BluRay.x264-SPARKS"), br, self.cfg)[0])
+        self.assertIsNotNone(evaluate(rel("Blade.Runner.2049.2017.1080p.BluRay.x264"), br, self.cfg)[0])
+        old = SearchRequest(kind="movie", title="Blade Runner", year=1982)
+        self.assertIsNone(evaluate(rel("Blade.Runner.2049.1080p.BluRay.x264-SPARKS"), old, self.cfg)[0])
+        self.assertIsNotNone(evaluate(rel("Blade.Runner.1982.Final.Cut.1080p.BluRay"), old, self.cfg)[0])
+        self.assertIsNotNone(evaluate(rel("1917.2019.1080p.BluRay.x264"),
+                                      SearchRequest(kind="movie", title="1917", year=2019), self.cfg)[0])
+
+    def test_prefix_match_does_not_accept_sequels(self):
+        self.assertIsNone(evaluate(rel("Dune.Part.Two.2024.1080p.WEB"), MOVIE, self.cfg)[0])
+        ted = SearchRequest(kind="movie", title="Ted", year=2012)
+        self.assertIsNone(evaluate(rel("Ted.2.2015.1080p.BluRay.x264"), ted, self.cfg)[0])
+
+    def test_apostrophes_accents_and_site_tags(self):
+        req = SearchRequest(kind="movie", title="Le Fabuleux Destin d'Amélie Poulain", year=2001)
+        for t in ("Le.Fabuleux.Destin.d.Amelie.Poulain.2001.FRENCH.1080p.BluRay.x264",
+                  "[ OxTorrent.com ] Le.Fabuleux.Destin.d'Amelie.Poulain.2001.FRENCH.1080p"):
+            self.assertIsNotNone(evaluate(rel(t), req, self.cfg)[0], t)
+        greys = SearchRequest(kind="episode", title="Grey's Anatomy", season=20, episode=3)
+        self.assertIsNotNone(evaluate(rel("Greys.Anatomy.S20E03.1080p.WEB.h264", size=GB), greys, self.cfg)[0])
+
+
 if __name__ == "__main__":
     unittest.main()

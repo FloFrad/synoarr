@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import datetime as _dt
 import re
 import unicodedata
 from typing import List, Optional, Tuple
@@ -70,9 +71,13 @@ _RE_LANGS = [(code, re.compile(r"(?<![a-z0-9])(?:%s)(?![a-z0-9])" % pat, re.I)) 
 _RE_TECH = re.compile(
     r"\b(?:x26[45]|h[ .]?26[45]|hevc|avc|xvid|divx|aac|ac3|eac3|dts|ddp?5[ .]?1|atmos|truehd|10bit|hdr|hdr10|dv|"
     r"proper|repack|internal|limited|extended|unrated|remastered|directors[ .]?cut|imax|"
-    r"multi|truefrench|french|vff|vostfr|bluray|bdrip|brrip|web[ .-]?dl|webrip|hdtv|dvdrip|remux)\b",
+    r"bluray|bdrip|brrip|web[ .-]?dl|webrip|hdtv|dvdrip|remux)\b",
     re.I,
 )
+# language words also end the title, but they are real words too ("The French Dispatch", "Multi Love"):
+# they only count when followed by nothing or by another technical token (see _language_cut)
+_RE_TECH_LANG = re.compile(r"\b(?:multi|truefrench|french|vff|vfq|vostfr|subfrench)\b", re.I)
+_RE_COUNTRY_SUFFIX = re.compile(r"\s(?:us|uk|au|nz|ca)$")
 
 _RE_ARTICLES = re.compile(r"^(?:the|a|an|le|la|les|l|un|une|des)\s+")
 
@@ -106,6 +111,37 @@ def _clean_title(raw: str) -> str:
     t = t.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
     t = re.sub(r"\s+", " ", t).strip(" -–_.,:")
     return t
+
+
+def _is_tech_token(rest: str) -> bool:
+    """True if *rest* (text after a language word) starts with a technical token."""
+    rest = rest.lstrip(" -")
+    if not rest:
+        return True
+    for rx in (_RE_TECH, _RE_TECH_LANG, _RE_RESOLUTION, _RE_SXXEYY, _RE_SEASON_ONLY, _RE_SEASON_WORD,
+               _RE_COMPLETE):
+        if rx.match(rest):
+            return True
+    if re.match(r"(?:19|20)\d\d\b", rest):
+        return True
+    for _code, rx in _RE_LANGS:
+        if rx.match(rest):
+            return True
+    for _src, rx in _RE_SOURCES:
+        if rx.match(rest):
+            return True
+    return False
+
+
+def _language_cut(s: str, other_markers: bool) -> Optional[int]:
+    """Position of the first language word that ends the title, if any."""
+    found = [m for m in _RE_TECH_LANG.finditer(s) if m.start() > 0]
+    for m in found:
+        if _is_tech_token(s[m.end():]):
+            return m.start()
+    if found and not other_markers:
+        return found[0].start()  # nothing else to cut on: "Kaamelott FRENCH HDLight"
+    return None
 
 
 def parse(name: str) -> ParsedName:
@@ -176,6 +212,8 @@ def parse(name: str) -> ParsedName:
     first_marker = min(marker_positions) if marker_positions else len(s)
     years = [y for y in _RE_YEAR.finditer(s)]
     year_match = None
+    max_year = _dt.date.today().year + 2  # "Blade Runner 2049", "Cyberpunk 2077": part of the title
+    years = [y for y in years if int(y.group(1)) <= max_year]
     candidates = [y for y in years if y.start() <= first_marker and y.start() > 0]
     if candidates:
         year_match = candidates[-1]
@@ -200,6 +238,9 @@ def parse(name: str) -> ParsedName:
     tech = _RE_TECH.search(s)
     if tech and tech.start() > 0:
         marker_positions.append(tech.start())
+    lang_cut = _language_cut(s, bool(marker_positions))
+    if lang_cut is not None:
+        marker_positions.append(lang_cut)
     cut = min(marker_positions) if marker_positions else len(s)
     title_part = s[:cut]
     result.title = _clean_title(title_part)
@@ -235,20 +276,44 @@ def normalize_title(title: str) -> str:
 
 def _core(title: str) -> str:
     t = normalize_title(title)
-    t = re.sub(r"\s+(19|20)\d\d$", "", t)  # trailing year
+    m = re.search(r"\s+((?:19|20)\d\d)$", t)  # trailing year ("Doctor Who 2005"), not "Blade Runner 2049"
+    if m and int(m.group(1)) <= _dt.date.today().year + 2:
+        t = t[:m.start()]
     t = _RE_ARTICLES.sub("", t)
     return t.replace(" and ", " ")
 
 
+def _cores(title: str) -> List[str]:
+    """Comparable forms of a title. An apostrophe is dropped ("Grey's" -> "greys") but may also separate an
+    elided French article: "L'Arme fatale" must match both "L.Arme.Fatale" and "LArme.Fatale"."""
+    out = [_core(title)]
+    if re.search(r"['’`]", title or ""):
+        alt = _core(re.sub(r"['’`]", " ", title))
+        if alt not in out:
+            out.append(alt)
+    return [c for c in out if c]
+
+
+def _same_core(c: str, w: str) -> bool:
+    return c == w or c.replace(" ", "") == w.replace(" ", "")
+
+
 def titles_match(candidate: str, wanted: str, alt_titles: Optional[List[str]] = None) -> bool:
-    """True if the parsed *candidate* title designates the same work as *wanted* (or one of alt_titles)."""
-    c = _core(candidate)
-    if not c:
+    """True if the parsed *candidate* title designates the same work as *wanted* (or one of alt_titles).
+
+    A trailing country code on one side only is ignored ("The Office US" ~ "The Office"), never when both
+    sides have a different one ("The Office UK" != "The Office US")."""
+    cands = _cores(candidate)
+    if not cands:
         return False
     for w in [wanted] + list(alt_titles or []):
-        wc = _core(w)
-        if not wc:
-            continue
-        if c == wc or c.replace(" ", "") == wc.replace(" ", ""):
-            return True
+        for wc in _cores(w):
+            for c in cands:
+                if _same_core(c, wc):
+                    return True
+                c_cc, w_cc = _RE_COUNTRY_SUFFIX.search(c), _RE_COUNTRY_SUFFIX.search(wc)
+                if c_cc and not w_cc and c[:c_cc.start()].strip() and _same_core(c[:c_cc.start()], wc):
+                    return True
+                if w_cc and not c_cc and wc[:w_cc.start()].strip() and _same_core(c, wc[:w_cc.start()]):
+                    return True
     return False

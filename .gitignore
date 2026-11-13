@@ -5,3 +5,4 @@ config.ini
 *.log
 *.pid
 .venv/
+docker-compose.yml

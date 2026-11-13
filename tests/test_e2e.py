@@ -356,5 +356,74 @@ enabled = false
                 h.close()
 
 
+class AppAndCliRobustnessTest(EndToEndTest):
+    def _cli(self, *argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(list(argv) + ["--config", self.cfg_path])
+        import logging
+        for h in list(logging.getLogger().handlers):
+            logging.getLogger().removeHandler(h)
+            h.close()
+        return rc, buf.getvalue()
+
+    def test_import_is_not_blocked_by_a_long_search(self):
+        app = self.make_app()
+        started, release = threading.Event(), threading.Event()
+
+        def slow_run_once(media_id=None, force=False):
+            started.set()
+            release.wait(10)
+            return {"searched": 0, "grabbed": 0}
+        app.searcher.run_once = slow_run_once
+        app.searcher.sync_watchlist = lambda: 0
+        self.assertTrue(app.run_watchlist_now())
+        self.assertTrue(started.wait(5))
+        self.assertFalse(app.run_watchlist_now())  # a second click does not queue another cycle
+        done = threading.Event()
+        threading.Thread(target=lambda: (app.job_process(), done.set()), daemon=True).start()
+        self.assertTrue(done.wait(5), "le traitement attend la fin de la recherche")
+        release.set()
+        app.shutdown(timeout=5)
+        with self.assertRaises(Exception):
+            app.db.query("SELECT 1")  # closed once the jobs are finished
+
+    def test_readonly_database_gives_a_sudo_hint(self):
+        import sqlite3
+        from unittest import mock
+        with mock.patch("synoarr.app.Database",
+                        side_effect=sqlite3.OperationalError("attempt to write a readonly database")), \
+                mock.patch.object(cli, "_not_root", return_value=True):
+            rc, out = self._cli("watchlist", "--no-sync")
+        self.assertEqual(rc, 1)
+        self.assertIn("non accessible en écriture", out)
+        self.assertIn("sudo", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_network_errors_are_explained(self):
+        from unittest import mock
+        from synoarr.httpclient import HttpError
+        with mock.patch("synoarr.plex.PlexClient.start_pin_login", side_effect=HttpError("timeout", None)):
+            rc, out = self._cli("plex-login")
+        self.assertEqual(rc, 1)
+        self.assertIn("plex.tv injoignable", out)
+        with mock.patch("synoarr.searcher.Searcher.sync_watchlist", side_effect=HttpError("Plex 503", 503)):
+            rc, out = self._cli("watchlist")
+        self.assertEqual(rc, 0)
+        self.assertIn("Watchlist Plex illisible", out)
+        with mock.patch("synoarr.cli.cmd_status", side_effect=RuntimeError("bug")):
+            rc, out = self._cli("status")
+        self.assertEqual(rc, 1)
+        self.assertIn("Erreur inattendue", out)
+
+    def test_check_reports_unwritable_data_dir(self):
+        from unittest import mock
+        with mock.patch.object(cli, "_check_data_dir", return_value="Dossier de données /x non accessible"), \
+                mock.patch.object(cli, "_not_root", return_value=True):
+            rc, out = self._cli("check")
+        self.assertEqual(rc, 1)
+        self.assertIn("sudo", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ cookie jar, and *no* automatic redirect to non-http schemes: a redirect to a
 """
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import logging
@@ -80,7 +81,9 @@ def redact(url: str) -> str:
         return url
     q = []
     for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
-        if k.lower() in ("apikey", "api_key", "x-plex-token", "token", "passwd", "password", "_sid", "sid", "passkey"):
+        low = k.lower()
+        if low in ("passwd", "password", "_sid", "sid", "account") or \
+                low.endswith(("apikey", "api_key", "token", "passkey", "secret")):
             v = "***"
         q.append((k, v))
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(q), parts.fragment))
@@ -124,7 +127,7 @@ def build_multipart(fields: Mapping[str, Any], files: Files) -> Tuple[bytes, str
 
 class HttpClient:
     def __init__(self, timeout: float = 30.0, retries: int = 2, backoff: float = 1.5,
-                 verify_ssl: bool = True, user_agent: str = USER_AGENT):
+                 verify_ssl: bool = True, user_agent: str = USER_AGENT, use_proxy: bool = True):
         self.timeout = timeout
         self.retries = retries
         self.backoff = backoff
@@ -137,6 +140,8 @@ class HttpClient:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        if not use_proxy:  # e.g. DSM on 127.0.0.1: never through http_proxy/https_proxy
+            handlers.append(urllib.request.ProxyHandler({}))
         self._opener = urllib.request.build_opener(*handlers)
 
     # ------------------------------------------------------------------ public
@@ -228,5 +233,7 @@ class HttpClient:
             raise HttpError("Connexion impossible à %s: %s" % (redact(url), reason), None, b"", url)
         except (socket.timeout, TimeoutError) as exc:
             raise HttpError("Délai dépassé pour %s: %s" % (redact(url), exc), None, b"", url)
-        except (ConnectionError, OSError) as exc:
+        except (ConnectionError, OSError, http.client.HTTPException) as exc:
             raise HttpError("Erreur réseau pour %s: %s" % (redact(url), exc), None, b"", url)
+        except ValueError as exc:  # malformed URL (bad port, unknown scheme...)
+            raise HttpError("URL invalide %s: %s" % (redact(url), exc), None, b"", url)

@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..httpclient import HttpClient
 from ..models import Release, SearchRequest
-from ..parser import parse, titles_match
+from ..parser import titles_match
+from ..quality import parse_for_request
 from .base import Indexer, to_int
 
 log = logging.getLogger(__name__)
@@ -130,7 +131,7 @@ class InternetArchiveIndexer(Indexer):
             rel = self.doc_to_release(doc)
             if rel is None:
                 continue
-            if titles_match(parse(rel.title).title, request.title, request.alt_titles):
+            if titles_match(parse_for_request(rel.title, request).title, request.title, request.alt_titles):
                 out.append(rel)
         return out
 

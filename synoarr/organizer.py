@@ -25,7 +25,10 @@ import time
 import unicodedata
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from .parser import normalize_title, parse
+from .parser import normalize_title, parse, titles_match
+
+from .config import missing_share_root
+from .db import release_file_lock, try_file_lock
 
 if TYPE_CHECKING:  # pragma: no cover - imported for type hints only
     from .config import Config
@@ -48,6 +51,14 @@ IGNORED_NAMES = {"@eadir", "#recycle", "#snapshot", "lost+found", "thumbs.db", "
 TMP_PREFIX = ".synoarr-tmp-"
 _COMPARE_CHUNK = 1024 * 1024
 _MAX_COMPONENT_BYTES = 200
+
+# Files that may be deleted with the leftover folder of one of OUR downloads (anything else keeps the folder).
+JUNK_EXTENSIONS = {"nfo", "txt", "jpg", "jpeg", "png", "sfv", "srr", "url", "exe", "md5", "nzb", "torrent"}
+# Bonus material: never imported as the movie / episode (like samples).
+_EXTRA_DIRS = {"trailer", "trailers", "featurette", "featurettes", "extra", "extras", "bonus", "bonus features",
+               "behind the scenes", "deleted scenes", "interviews", "making of", "bandes annonces", "bande annonce"}
+_RE_EXTRA = re.compile(r"\b(?:trailers?|teasers?|featurettes?|behind the scenes|deleted scenes?|making of|"
+                       r"bande annonce)\b")
 
 _RE_PART = re.compile(r"(?:^|[ ._\-\[(])(?:cd|disc|disk|part|pt)[ ._-]?(\d{1,2})(?=$|[ ._\-\])])", re.I)
 
@@ -132,7 +143,7 @@ def _clean_value(value: str) -> str:
     """Sanitize a metadata value before it is inserted in a naming format (no path separators)."""
     value = unicodedata.normalize("NFC", value)
     value = value.replace(":", " - ")
-    value = re.sub(r"[/\\]", "", value)
+    value = re.sub(r"\s*[/\\]\s*", "-", value)  # "Face/Off" -> "Face-Off"
     return re.sub(r"\s+", " ", value).strip()
 
 
@@ -241,11 +252,29 @@ class Organizer:
     # ================================================================== public API
     def run_once(self, dry_run: bool = False) -> List[Dict]:
         """Process every top-level entry of the download folder. Never raises."""
+        dry = bool(dry_run or self.cfg.general.dry_run)
+        lock_fd = None
         try:
-            return self._run(bool(dry_run or self.cfg.general.dry_run))
+            if not dry:
+                lock_fd = self._lock()
+                if lock_fd is False:
+                    log.info("Un autre traitement des téléchargements est en cours (démon ou commande) : "
+                             "cycle ignoré")
+                    return []
+            return self._run(dry)
         except Exception as exc:  # last resort: the daemon must survive
             log.exception("Erreur inattendue de l'organiseur : %s", exc)
             return []
+        finally:
+            release_file_lock(lock_fd)
+
+    def _lock(self) -> Any:
+        """Inter-process lock in data_dir. Returns an fd, None (no locking possible) or False (busy)."""
+        try:
+            data_dir = self.cfg.data_dir
+        except (TypeError, AttributeError):  # pragma: no cover
+            return None
+        return try_file_lock(data_dir, "organizer.lock")
 
     def plan(self, entry_path: str) -> List[Tuple[str, str, Dict]]:
         """Planned (src, dst, meta) for one entry, without touching anything."""
@@ -322,6 +351,13 @@ class Organizer:
         busy = [t for t in matching if not t.is_complete]
         if busy:
             return [self._skip(entry_path, "téléchargement non terminé dans Download Station (%s)" % busy[0].status)], 0
+        if grab and grab.get("status") == "failed":
+            # the download failed (task in error, release blocklisted): what is on disk is probably partial
+            return [self._skip(entry_path, "téléchargement en échec dans Download Station : fichiers ignorés "
+                                           "(supprimez-les ou importez-les à la main)")], 0
+        if grab and grab.get("status") == "sent" and self.ds is not None and not ds_ok:
+            # one of our downloads, but its state cannot be checked: a stalled download looks "old" too
+            return [self._skip(entry_path, "Download Station injoignable : état du téléchargement inconnu")], 0
         if is_dir:
             partial = self._find_incomplete(entry_path)
             if partial:
@@ -330,6 +366,8 @@ class Organizer:
         if self._settled.get(entry_path) == newest:
             return [], 0
         age_min = (time.time() - newest) / 60.0
+        if age_min < -24 * 60:
+            age_min = min_age  # mtime more than a day in the future (wrong clock): do not wait forever
         if age_min < min_age:
             return [self._skip(entry_path, "modifié il y a %.1f min (attente de %.0f min)" % (max(age_min, 0), min_age))], 0
         if self.cfg.paths.only_known_downloads and not grab:
@@ -401,6 +439,10 @@ class Organizer:
         if grab and grab.get("status") != "imported":
             try:
                 self.db.set_grab_status(int(grab["id"]), "imported", "importé dans la bibliothèque")
+                # episodes the download did not contain (incomplete season pack...) are searched again
+                if self.db.reset_grab_episodes(grab):
+                    log.info("%s ne contenait pas tous les épisodes attendus : les manquants seront recherchés",
+                             name)
             except Exception as exc:
                 log.warning("Mise à jour du grab %s impossible : %s", grab.get("id"), exc)
         if paths.remove_task_after_import and matching:
@@ -413,7 +455,8 @@ class Organizer:
                         log.info("Tâche Download Station supprimée : %s", task.title)
                     except Exception as exc:
                         log.warning("Suppression de la tâche Download Station %s impossible : %s", task.title, exc)
-        if is_dir and paths.action == "move" and paths.delete_leftovers:
+        if is_dir and paths.action == "move" and paths.delete_leftovers and grab:
+            # only for downloads synoarr sent itself: a folder dropped by the user is never deleted
             self._delete_leftovers(entry_path)
         if not new_files:
             return
@@ -462,10 +505,82 @@ class Organizer:
             grab = self.db.find_grab_by_name(name)
             if not grab and not is_dir:
                 grab = self.db.find_grab_by_name(_stem(name))
+            if not grab:
+                grab = self._guess_grab(name, is_dir)
             return grab
         except Exception as exc:
             log.warning("Recherche du grab pour %s impossible : %s", name, exc)
             return None
+
+    def _strip_video_ext(self, name: str) -> str:
+        return _stem(name) if _ext(name) in self._video_exts() else name
+
+    def _guess_grab(self, name: str, is_dir: bool) -> Optional[Dict[str, Any]]:
+        """Pending grab whose name differs from the entry: magnet without "dn" (the release title of the
+        indexer is not the torrent name), punctuation changed... Only downloads still 'sent' are considered."""
+        sent = self.db.list_grabs(status="sent", limit=500)
+        if not sent:
+            return None
+        key = normalize_title(self._strip_video_ext(name))
+        if key:
+            for g in sent:
+                for k in ("torrent_name", "release_title"):
+                    v = g.get(k) or ""
+                    if v and normalize_title(self._strip_video_ext(v)) == key:
+                        return g
+        p = parse(name)
+        if not p.title:
+            return None
+        medias = {}  # type: Dict[int, Optional[Dict[str, Any]]]
+        for g in sent:  # newest first
+            mid = g.get("media_id")
+            if not mid:
+                continue
+            if mid not in medias:
+                medias[mid] = self.db.get_media(int(mid))
+            media = medias[mid]
+            if not media:
+                continue
+            alts = [media["original_title"]] if media.get("original_title") else []
+            if not titles_match(p.title, media.get("title") or "", alts):
+                continue
+            if g.get("season") is None:
+                if media.get("type") != "movie" or p.seasons or p.episodes:
+                    continue
+                if p.year and media.get("year") and abs(p.year - int(media["year"])) > 1:
+                    continue
+                return g
+            if p.season is None or int(g["season"]) not in p.seasons:
+                continue
+            if g.get("episode") is None:
+                if not p.episodes:  # the season pack itself, not one of its episodes
+                    return g
+            elif int(g["episode"]) in p.episodes:
+                return g
+        return None
+
+    def _guess_media(self, titles: List[str], year: Optional[int], is_show: bool) -> Optional[Dict[str, Any]]:
+        """Watchlist item matching a download that synoarr did not send (same naming + status update).
+        Only an unambiguous match is used."""
+        titles = [t for t in titles if t]
+        if not titles:
+            return None
+        try:
+            rows = self.db.list_media()
+        except Exception as exc:
+            log.debug("Lecture de la Watchlist impossible : %s", exc)
+            return None
+        found = []
+        for m in rows:
+            if (m.get("type") == "show") != is_show:
+                continue
+            alts = [m["original_title"]] if m.get("original_title") else []
+            if not any(titles_match(t, m.get("title") or "", alts) for t in titles):
+                continue
+            if not is_show and year and m.get("year") and abs(int(m["year"]) - year) > 1:
+                continue
+            found.append(m)
+        return found[0] if len(found) == 1 else None
 
     @staticmethod
     def _matching_tasks(name: str, is_dir: bool, grab: Optional[Dict[str, Any]],
@@ -552,15 +667,40 @@ class Organizer:
                 return True
         return parse(os.path.basename(video)).is_sample and not entry_parsed.is_sample
 
-    def _is_junk_sample(self, path: str) -> bool:
-        parts = [p.lower() for p in path.replace("\\", "/").split("/")[:-1]]
-        sample = parse(os.path.basename(path)).is_sample or bool(set(parts) & {"sample", "samples"})
+    @staticmethod
+    def _is_extra(entry_path: str, video: str) -> bool:
+        """Bonus material (trailer, featurette, extras folder...): never imported as the movie/episode."""
+        rel = os.path.relpath(video, entry_path) if os.path.isdir(entry_path) else os.path.basename(video)
+        for part in rel.replace("\\", "/").split("/")[:-1]:
+            if normalize_title(part) in _EXTRA_DIRS:
+                return True
+        # "Big.Movie.2020.Trailer.1080p.mkv" (the word after the title), not "Trailer.Park.Boys.S01E01.mkv"
+        p = parse(os.path.basename(video))
+        norm, title = normalize_title(_stem(video)), normalize_title(p.title)
+        tail = norm[len(title):] if title and norm.startswith(title) else norm
+        return bool(_RE_EXTRA.search(tail))
+
+    @staticmethod
+    def _is_junk(entry_path: str, path: str) -> bool:
+        """Leftover file that may be deleted: nfo/txt/images/checksums..., or anything named / filed as sample."""
+        name = os.path.basename(path)
+        if _ext(name) in JUNK_EXTENSIONS or _is_ignored_name(name):
+            return True
+        rel = os.path.relpath(path, entry_path).replace("\\", "/").lower()
+        return "sample" in rel
+
+    def _is_junk_sample(self, entry_path: str, path: str) -> bool:
+        """A small sample video that may be deleted with the leftover folder."""
+        sample = self._is_sample(entry_path, path, parse(os.path.basename(entry_path)))
         return sample and 0 <= _file_size(path) < self.sample_max_size
 
     def _select_videos(self, entry_path: str, videos: List[str],
                        entry_parsed: "ParsedName") -> Tuple[List[str], List[Tuple[str, str]]]:
         infos = []
         for v in videos:
+            if self._is_extra(entry_path, v):
+                log.debug("Bonus ignoré : %s", v)
+                continue
             size = _file_size(v)
             if size < 0:
                 continue
@@ -607,6 +747,13 @@ class Organizer:
             except Exception as exc:
                 log.warning("Lecture du média %s impossible : %s", grab.get("media_id"), exc)
         parsed = dict((v, parse(os.path.basename(v))) for v in chosen)
+        if media is None and not grab:
+            is_show = any(p.is_episode for p in parsed.values()) or entry_parsed.is_episode or \
+                bool(entry_parsed.seasons)
+            first = parsed[chosen[0]]
+            media = self._guess_media([entry_parsed.title, first.title], entry_parsed.year or first.year, is_show)
+            if media:
+                log.debug("%s associé à « %s » de la Watchlist", name, media.get("title"))
 
         if media:
             kind = "movie" if media.get("type") == "movie" else "show"
@@ -916,6 +1063,10 @@ class Organizer:
                 self._place(src, dst, replace=True)
                 return "imported", "remplace une version plus petite (%d < %d octets)" % (dsize, ssize), True
             parent = os.path.dirname(dst)
+            missing = missing_share_root(dst)
+            if missing:  # never create a shared folder (typo in movies_dir/series_dir)
+                return ("error", "dossier partagé %s introuvable : vérifiez movies_dir / series_dir (File Station > "
+                        "clic droit > Propriétés > Emplacement)" % missing, False)
             if parent:
                 os.makedirs(parent, exist_ok=True)
             how = self._place(src, dst, replace=False)
@@ -991,15 +1142,15 @@ class Organizer:
         root = self.cfg.paths.download_dir
         if os.path.islink(entry_path) or not os.path.isdir(entry_path) or not _inside(entry_path, root):
             return False
-        vexts = self._video_exts()
         for dirpath, _dirs, files in os.walk(entry_path):
             for f in files:
                 full = os.path.join(dirpath, f)
                 if f.lower().endswith(INCOMPLETE_SUFFIXES):
                     log.info("Dossier %s conservé : fichier en cours d'écriture %s", entry_path, f)
                     return False
-                if _ext(f) in vexts and not self._is_junk_sample(full):
-                    log.info("Dossier %s conservé : il contient encore la vidéo %s", entry_path, f)
+                if not self._is_junk(entry_path, full):
+                    log.info("Dossier %s conservé : il contient encore %s", entry_path,
+                             os.path.relpath(full, entry_path))
                     return False
         try:
             shutil.rmtree(entry_path)

@@ -6,7 +6,9 @@ exposed as a small dataclass so the rest of the code never touches configparser.
 from __future__ import annotations
 
 import configparser
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -50,8 +52,8 @@ class DownloadStationConfig:
 @dataclass
 class PathsConfig:
     download_dir: str = "/volume1/Download"
-    movies_dir: str = "/volume1/video/Films"
-    series_dir: str = "/volume1/video/Series"
+    movies_dir: str = "/volume1/Vidéos/Films"
+    series_dir: str = "/volume1/Vidéos/Séries"
     action: str = "move"  # move | copy | hardlink
     min_age_minutes: float = 5.0
     remove_task_after_import: bool = True
@@ -118,6 +120,7 @@ class Config:
     series: SeriesConfig = field(default_factory=SeriesConfig)
     tmdb: TmdbConfig = field(default_factory=TmdbConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    warnings: List[str] = field(default_factory=list)  # non fatal problems found while loading (French)
 
     @property
     def data_dir(self) -> str:
@@ -140,11 +143,23 @@ class Config:
             try:
                 fmt.format(title="T", year=2000, show="S", season=1, episode=2, episode_title="E", ext="mkv",
                            resolution="1080p", tmdb="1", imdb="tt1", tvdb="1")
-            except (KeyError, IndexError, ValueError) as exc:
+            except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
                 problems.append("[naming] %s invalide: %s" % (fmt_name, exc))
         if not self.downloadstation.url.startswith(("http://", "https://")):
             problems.append("[downloadstation] url doit commencer par http:// ou https://")
         return problems
+
+
+def missing_share_root(path: str) -> Optional[str]:
+    """For a Synology path /volumeN/<Share>/sub..., the share root if it does not exist (else None).
+
+    A missing share must never be created by synoarr (a typo such as "Videos" instead of "Vidéos" would
+    create a plain folder on the volume, invisible in File Station)."""
+    m = re.match(r"^(/volume[^/]*/[^/]+)", (path or "").replace("\\", "/"))
+    if not m:
+        return None
+    root = m.group(1)
+    return None if os.path.isdir(root) else root
 
 
 _SECTIONS = {
@@ -163,8 +178,33 @@ _TRUE = ("1", "true", "yes", "on", "oui", "vrai")
 _FALSE = ("0", "false", "no", "off", "non", "faux", "")
 
 
+def _unquote(value: str) -> str:
+    """'"/volume1/Vidéos"' -> '/volume1/Vidéos' (users often quote values, INI files do not need it)."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _read_text(path: str) -> str:
+    """config.ini edited from Windows over SMB may be UTF-8 with BOM, UTF-16 (old Notepad "Unicode")
+    or ANSI/cp1252: accept all of them. Line endings (CRLF) are handled by universal newlines."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16")
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            logging.getLogger(__name__).warning(
+                "%s n'est pas enregistré en UTF-8 : lu comme Windows-1252 (ANSI). Enregistrez-le de préférence "
+                "en UTF-8.", path)
+            text = data.decode("cp1252", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _convert(name: str, raw: str, default):
-    raw = raw.strip()
+    raw = _unquote(raw.strip()).strip()
     if isinstance(default, bool):
         low = raw.lower()
         if low in _TRUE:
@@ -194,15 +234,31 @@ def load_config(path: Optional[str]) -> Config:
     (e.g. SYNOARR_DOWNLOADSTATION_PASSWORD).
     """
     cfg = Config(path=os.path.abspath(path) if path else None)
-    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+    # No inline comments: a password may contain " #" or " ;" or start with them ("#abc", ";abc").
+    # Comments are whole lines starting with ; or # (as in config.example.ini).
+    parser = configparser.ConfigParser(interpolation=None)
     if path:
         if not os.path.isfile(path):
             raise ConfigError("Fichier de configuration introuvable: %s" % path)
         try:
-            with open(path, "r", encoding="utf-8-sig") as fh:
-                parser.read_file(fh)
+            text = _read_text(path)
+        except OSError as exc:
+            raise ConfigError("Lecture de %s impossible : %s (essayez avec sudo)" % (path, exc.strerror or exc))
+        try:
+            parser.read_string(text, source=path)
         except configparser.Error as exc:
             raise ConfigError("Erreur de syntaxe dans %s: %s" % (path, exc))
+        for section in parser.sections():
+            klass = _SECTIONS.get(section.lower()) if section.lower() == section else None
+            if klass is None:
+                cfg.warnings.append("Section [%s] inconnue dans %s (ignorée)%s" % (
+                    section, os.path.basename(path),
+                    " : les noms de section s'écrivent en minuscules" if section.lower() in _SECTIONS else ""))
+                continue
+            for key in parser.options(section):
+                if key not in klass.__dataclass_fields__ and key not in parser.defaults():  # type: ignore
+                    cfg.warnings.append("Option inconnue « %s » dans [%s] (ignorée, faute de frappe ?)"
+                                        % (key, section))
     for section, klass in _SECTIONS.items():
         obj = getattr(cfg, section)
         for fname in klass.__dataclass_fields__:  # type: ignore[attr-defined]
@@ -222,6 +278,11 @@ def load_config(path: Optional[str]) -> Config:
     cfg.plex.server_url = cfg.plex.server_url.rstrip("/")
     cfg.paths.action = cfg.paths.action.lower().strip()
     cfg.series.monitor = cfg.series.monitor.lower().strip()
+    for attr in ("download_dir", "movies_dir", "series_dir"):
+        value = getattr(cfg.paths, attr).strip()
+        if len(value) > 1:
+            value = value.rstrip("/")
+        setattr(cfg.paths, attr, os.path.expanduser(value))
     cfg.naming.video_extensions = [e.lower().lstrip(".") for e in cfg.naming.video_extensions]
     cfg.naming.subtitle_extensions = [e.lower().lstrip(".") for e in cfg.naming.subtitle_extensions]
     return cfg
