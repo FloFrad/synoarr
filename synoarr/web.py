@@ -423,6 +423,8 @@ class WebServer:
             ("POST", r"/api/media/(\d+)/language", self.api_media_language),
             ("POST", r"/api/media/(\d+)/title_fr", self.api_media_title_fr),
             ("POST", r"/api/media/(\d+)/monitor", self.api_media_monitor),
+            ("GET", r"/api/trending", self.api_trending),
+            ("POST", r"/api/trending/add", self.api_trending_add),
             ("POST", r"/api/media/(\d+)/episodes/monitor", self.api_media_episodes_monitor),
             ("GET", r"/api/jobs", self.api_jobs),
             ("POST", r"/api/jobs", self.api_job_start),
@@ -966,6 +968,63 @@ class WebServer:
         elif fresh.get("status") == "grabbed":
             msg += " — un téléchargement est déjà en cours : utilisez « Changer de source » pour une version française"
         return {"ok": True, "languages": value, "title_fr": title_fr, "message": msg}
+
+    _trend_cache = {}  # type: Dict[str, Any]
+
+    def api_trending(self, query: Dict[str, str], body: Any = None) -> Dict[str, Any]:
+        """TMDb « tendances » (popular this week) and new releases, marked when already in the watchlist."""
+        import time as _time
+        name = query.get("list") or "trending_movies"
+        tmdb = getattr(self.app, "tmdb", None)
+        lists = getattr(type(tmdb), "TREND_LISTS", {}) if tmdb is not None else {}
+        if name not in lists:
+            raise HttpProblem(400, "Liste inconnue : %s" % name)
+        if tmdb is None or not getattr(tmdb, "enabled", False):
+            return {"list": name, "items": [], "tmdb_configured": False}
+        try:
+            page = int(query.get("page") or 1)
+        except ValueError:
+            raise HttpProblem(400, "Page invalide")
+        key = "%s:%d:%s" % (name, page, getattr(tmdb, "language", ""))
+        cached = self._trend_cache.get(key)
+        if cached and _time.time() - cached[0] < 3600:
+            items = cached[1]
+        else:
+            items = tmdb.trend_list(name, page)
+            if items:
+                self._trend_cache[key] = (_time.time(), items)
+        known = {}  # type: Dict[Any, int]
+        for m in self.app.db.list_media(include_hidden=True):
+            if m.get("tmdb"):
+                known[(m["type"], str(m["tmdb"]))] = m["id"]
+        out = []
+        for it in items:
+            it = dict(it)
+            it["media_id"] = known.get((it["type"], it["tmdb"]))
+            it["in_watchlist"] = it["media_id"] is not None
+            out.append(it)
+        return {"list": name, "items": out, "tmdb_configured": True}
+
+    def api_trending_add(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        """Add a TMDb trending item: matched with Plex Discover (to land in the Plex Watchlist) when possible."""
+        data = self._body_dict(body)
+        cand = data.get("candidate")
+        if not isinstance(cand, dict) or not cand.get("title") or cand.get("type") not in ("movie", "show"):
+            raise HttpProblem(400, "Élément invalide")
+        langs = self._parse_add_languages(data.get("languages"))
+        best = dict(cand)
+        try:
+            found = self._app_func("search_titles")(str(cand["title"]), cand["type"], cand.get("year")) or {}
+            for c in found.get("results") or []:
+                if str(c.get("tmdb") or "") == str(cand.get("tmdb") or "") and c.get("type") == cand["type"]:
+                    best = dict(c)
+                    best.setdefault("poster_url", cand.get("poster_url"))
+                    break
+        except Exception:  # Plex/TMDb search failed: add the TMDb item as is (local entry)
+            pass
+        row = self._app_func("add_to_watchlist")(best, data.get("add_to_plex", True) is not False)
+        self._apply_add_languages(row, langs)
+        return self._added(row, data.get("search_now", True) is not False)
 
     MONITOR_LABELS = {"": "par défaut", "all": "tous les épisodes", "future": "nouveaux épisodes seulement",
                       "latest_season": "dernière saison", "none": "aucun épisode"}
@@ -1564,6 +1623,22 @@ function calRow(i,t){const ep=i.kind==='episode',code=ep?`S${pad(i.season)}E${pa
   ${i.status==='wanted'&&!fut?`<div class="cact">${srcBtn(i.media_id,ep?i.season:null,ep?i.episode:null,null,i.title+(ep?' '+code:''),'',ep?'Source…':'Choisir une source')}</div>`:''}</div>`}
 function calList(list,t){const g=[];list.forEach(i=>{let x=g[g.length-1];if(!x||x.d!==i.date){x={d:i.date,a:[]};g.push(x)}x.a.push(i)});
   return g.map(x=>`<section class="cday"><h4${x.d===t?' class="tdy"':''}>${esc(dayLbl(x.d,t))}${/^Aujourd|^Demain|^Hier/.test(dayLbl(x.d,t))?` <span class="mut small">${esc(pday(x.d).toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'long'}))}</span>`:''}</h4>${x.a.map(i=>calRow(i,t)).join('')}</section>`).join('')}
+/* ------------------------------------------------------------------ Tendances */
+let TRL='trending_movies';try{TRL=localStorage.getItem('synoarr.trl')||'trending_movies'}catch(e){}
+const TRLISTS=[['trending_movies','Films populaires'],['trending_shows','Séries populaires'],['new_movies','Nouveaux films (au cinéma)'],['upcoming_movies','Films à venir'],['new_shows','Séries en cours de diffusion']];
+V.trend=async()=>{const r=await api('trending?list='+encodeURIComponent(TRL));TRITEMS=r.items||[];
+  const chips=`<div class="row wtabs" role="tablist" aria-label="Listes">${TRLISTS.map(t=>`<button type="button" role="tab" class="xs${TRL===t[0]?'':' sec'}" aria-selected="${TRL===t[0]}" data-trl="${t[0]}">${t[1]}</button>`).join('')}</div>`;
+  if(!r.tmdb_configured)return chips+'<p class="card msg wa">Les tendances viennent de TMDb : renseignez une clé TMDb (Paramètres → Configuration → TMDb).</p>';
+  if(!r.items.length)return chips+'<p class="mut card">Aucun élément (TMDb n\'a pas répondu, réessayez plus tard).</p>';
+  return chips+`<p class="mut small">Popularité et nouveautés selon TMDb (mises à jour chaque heure).</p><div class="tgrid">${r.items.map((c,i)=>`<div class="card tcard">${pst({title:c.title,poster:c.poster_url},'tp')}<div class="tb">
+    <div><b>${esc(c.title)}</b> ${c.year?`<span class="mut">(${esc(c.year)})</span>`:''}</div>
+    <div class="meta">${badge(c.type)}${c.rating?` <span class="mut small">★ ${esc(Number(c.rating).toFixed(1))}</span>`:''}${c.date&&TRL.indexOf('trending')<0?` <span class="mut small">${esc(fdate(c.date))}</span>`:''}</div>
+    ${c.original_title&&c.original_title!==c.title?`<div class="mut small">${esc(c.original_title)}</div>`:''}${c.overview?`<p class="small ov">${esc(c.overview)}</p>`:''}
+    <div class="row">${c.in_watchlist?'<span class="b b-done">Dans la Watchlist</span>':`<select class="lsel" id="trl${i}" aria-label="Langue"><option value="">Auto</option><option value="en">Anglais</option><option value="fr">Français</option><option value="en,fr">Anglais + Français</option></select><button class="xs" data-tradd="${i}">+ Ajouter</button>`}</div></div></div>`).join('')}</div>`};
+let TRITEMS=[];
+async function trAdd(i,b){const c=TRITEMS[i];if(!c)return;b.disabled=true;b.textContent='Ajout…';
+  try{const r=await api('trending/add','POST',{candidate:c,languages:($('#trl'+i)||{}).value||'',search_now:true});toast(r.message);await refresh()}
+  catch(e){b.disabled=false;b.textContent='+ Ajouter';toast(e.message,true)}}
 V.cal=async()=>{const r=await api('upcoming?days='+encodeURIComponent(CALD));const t=r.today;
   const sel=`<select id="cald" aria-label="Période">${[['7','7 jours'],['14','14 jours'],['30','30 jours'],['60','60 jours'],['90','90 jours']].map(o=>`<option value="${o[0]}"${CALD===o[0]?' selected':''}>${o[1]}</option>`).join('')}</select>`;
   const hint=`<p class="mut small">Épisodes des séries suivies (dates de diffusion TMDb / Plex, mises à jour à chaque synchronisation de la Watchlist)${r.tmdb_configured?' et films recherchés avec une date de sortie connue':' ; configurez une clé TMDb pour voir aussi les dates de sortie des films'}.</p>`;
@@ -1823,7 +1898,12 @@ async function cfgRestore(){if(!confirm('Restaurer la sauvegarde précédente de
   try{const r=await api('config/restore','POST');cfgD=null;await S.cfg();$('#cfr').innerHTML=cfgResult(r);toast(r.message)}
   catch(e){const p=(e.data&&e.data.problems)||[];$('#cfr').innerHTML=`<div class="msg ko"><b>${esc(e.message)}</b>${p.length?`<ul>${p.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`;toast(e.message,true)}}
 /* -------------------------------------------------------------------- moteur */
-async function refresh(){clearTimeout(timer);document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.hash==='#'+tab));
+const SETTINGS=['cmd','idx','hist','logs','cfg'];
+function syncNav(){const inSet=SETTINGS.includes(tab);document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('on',a.hash==='#'+tab||!!(a.dataset.set&&inSet)));
+  const sn=$('#subnav');if(sn)sn.hidden=!inSet;const ns=$('#navset');
+  if(inSet){try{localStorage.setItem('synoarr.set',tab)}catch(e){}}
+  if(ns){let last='cmd';try{last=localStorage.getItem('synoarr.set')||'cmd'}catch(e){}if(!SETTINGS.includes(last))last='cmd';ns.setAttribute('href','#'+(inSet?tab:last))}}
+async function refresh(){clearTimeout(timer);syncNav();
   if(tab!=='logs')clearTimeout(logT);
   if(S[tab]){if(mounted!==tab){mounted=tab;try{await S[tab]();$('#conn').textContent=''}catch(e){mounted=null;app.innerHTML=`<p class="card msg ko">${esc(e.message)}</p>`}}return}
   mounted=null;
@@ -1868,6 +1948,8 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.tfr){const v=prompt('Titre français utilisé pour chercher les releases françaises (vide = recherche automatique sur TMDb) :',d.v||'');
     if(v!==null)act(()=>api('media/'+d.tfr+'/title_fr','POST',{title_fr:v}))}
   else if(d.wst){WST=d.wst;try{localStorage.setItem('synoarr.wst',WST)}catch(e){}refresh()}
+  else if(d.trl){TRL=d.trl;try{localStorage.setItem('synoarr.trl',TRL)}catch(e){}refresh()}
+  else if(d.tradd)trAdd(+d.tradd,b);
   else if(d.iedit)openIdxEdit(d.iedit);
   else if(d.pd)setPrio(d.pd,d.v);
   else if(d.prws)prwSync();
@@ -2173,7 +2255,9 @@ button.xs{font-size:12px;padding:3px 8px}h4{margin:14px 0 6px;font-size:14px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow-y:auto}
 .mbox{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:12px;width:100%;max-width:920px;padding:14px 16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .mhd{display:flex;justify-content:space-between;align-items:center;gap:10px}.mhd h3{margin:0}.opts{margin:4px 0 6px;gap:6px 16px}
-#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.efl{margin:6px 0}table.eps td:first-child{white-space:nowrap;padding-right:10px}table.eps td:first-child input{margin-right:4px;vertical-align:middle}.wtabs{gap:6px;margin:8px 0;align-items:center}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
+#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.efl{margin:6px 0}table.eps td:first-child{white-space:nowrap;padding-right:10px}table.eps td:first-child input{margin-right:4px;vertical-align:middle}.subnav{display:flex;flex-wrap:wrap;gap:2px;margin:-4px 0 10px;border-bottom:1px solid var(--bd)}.subnav a{font-size:14px}
+.tgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}.tcard{display:flex;gap:12px;margin:0}.tb{flex:1;min-width:0}.pst.tp{flex:0 0 70px;width:70px;height:105px}
+.wtabs{gap:6px;margin:8px 0;align-items:center}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
 body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(--pub);color:var(--puf)}
 .cands{display:flex;flex-direction:column;gap:8px;margin-top:10px}.cand{display:flex;gap:12px;border:1px solid var(--bd);border-radius:8px;padding:8px}
 .cand img,.noimg{width:62px;height:93px;object-fit:cover;border-radius:6px;flex:0 0 62px;background:var(--neb)}.noimg{display:flex;align-items:center;justify-content:center;color:var(--mut)}
@@ -2198,8 +2282,8 @@ body.selmode main{padding-bottom:calc(var(--bkh,64px) + 16px)}body.selmode #toas
 @media (max-width:600px){.cff{grid-template-columns:1fr}.pst{flex-basis:40px;width:40px;height:60px}.wck{margin-top:20px}.wr{gap:10px}.bkn{min-width:0;flex:1}.bka{order:3;flex-basis:100%}.bkx{margin-left:0}.crow{flex-wrap:wrap}.cact{margin-left:44px}table.eps td:last-child{width:auto}.modal{padding:8px}.mbox{padding:12px}.srt{max-height:52vh}.cand img,.noimg{width:48px;height:72px;flex-basis:48px}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
 </style></head><body>
 <header><div class="hd"><h1><span>syno</span>arr</h1>
-<nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#cal">À venir</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
-<main><div class="card" id="msearch" hidden><h3>Recherche manuelle</h3><form id="sf" class="row" autocomplete="off"><input id="sq" type="search" placeholder="ex. Night of the Living Dead 1968 · Série S01E02" required maxlength="200" aria-label="Recherche manuelle sur les indexers"><button type="submit">Rechercher</button></form>
+<nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#cal">À venir</a><a href="#trend">Tendances</a><a href="#cmd" id="navset" data-set="1">Paramètres</a></nav><div id="conn"></div></div></header>
+<main><nav id="subnav" class="subnav" hidden aria-label="Paramètres"><a href="#cmd">Commandes</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#logs">Journal</a><a href="#cfg">Configuration</a></nav><div class="card" id="msearch" hidden><h3>Recherche manuelle</h3><form id="sf" class="row" autocomplete="off"><input id="sq" type="search" placeholder="ex. Night of the Living Dead 1968 · Série S01E02" required maxlength="200" aria-label="Recherche manuelle sur les indexers"><button type="submit">Rechercher</button></form>
 <p class="mut small">Rien n'est envoyé automatiquement : choisissez une release acceptable puis « Envoyer à Download Station ».</p><div id="sres"></div></div>
 <div id="app"><p class="mut">Chargement…</p></div>
 <div class="card" id="addc" hidden><h3>Ajouter un indexer par URL</h3>

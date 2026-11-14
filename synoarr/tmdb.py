@@ -187,6 +187,42 @@ class TmdbClient:
                 break
         return out
 
+    TREND_LISTS = {
+        "trending_movies": ("/trending/movie/week", "movie"),
+        "trending_shows": ("/trending/tv/week", "show"),
+        "new_movies": ("/movie/now_playing", "movie"),
+        "upcoming_movies": ("/movie/upcoming", "movie"),
+        "new_shows": ("/tv/on_the_air", "show"),
+    }
+
+    def trend_list(self, name: str, page: int = 1) -> List[Dict[str, Any]]:
+        """TMDb lists: trending (popularity this week) or new releases. Same item shape as search_multi plus
+        "rating" and "popularity". Never raises ([] on error / disabled / unknown list)."""
+        if not self.enabled or name not in self.TREND_LISTS:
+            return []
+        path, kind = self.TREND_LISTS[name]
+        params = {"page": max(1, min(int(page or 1), 5))}  # type: Dict[str, Any]
+        if name in ("new_movies", "upcoming_movies"):
+            region = (self.language.split("-")[1] if "-" in self.language else "").upper()
+            if region:
+                params["region"] = region
+        data = self._get(path, params) or {}
+        out = []  # type: List[Dict[str, Any]]
+        for r in data.get("results") or []:
+            if not isinstance(r, dict) or not r.get("id"):
+                continue
+            title = r.get("title") or r.get("name") or ""
+            orig = r.get("original_title") or r.get("original_name") or ""
+            poster = r.get("poster_path")
+            out.append({"source": "tmdb", "type": kind, "title": str(title), "original_title": str(orig),
+                        "year": _year(r.get("release_date") or r.get("first_air_date")),
+                        "date": str(r.get("release_date") or r.get("first_air_date") or "")[:10] or None,
+                        "tmdb": str(r["id"]), "imdb": None, "tvdb": None, "rating_key": None,
+                        "overview": str(r.get("overview") or "")[:300],
+                        "poster_url": self.POSTER_BASE + str(poster) if poster else None,
+                        "rating": r.get("vote_average"), "popularity": r.get("popularity")})
+        return out
+
     def external_ids(self, tmdb_id: str, kind: str) -> Dict[str, str]:
         """{"imdb": "tt..", "tvdb": "123"} of a movie / show (kind "movie" | "show"), {} on error."""
         if not self.enabled or not tmdb_id:

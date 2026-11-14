@@ -2288,3 +2288,29 @@ class MonitorEndpointsTest(RealAppWebBase):
         from synoarr.web import INDEX_JS
         self.assertIn("data-mon", INDEX_JS)
         self.assertIn("data-efm", INDEX_JS)
+
+
+class TrendingTest(RealAppWebBase):
+    def test_trending_endpoints(self) -> None:
+        self.assertFalse(self.req("/api/trending?list=trending_movies")[1]["tmdb_configured"])
+        self.app.tmdb.enabled = True
+        self.app.tmdb._get = lambda *a, **k: None  # no network in tests
+        self.app.search_titles = lambda *a, **k: {"results": [], "warnings": []}
+        mid = self.app.db.upsert_media("t1", "movie", "Film A", 2026, None, "11", None)
+        self.app.tmdb.trend_list = lambda name, page=1: [
+            {"source": "tmdb", "type": "movie", "title": "Film A", "year": 2026, "tmdb": "11", "poster_url": None},
+            {"source": "tmdb", "type": "movie", "title": "Film B", "year": 2026, "tmdb": "12", "poster_url": None}]
+        data = self.req("/api/trending?list=trending_movies")[1]
+        self.assertEqual([(i["title"], i["in_watchlist"], i["media_id"]) for i in data["items"]],
+                         [("Film A", True, mid), ("Film B", False, None)])
+        self.assertEqual(self.req("/api/trending?list=nope")[0], 400)
+        self.app.search_now = lambda m: None
+        status, out, _ = self.req("/api/trending/add", "POST",
+                                  {"candidate": data["items"][1], "languages": "fr", "add_to_plex": False})
+        self.assertEqual(status, 200, out)
+        added = [m for m in self.app.db.list_media() if m["title"] == "Film B"][0]
+        self.assertEqual(added["language_override"], "fr")
+        self.assertEqual(self.req("/api/trending/add", "POST", {"candidate": {"title": "x"}})[0], 400)
+        from synoarr.web import INDEX_JS, INDEX_HTML
+        self.assertIn("V.trend", INDEX_JS)
+        self.assertIn('id="subnav"', INDEX_HTML)
