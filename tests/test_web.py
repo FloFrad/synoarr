@@ -1724,3 +1724,11 @@ class FrenchTitleWebTest(RealAppWebBase):
         self.req("/api/media/%d/title_fr" % mid, "POST", {"title_fr": ""})
         self.assertIsNone(self.app.db.get_media(mid)["title_fr"])
         self.assertEqual(self.req("/api/media/%d/title_fr" % mid, "POST", {"title_fr": 5})[0], 400)
+
+
+class SourceListControlsTest(unittest.TestCase):
+    def test_sort_and_filters_present(self) -> None:
+        from synoarr.web import INDEX_JS
+        for needle in ('data-sort="${c[0]}"', 'id="sfseed"', 'id="sfsmin"', 'id="sfsmax"', 'id="sfq"', 'id="sfidx"',
+                       'id="sfok"', "function srcRows"):
+            self.assertIn(needle, INDEX_JS)

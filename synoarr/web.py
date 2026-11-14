@@ -1296,13 +1296,44 @@ async function srcSearch(){const S0=SRC;try{const r=await api('media/'+S0.mid+'/
     if(SRC===S0)drawSrcRes(j)}
   catch(e){if(SRC===S0)$('#sres2').innerHTML=`<div class="msg ko">${esc(e.message)}</div>`}}
 let srcJob=null;
-function drawSrcRes(j){srcJob=j;const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
+/* tri + filtres de la liste des sources */
+const SF={key:'score',dir:-1,q:'',smin:'',smax:'',seed:'',idx:'',ok:false};
+const SCOLS=[['score','Score'],['title','Release'],['size','Taille'],['seeders','Seeders'],['indexer','Indexer']];
+const sval=(x,k)=>k==='title'||k==='indexer'?String(x[k]||'').toLowerCase():(x[k]==null?-1:+x[k]);
+function srcRows(list){const GB=1073741824;const q=SF.q.trim().toLowerCase();
+  const smin=SF.smin===''?null:parseFloat(SF.smin)*GB,smax=SF.smax===''?null:parseFloat(SF.smax)*GB,seed=SF.seed===''?null:parseInt(SF.seed,10);
+  const out=list.filter(x=>ltPass(x,LTF.src)&&(!q||String(x.title).toLowerCase().includes(q))&&(smin==null||isNaN(smin)||(x.size||0)>=smin)
+    &&(smax==null||isNaN(smax)||((x.size||0)>0&&x.size<=smax))&&(seed==null||isNaN(seed)||(x.seeders!=null&&x.seeders>=seed))
+    &&(!SF.idx||x.indexer===SF.idx)&&(!SF.ok||x.score!=null));
+  out.sort((a,b)=>{const va=sval(a,SF.key),vb=sval(b,SF.key);return (va<vb?-1:va>vb?1:0)*SF.dir||(a.index-b.index)});return out}
+function drawSrcTable(){const r=srcJob&&srcJob.result,el=$('#srctbl');if(!r||!el)return;const vis=srcRows(r.results);
+  $('#srcn').textContent=`${vis.length} / ${r.results.length} affiché(s)`;
+  $('#srcchips').innerHTML=ltChips(r.results,'src');
+  const th=c=>`<th${c[0]==='size'||c[0]==='seeders'||c[0]==='indexer'?' class="hm"':''}><button type="button" class="sortb${SF.key===c[0]?' on':''}" data-sort="${c[0]}" title="Trier par ${c[1].toLowerCase()}">${c[1]}${SF.key===c[0]?(SF.dir<0?' ▼':' ▲'):''}</button></th>`;
+  el.innerHTML=vis.length?`<div class="tw srt"><table><tr>${SCOLS.map(th).join('')}<th></th></tr>
+  ${vis.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
+  <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir<span class="hm"> quand même</span>':'Choisir'}</button></td></tr>`).join('')}</table></div>`
+  :'<p class="mut">Aucun résultat ne correspond aux filtres.</p>'}
+function drawSrcRes(j){const first=srcJob!==j||!$('#srctbl');srcJob=j;const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
   SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
   if(!r.results.length){el.innerHTML=`<p class="mut">Aucun résultat pour ${esc(r.request)} (langues : ${langs}). Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
-  const ok=r.results.filter(x=>x.score!=null).length,vis=r.results.filter(x=>ltPass(x,LTF.src));
-  el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>${ltChips(r.results,'src')}${vis.length?'':'<p class="mut">Aucun résultat de ce type.</p>'}<div class="tw srt"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>
-  ${vis.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
-  <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir<span class="hm"> quand même</span>':'Choisir'}</button></td></tr>`).join('')}</table></div>`}
+  if(first){const ok=r.results.filter(x=>x.score!=null).length,idxs=[...new Set(r.results.map(x=>x.indexer))].sort();
+    if(SF.idx&&!idxs.includes(SF.idx))SF.idx='';
+    const opt=(v,l)=>`<option value="${esc(v)}"${SF.key===v?' selected':''}>${l}</option>`;
+    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
+    <div id="srcchips"></div>
+    <div class="row sfil" role="group" aria-label="Filtrer les sources">
+      <input id="sfq" type="search" placeholder="Filtrer le titre (ex. 1080p, MULTi…)" value="${esc(SF.q)}" aria-label="Filtrer le titre">
+      <label class="mini">Taille (Go) <input id="sfsmin" type="number" min="0" step="0.1" placeholder="min" value="${esc(SF.smin)}" aria-label="Taille minimale en Go"> – <input id="sfsmax" type="number" min="0" step="0.1" placeholder="max" value="${esc(SF.smax)}" aria-label="Taille maximale en Go"></label>
+      <label class="mini">Seeders ≥ <input id="sfseed" type="number" min="0" step="1" placeholder="0" value="${esc(SF.seed)}" aria-label="Seeders minimum"></label>
+      <select id="sfidx" aria-label="Indexer"><option value="">Tous les indexers</option>${idxs.map(v=>`<option value="${esc(v)}"${SF.idx===v?' selected':''}>${esc(v)}</option>`).join('')}</select>
+      <select id="sfsort" aria-label="Trier par">${opt('score','Tri : score')}${opt('seeders','Tri : seeders')}${opt('size','Tri : taille')}${opt('title','Tri : titre')}${opt('indexer','Tri : indexer')}</select>
+      <label class="chk"><input type="checkbox" id="sfok"${SF.ok?' checked':''}> Acceptables seulement</label>
+      <button type="button" class="xs sec" data-sfreset="1">Réinitialiser</button><span id="srcn" class="mut small"></span>
+    </div><div id="srctbl"></div>`}
+  drawSrcTable()}
+function srcFilterInput(){SF.q=$('#sfq').value;SF.smin=$('#sfsmin').value;SF.smax=$('#sfsmax').value;SF.seed=$('#sfseed').value;
+  SF.idx=$('#sfidx').value;SF.ok=$('#sfok').checked;const k=$('#sfsort').value;if(k!==SF.key){SF.key=k;SF.dir=(k==='title'||k==='indexer')?1:-1}drawSrcTable()}
 async function srcSend(body){const S0=SRC;if(!S0)return;const msg=$('#smsg'),btns=[...document.querySelectorAll('#srcb button')];
   Object.assign(body,{season:S0.s,episode:S0.e,grab_id:S0.g,delete_old:!!($('#sdel')&&$('#sdel').checked),blocklist_old:!!($('#sblk')&&$('#sblk').checked)});
   btns.forEach(b=>b.disabled=true);msg.innerHTML='<div class="msg wa">Envoi à Download Station…</div>';msg.scrollIntoView({block:'nearest'});
@@ -1319,8 +1350,14 @@ async function srcFile(){const f=$('#sfile').files[0];if(!f){toast('Choisissez u
   try{const data=await new Promise((ok,ko)=>{const rd=new FileReader();rd.onload=()=>ok(String(rd.result));rd.onerror=()=>ko(new Error('Lecture du fichier impossible'));rd.readAsDataURL(f)});
     srcSend({torrent_base64:data.slice(data.indexOf(',')+1)})}catch(e){toast(e.message,true)}}
 srcm.addEventListener('click',e=>{if(e.target===srcm||e.target.closest('[data-mclose]')){closeSrc();return}
-  const f=e.target.closest('button[data-ltf]');if(f){LTF.src=f.dataset.ltf;if(srcJob)drawSrcRes(srcJob);return}
+  const f=e.target.closest('button[data-ltf]');if(f){LTF.src=f.dataset.ltf;drawSrcTable();return}
+  const so=e.target.closest('button[data-sort]');if(so){const k=so.dataset.sort;if(SF.key===k)SF.dir=-SF.dir;else{SF.key=k;SF.dir=(k==='title'||k==='indexer')?1:-1}
+    if($('#sfsort'))$('#sfsort').value=SF.key;drawSrcTable();return}
+  if(e.target.closest('[data-sfreset]')){Object.assign(SF,{key:'score',dir:-1,q:'',smin:'',smax:'',seed:'',idx:'',ok:false});LTF.src='all';
+    if(srcJob){const j0=srcJob;srcJob=null;drawSrcRes(j0)}return}
   const b=e.target.closest('button[data-pick]');if(b)pick(+b.dataset.pick)});
+srcm.addEventListener('input',e=>{if(e.target.closest('.sfil'))srcFilterInput()});
+srcm.addEventListener('change',e=>{if(e.target.closest('.sfil'))srcFilterInput()});
 srcm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='slf'){const v=$('#slink').value.trim();if(!v){toast('Collez un lien magnet ou une URL .torrent',true);return}srcSend({link:v})}
   else if(e.target.id==='sff')srcFile()});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if(SRC)closeSrc();else if(GM)closeGM()});
@@ -1464,7 +1501,7 @@ button.xs{font-size:12px;padding:3px 8px}h4{margin:14px 0 6px;font-size:14px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow-y:auto}
 .mbox{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:12px;width:100%;max-width:920px;padding:14px 16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .mhd{display:flex;justify-content:space-between;align-items:center;gap:10px}.mhd h3{margin:0}.opts{margin:4px 0 6px;gap:6px 16px}
-#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.srt table td,.srt table th{padding:5px 6px}
+#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
 body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(--pub);color:var(--puf)}
 .cands{display:flex;flex-direction:column;gap:8px;margin-top:10px}.cand{display:flex;gap:12px;border:1px solid var(--bd);border-radius:8px;padding:8px}
 .cand img,.noimg{width:62px;height:93px;object-fit:cover;border-radius:6px;flex:0 0 62px;background:var(--neb)}.noimg{display:flex;align-items:center;justify-content:center;color:var(--mut)}
