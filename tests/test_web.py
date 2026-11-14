@@ -2145,3 +2145,121 @@ class FrenchOnlySourcesParamTest(RealAppWebBase):
         self.assertIn("Titre français seulement", INDEX_JS)
         self.assertIn("french_only_default", INDEX_JS)
         self.assertIn("recherche élargie au titre original", INDEX_JS)
+
+
+class ConfigFormTest(RealAppWebBase):
+    def read(self) -> str:
+        with open(self.cfg_path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def field(self, data: Dict[str, Any], section: str, key: str) -> Dict[str, Any]:
+        sec = next(s for s in data["sections"] if s["name"] == section)
+        return next(f for f in sec["fields"] if f["key"] == key)
+
+    def test_schema(self) -> None:
+        status, data, _ = self.req("/api/config/form")
+        self.assertEqual(status, 200, data)
+        titles = [s["title"] for s in data["sections"]]
+        self.assertEqual(titles[:4], ["Général", "Plex", "Download Station", "Dossiers"])
+        self.assertIn("Interface web", titles)
+        f = self.field(data, "paths", "min_age_minutes")
+        self.assertEqual((f["type"], f["value"], f["default"], f["in_file"]), ("float", 0.0, 5.0, True))
+        self.assertTrue(f["help"].startswith("Un téléchargement n'est traité"))  # from config.example.ini
+        self.assertEqual(self.field(data, "paths", "action")["choices"][0][0], "move")
+        self.assertEqual(self.field(data, "quality", "languages")["type"], "list")
+        self.assertEqual(self.field(data, "general", "dry_run")["type"], "bool")
+        self.assertEqual(self.field(data, "web", "port")["type"], "int")
+        for sec, key in (("downloadstation", "password"), ("plex", "token"), ("tmdb", "api_key")):
+            f = self.field(data, sec, key)
+            self.assertTrue(f["secret"])
+            self.assertIsNone(f["value"])
+        self.assertTrue(self.field(data, "downloadstation", "password")["has_value"])
+        self.assertNotIn("secret", json.dumps([f.get("value") for s in data["sections"] for f in s["fields"]]))
+        self.assertNotIn("PLEXTOKEN", json.dumps(data))
+
+    def test_round_trip_keeps_comments_and_untouched_keys(self) -> None:
+        changes = {"paths": {"min_age_minutes": "3,5", "action": "copy"}, "general": {"dry_run": True},
+                   "quality": {"languages": "EN, fr"}, "series": {"monitor": "future"},
+                   "downloadstation": {"password": "", "username": "synoarr"}}
+        # password "" is an explicit clear; username unchanged -> not rewritten
+        status, data, _ = self.req("/api/config/form", "POST", {"changes": changes})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(sorted(data["changed"]), ["downloadstation.password", "general.dry_run", "paths.action",
+                                                    "paths.min_age_minutes", "quality.languages", "series.monitor"])
+        text = self.read()
+        self.assertTrue(text.startswith("; configuration de test (commentaire conservé)\n[general]\n"))
+        self.assertIn("min_age_minutes = 3.5\naction = copy\n[web]", text)  # missing key appended to its section
+        self.assertIn("log_level = WARNING\ndry_run = true\n", text)
+        self.assertIn("password =\n", text)
+        self.assertIn("\n[quality]\nlanguages = en, fr\n", text)  # missing section appended at the end
+        self.assertIn("[series]\nmonitor = future\n", text)
+        self.assertIn("token = PLEXTOKEN", text)
+        self.assertEqual(self.app.cfg.paths.action, "copy")
+        self.assertEqual(self.app.cfg.quality.languages, ["en", "fr"])
+        self.assertTrue(os.path.exists(self.cfg_path + ".bak1"))
+        # secret left empty by the form = not sent = untouched ; nothing changed -> nothing written
+        status, data, _ = self.req("/api/config/form", "POST", {"changes": {"plex": {"server_url": ""}}})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["changed"], [])
+        self.assertEqual(self.read(), text)
+
+    def test_invalid_values_refused_and_file_unchanged(self) -> None:
+        for changes in ({"paths": {"min_age_minutes": "vite"}}, {"web": {"port": "80a"}},
+                        {"nope": {"x": 1}}, {"paths": {"inconnu": 1}}, {"paths": {"action": "a\nb"}},
+                        {"paths": "copy"}):
+            status, data, _ = self.req("/api/config/form", "POST", {"changes": changes})
+            self.assertEqual(status, 400, (changes, data))
+            self.assertTrue(data["problems"], data)
+        status, data, _ = self.req("/api/config/form", "POST", {"changes": {"paths": {"action": "téléporter"}}})
+        self.assertEqual(status, 400, data)
+        self.assertTrue(any(p.startswith("[paths] action") for p in data["problems"]), data)
+        self.assertEqual(self.read(), self.cfg_text)
+        self.assertFalse(os.path.exists(self.cfg_path + ".bak1"))
+
+    def test_apply_changes_unit(self) -> None:
+        from synoarr.configform import apply_changes, parse_help
+        text = "; tête\n[a]\n; aide\nx = 1\n  suite\ny=2\n\n\n[b]\nz = 3\n"
+        out = apply_changes(text, {"a": {"x": "9", "new": "n"}, "c": {"k": "v"}})
+        self.assertEqual(out, "; tête\n[a]\n; aide\nx = 9\ny=2\nnew = n\n\n\n[b]\nz = 3\n\n[c]\nk = v\n")
+        helps = parse_help("[s]\n; Aide de a\na = 1\nb = 2\n; true = prose\nc = 3\n")
+        self.assertEqual(helps[("s", "a")], ("Aide de a", False))
+        self.assertEqual(helps[("s", "b")], ("Aide de a", True))
+        self.assertEqual(helps[("s", "c")], ("true = prose", False))
+
+
+class HistoryPeriodTest(RealAppWebBase):
+    def test_since_until(self) -> None:
+        db = self.app.db
+        ids = [db.add_grab(None, None, None, "R%d" % i, "R%d" % i, "Fake", None, 1) for i in range(4)]
+        for gid, day in zip(ids, ("2026-01-01", "2026-02-10", "2026-02-11", "2026-03-01")):
+            db.execute("UPDATE grabs SET created_at = ? WHERE id = ?", (day + " 12:00:00", gid))
+        old = self.req("/api/grabs?limit=2")[1]  # previous behaviour: a plain list
+        self.assertEqual([g["id"] for g in old], [ids[3], ids[2]])
+        d = self.req("/api/grabs?since=2026-02-10&until=2026-02-11")[1]
+        self.assertEqual(([g["id"] for g in d["items"]], d["total"]), ([ids[2], ids[1]], 2))
+        d = self.req("/api/grabs?since=2026-02-01&limit=1")[1]
+        self.assertEqual((len(d["items"]), d["total"], d["until"]), (1, 3, "9999-12-31"))
+        self.assertEqual(self.req("/api/grabs?until=2026-01-01")[1]["total"], 1)
+        for q in ("since=2026-13-01", "since=hier", "since=2026-03-01&until=2026-02-01"):
+            self.assertEqual(self.req("/api/grabs?" + q)[0], 400, q)
+            self.assertEqual(self.req("/api/events?" + q)[0], 400, q)
+        db.add_event("test", "aujourd'hui")
+        import datetime as dt
+        today = dt.date.today().isoformat()
+        d = self.req("/api/events?since=%s&until=%s" % (today, today))[1]
+        self.assertTrue(any(e["message"] == "aujourd'hui" for e in d["items"]))
+        self.assertEqual(d["total"], len(d["items"]))
+        self.assertIsInstance(self.req("/api/events?limit=5")[1], list)
+        from synoarr.web import INDEX_JS
+        for w in ("30 derniers jours", "Période personnalisée", "affichés sur", "synoarr.hist"):
+            self.assertIn(w, INDEX_JS)
+
+
+class CommandCategoriesTest(WebTestBase):
+    def test_status_lists_commands_and_ui_categories(self) -> None:
+        data = self.req("/api/status")[1]
+        self.assertIn("sync", data["commands"])
+        from synoarr.web import INDEX_JS, INDEX_HTML
+        for w in ("Watchlist & recherche", "Téléchargements", "Connexions & notifications", "Maintenance", "'Autres'"):
+            self.assertIn(w, INDEX_JS)
+        self.assertIn('id="msearch"', INDEX_HTML)  # manual search moved to the dashboard

@@ -534,6 +534,11 @@ class WebServer:
             "(SELECT COUNT(*) FROM grabs WHERE status='sent') AS downloading, "
             "(SELECT COUNT(*) FROM indexers WHERE enabled=1) AS indexers_enabled") or {}
         status["counts"] = one
+        try:  # commandes connues du programme (onglet Commandes : seules celles-ci sont proposées)
+            from .app import COMMANDS
+            status.setdefault("commands", dict(COMMANDS))
+        except ImportError:  # pragma: no cover
+            pass
         return status
 
     def _downloads(self) -> Dict[str, Any]:
@@ -872,13 +877,46 @@ class WebServer:
         self.app.indexer_manager.delete(indexer_id)
         return {"ok": True}
 
-    def api_grabs(self, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
-        return self.app.db.query(
-            "SELECT g.*, m.title AS media_title, m.type AS media_type FROM grabs g "
-            "LEFT JOIN media m ON m.id = g.media_id ORDER BY g.id DESC LIMIT ?", (self._limit(query, 200),))
+    @staticmethod
+    def _period(query: Dict[str, str]) -> Optional[Tuple[str, str]]:
+        """?since=YYYY-MM-DD&until=YYYY-MM-DD (inclusive) -> (since, until), None without these parameters."""
+        if "since" not in query and "until" not in query:
+            return None
+        out = []
+        for name, empty in (("since", "0001-01-01"), ("until", "9999-12-31")):
+            raw = (query.get(name) or "").strip()
+            if not raw:
+                out.append(empty)
+                continue
+            try:
+                out.append(_dt.datetime.strptime(raw, "%Y-%m-%d").date().isoformat())
+            except ValueError:
+                raise HttpProblem(400, "Date invalide pour « %s » : AAAA-MM-JJ attendu (ex. 2026-11-01)" % name)
+        if out[0] > out[1]:
+            raise HttpProblem(400, "Période invalide : la date de début est après la date de fin")
+        return out[0], out[1]
 
-    def api_events(self, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
-        return self.app.db.recent_events(self._limit(query, 100))
+    def _history(self, sql: str, count_sql: str, date_col: str, query: Dict[str, str], default: int) -> Any:
+        period = self._period(query)
+        if period is None:  # previous behaviour: latest *limit* rows, plain list
+            return self.app.db.query(sql % "1=1", (self._limit(query, default),))
+        cond = "substr(%s, 1, 10) BETWEEN ? AND ?" % date_col
+        limit = self._limit(query, 500)
+        rows = self.app.db.query(sql % cond, (period[0], period[1], limit))
+        total = (self.app.db.query_one(count_sql % cond, period) or {}).get("n", 0)
+        return {"items": rows, "total": int(total or 0), "limit": limit, "since": period[0], "until": period[1]}
+
+    def api_grabs(self, query: Dict[str, str], body: Any) -> Any:
+        """Envois, les plus récents d'abord. Avec ?since=&until= : {"items", "total", "limit", "since", "until"}."""
+        return self._history(
+            "SELECT g.*, m.title AS media_title, m.type AS media_type FROM grabs g "
+            "LEFT JOIN media m ON m.id = g.media_id WHERE %s ORDER BY g.id DESC LIMIT ?",
+            "SELECT COUNT(*) AS n FROM grabs g WHERE %s", "g.created_at", query, 200)
+
+    def api_events(self, query: Dict[str, str], body: Any) -> Any:
+        """Événements, les plus récents d'abord. Avec ?since=&until= : même format que /api/grabs."""
+        return self._history("SELECT * FROM events WHERE %s ORDER BY id DESC LIMIT ?",
+                             "SELECT COUNT(*) AS n FROM events WHERE %s", "ts", query, 100)
 
     def api_run_watchlist(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         if self.app.run_watchlist_now() is False:
@@ -1529,11 +1567,23 @@ V.idx=async()=>{const [ix,cat,prw,jkt]=await Promise.all([api('indexers'),api('c
   <input id="jktk" name="api_key" type="password" autocomplete="new-password" placeholder="Clé API Jackett" aria-label="Clé API Jackett" value="${esc(JKT.key)}"><button type="submit">Importer</button></form><div id="jktr">${JKT.res}</div>${jktState(jkt)}</div>
   <div class="card"><h3>Catalogue (sources légales)</h3>${cat.map(c=>`<div class="item it"><div><b>${esc(c.name)}</b> ${badge(c.type)}<div class="meta mut">${esc(c.description||'')}</div></div>
   <div class="acts">${c.installed?'<span class="b b-done">Installé</span>':`<button data-cat="${esc(c.id)}">Ajouter</button>`}</div></div>`).join('')||'<p class="mut">Catalogue vide.</p>'}</div>`};
-V.hist=async()=>{const [g,ev]=await Promise.all([api('grabs'),api('events?limit=100')]);
-  return `<div class="card"><h3>Téléchargements envoyés</h3>${g.length?`<div class="tw"><table><tr><th>Date</th><th>Release</th><th class="hm">Média</th><th class="hm">Indexer</th><th class="hm">Taille</th><th>Statut</th></tr>
+/* Historique : période (mémorisée dans le navigateur) */
+let HP={p:'30',from:'',to:''};try{Object.assign(HP,JSON.parse(localStorage.getItem('synoarr.hist')||'{}'))}catch(e){}
+const saveHP=()=>{try{localStorage.setItem('synoarr.hist',JSON.stringify(HP))}catch(e){}};
+const isoD=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
+const HPS=[['today','Aujourd\'hui'],['7','7 derniers jours'],['30','30 derniers jours'],['90','90 derniers jours'],['all','Tout'],['custom','Période personnalisée']];
+function histRange(){const t=new Date(),ago=n=>{const d=new Date(t);d.setDate(d.getDate()-n);return isoD(d)};
+  if(HP.p==='today')return [isoD(t),isoD(t)];if(HP.p==='all')return ['',''];if(HP.p==='custom')return [HP.from||'',HP.to||''];
+  return [ago((+HP.p||30)-1),isoD(t)]}
+const hcount=(d,w)=>d.total>d.items.length?`<span class="mut small">${d.items.length} affichés sur ${d.total}</span>`:`<span class="mut small">${d.total} ${w}</span>`;
+V.hist=async()=>{const [a,b]=histRange(),q=`since=${encodeURIComponent(a)}&until=${encodeURIComponent(b)}`;
+  const [gd,ed]=await Promise.all([api('grabs?'+q),api('events?'+q)]);const g=gd.items,ev=ed.items;
+  const per=`<div class="card"><div class="row hper"><label class="mini" for="hp">Période</label><select id="hp">${HPS.map(o=>`<option value="${o[0]}"${HP.p===o[0]?' selected':''}>${o[1]}</option>`).join('')}</select>
+  ${HP.p==='custom'?`<label class="mini">du <input type="date" id="hpf" value="${esc(HP.from)}" max="${esc(HP.to||'')}"></label><label class="mini">au <input type="date" id="hpt" value="${esc(HP.to)}" min="${esc(HP.from||'')}"></label>`:''}</div></div>`;
+  return `${per}<div class="card"><h3>Téléchargements envoyés ${hcount(gd,'envoi(s)')}</h3>${g.length?`<div class="tw"><table><tr><th>Date</th><th>Release</th><th class="hm">Média</th><th class="hm">Indexer</th><th class="hm">Taille</th><th>Statut</th></tr>
   ${g.map(x=>`<tr><td class="nw">${esc(fdate(x.created_at))}</td><td class="brk">${esc(x.release_title)}${x.message?`<div class="mut">${esc(x.message)}</div>`:''}</td><td class="hm">${esc(x.media_title||'')}${x.season!=null?` S${String(x.season).padStart(2,'0')}${x.episode!=null?'E'+String(x.episode).padStart(2,'0'):''}`:''}</td>
-  <td class="hm">${esc(x.indexer||'')}</td><td class="hm nw">${size(x.size)}</td><td>${badge(x.status)}</td></tr>`).join('')}</table></div>`:'<p class="mut">Aucun téléchargement pour le moment.</p>'}</div>
-  <div class="card"><h3>Événements</h3>${evList(ev)}</div>`};
+  <td class="hm">${esc(x.indexer||'')}</td><td class="hm nw">${size(x.size)}</td><td>${badge(x.status)}</td></tr>`).join('')}</table></div>`:'<p class="mut">Aucun téléchargement sur cette période.</p>'}</div>
+  <div class="card"><h3>Événements ${hcount(ed,'événement(s)')}</h3>${ev.length?evList(ev):'<p class="mut">Aucun événement sur cette période.</p>'}</div>`};
 /* ---------------------------------------------------------------- Commandes */
 const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (films et séries).'],
   ['search_all','Rechercher tout','Synchronise puis cherche sur les indexers tout ce qui manque.'],
@@ -1552,13 +1602,23 @@ const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (f
 const PFX={ok:'[OK]  ',err:'[ERR] ',warn:'[!]   ',info:''};
 let jobs={}, cur=null, srch=null, plexId=null;
 const polling=new Set();
-S.cmd=async()=>{app.innerHTML=`<div class="card"><h3>Commandes</h3><div class="cmds">
-  ${CMDS.map(c=>`<div class="cmd"><button data-cmd="${c[0]}">${c[1]}</button><span class="mut">${c[2]}</span>${c[0]==='search_all'?'<label class="chk"><input type="checkbox" id="force"> forcer (ignorer le délai entre deux recherches)</label>':''}</div>`).join('')}
-  <div class="cmd"><button data-plex="1">Connexion Plex</button><span class="mut">Relie synoarr à votre compte Plex (code à saisir sur plex.tv/link).</span></div>
-  <div class="cmd"><button class="danger" data-restart="1">Redémarrer synoarr</button><span class="mut">Relance le programme, après la fin des tâches en cours.</span></div>
-  </div><div id="plexbox"></div></div>
-  <div class="card"><h3>Recherche manuelle</h3><form id="sf" class="row" autocomplete="off"><input id="sq" type="search" placeholder="ex. Night of the Living Dead 1968 · Série S01E02" required maxlength="200"><button type="submit">Rechercher</button></form>
-  <p class="mut small">Rien n'est envoyé automatiquement : choisissez une release acceptable puis « Envoyer à Download Station ».</p><div id="sres"></div></div>
+/* catégories de l'onglet Commandes : une commande absente d'ici (ajoutée plus tard) va dans « Autres » */
+const CMDCAT=[['Watchlist & recherche',['sync','search_all','rss_sync']],['Téléchargements',['process','dry_run','ds_test','ds_diag']],
+  ['Indexers',['test_indexers']],['Bibliothèque',['subtitles_scan']],['Connexions & notifications',['check','plex_login','telegram_test']],
+  ['Maintenance',['update_check','update','update_rollback','restart']]];
+const CMDX={plex_login:['plex_login','Connexion Plex','Relie synoarr à votre compte Plex (code à saisir sur plex.tv/link).'],
+  restart:['restart','Redémarrer synoarr','Relance le programme, après la fin des tâches en cours.']};
+const cmdItem=c=>c[0]==='plex_login'?`<div class="cmd"><button data-plex="1">${esc(c[1])}</button><span class="mut">${esc(c[2])}</span></div>`
+  :c[0]==='restart'?`<div class="cmd"><button class="danger" data-restart="1">${esc(c[1])}</button><span class="mut">${esc(c[2])}</span></div>`
+  :`<div class="cmd"><button data-cmd="${esc(c[0])}">${esc(c[1])}</button>${c[2]?`<span class="mut">${esc(c[2])}</span>`:''}${c[0]==='search_all'?'<label class="chk"><input type="checkbox" id="force"> forcer (ignorer le délai entre deux recherches)</label>':''}</div>`;
+function cmdCards(known){const desc={};CMDS.forEach(c=>desc[c[0]]=c);
+  const avail=id=>id==='restart'||!known||id in known,get=id=>CMDX[id]||desc[id]||(known&&known[id]?[id,known[id],'']:null),used=new Set(['search']);
+  const cards=CMDCAT.map(([t,ids])=>{const it=ids.filter(avail).map(get).filter(Boolean);it.forEach(c=>used.add(c[0]));return it.length?[t,it]:null}).filter(Boolean);
+  const other=CMDS.map(c=>c[0]).concat(Object.keys(known||{})).filter((id,i,a)=>a.indexOf(id)===i&&!used.has(id)&&avail(id)).map(get).filter(Boolean);
+  if(other.length)cards.push(['Autres',other]);return cards}
+S.cmd=async()=>{let known=null;try{known=(await api('status')).commands||null}catch(e){}
+  app.innerHTML=`<div class="cmdcats">${cmdCards(known).map(([t,it])=>`<div class="card"><h3>${esc(t)}</h3><div class="cmdl">${it.map(cmdItem).join('')}</div>${it.some(c=>c[0]==='plex_login')?'<div id="plexbox"></div>':''}</div>`).join('')}</div>
+  <p class="mut small">La recherche manuelle (requête libre, résultats notés, envoi à Download Station) est sur le <a href="#dash">Tableau de bord</a>.</p>
   <div class="card" id="outc"><h3 id="outh">Résultat</h3><div id="out"><p class="mut">Lancez une commande : son résultat s'affichera ici.</p></div></div>
   <div class="card"><h3>Tâches récentes</h3><div id="jl" class="mut">…</div></div>`;
   [cur,srch,plexId].forEach(id=>{if(id&&jobs[id])draw(jobs[id])});loadJobs()};
@@ -1572,7 +1632,7 @@ async function poll(id){if(polling.has(id))return;polling.add(id);let fails=0;
 function done(j){if(j.result&&j.result.restarting){waitRestart(upS0)}
   if(j.command==='plex_login')toast(j.status==='done'?'Compte Plex connecté':(j.error||'Connexion Plex échouée'),j.status!=='done');
   else if(j.command!=='search')toast(j.label+' : '+(j.status==='done'?'terminé':'erreur'),j.status!=='done');loadJobs()}
-function draw(j){if(tab!=='cmd')return;if(j.id===cur&&$('#out'))drawOut(j);if(j.id===srch&&$('#sres'))drawSearch(j);if(j.id===plexId&&$('#plexbox'))drawPlex(j)}
+function draw(j){if(j.id===srch&&$('#sres'))drawSearch(j);if(tab!=='cmd')return;if(j.id===cur&&$('#out'))drawOut(j);if(j.id===plexId&&$('#plexbox'))drawPlex(j)}
 const con=o=>`<pre class="con">${o.map(x=>`<span class="o-${esc(x.level)}">${esc(PFX[x.level]||'')}${esc(x.text)}</span>`).join('\n')}</pre>`;
 function drawOut(j){$('#outh').innerHTML=`${esc(j.label)} ${badge(j.status)} <span class="mut small">${esc(fdate(j.started_at))}</span>`;
   const r=j.result||{};let h='';
@@ -1582,19 +1642,31 @@ function drawOut(j){$('#outh').innerHTML=`${esc(j.label)} ${badge(j.status)} <sp
   else h+=j.output.length?con(j.output):'';
   if(j.status==='running')h+='<p class="mut">En cours…</p>';
   $('#out').innerHTML=h||'<p class="mut">Aucune sortie.</p>'}
-function drawSearch(j){const r=j.result;let h=`<p class="small">${esc(j.label)} ${badge(j.status)}</p>`;
-  if(j.status==='running')h+='<p class="mut">Recherche en cours sur les indexers…</p>';
-  else if(j.status==='error')h+=con(j.output);
-  else if(r){const all=r.results,vis=all.filter(x=>ltPass(x,LTF.srch)),ok=vis.filter(x=>x.score!=null),ko=vis.filter(x=>x.score==null);
-    const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div>
-      <div class="mut small sm">${size(x.size)} · ${x.seeders==null?'?':esc(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${x.seeders==null?'?':esc(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td>
+/* recherche manuelle (Tableau de bord) : tri par colonne et filtres comme la liste des sources */
+const MSF={key:'score',dir:-1,q:'',ok:false};let msJob=null;
+function drawSearch(j){const r=j.result,el=$('#sres');if(!el)return;
+  if(j.status!=='done'||!r){msJob=null;el.innerHTML=`<p class="small">${esc(j.label)} ${badge(j.status)}</p>${j.status==='running'?'<p class="mut">Recherche en cours sur les indexers…</p>':j.status==='error'?con(j.output):''}`;return}
+  if(msJob!==j.id||!$('#mstbl')){msJob=j.id;const all=r.results;
+    el.innerHTML=`<p class="small">${esc(j.label)} ${badge(j.status)}</p><p class="mut small">Requête : ${esc(r.request)} (${esc(r.kind==='movie'?'film':r.kind==='season'?'saison':'épisode')}) — ${r.total} résultat(s), ${all.filter(x=>x.score!=null).length} acceptable(s)</p>
+    ${all.length?`<div id="mschips"></div><div class="row sfil"><input id="msq" type="search" placeholder="Filtrer le titre (ex. 1080p, MULTi…)" value="${esc(MSF.q)}" aria-label="Filtrer le titre"><label class="chk"><input type="checkbox" id="msok"${MSF.ok?' checked':''}> Acceptables seulement</label><span id="msn" class="mut small"></span></div>`:''}<div id="mstbl"></div>`}
+  drawMsTable()}
+function drawMsTable(){const j=msJob&&jobs[msJob],r=j&&j.result,el=$('#mstbl');if(!r||!el)return;const all=r.results,q=MSF.q.trim().toLowerCase();
+  if($('#mschips'))$('#mschips').innerHTML=ltChips(all,'srch');
+  const vis=all.filter(x=>ltPass(x,LTF.srch)&&(!q||String(x.title).toLowerCase().includes(q))&&(!MSF.ok||x.score!=null));
+  vis.sort((a,b)=>{const va=sval(a,MSF.key),vb=sval(b,MSF.key);return (va<vb?-1:va>vb?1:0)*MSF.dir||(a.index-b.index)});
+  if($('#msn'))$('#msn').textContent=`${vis.length} / ${all.length} affiché(s)`;
+  const th=c=>`<th${c[0]==='size'||c[0]==='seeders'||c[0]==='indexer'?' class="hm"':''}><button type="button" class="sortb${MSF.key===c[0]?' on':''}" data-msort="${c[0]}" title="Trier par ${c[1].toLowerCase()}">${c[1]}${MSF.key===c[0]?(MSF.dir<0?' ▼':' ▲'):''}</button></th>`;
+  const row=x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div>
+      <div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td><td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td>
       <td>${x.score!=null?`<button data-grab="${x.index}" title="Envoyer à Download Station">Envoyer<span class="hm"> à Download Station</span></button>`:''}</td></tr>`;
-    const tbl=a=>`<div class="tw"><table><tr><th>Score</th><th>Release</th><th class="hm">Taille</th><th class="hm">Seeders</th><th class="hm">Indexer</th><th></th></tr>${a.map(row).join('')}</table></div>`;
-    h+=`<p class="mut small">Requête : ${esc(r.request)} (${esc(r.kind==='movie'?'film':r.kind==='season'?'saison':'épisode')}) — ${r.total} résultat(s), ${all.filter(x=>x.score!=null).length} acceptable(s)</p>`;
-    if(all.length)h+=ltChips(all,'srch');
-    h+=ok.length?tbl(ok):'<p class="mut">Aucun résultat acceptable.</p>';
-    if(ko.length)h+=`<details><summary>Résultats rejetés (${ko.length})</summary>${tbl(ko)}</details>`}
-  $('#sres').innerHTML=h}
+  el.innerHTML=!all.length?'<p class="mut">Aucun résultat.</p>':vis.length?`<div class="tw srt"><table><tr>${SCOLS.map(th).join('')}<th></th></tr>${vis.map(row).join('')}</table></div>`:'<p class="mut">Aucun résultat ne correspond aux filtres.</p>'}
+const msBox=$('#msearch');
+msBox.addEventListener('submit',e=>{if(e.target.id!=='sf')return;e.preventDefault();const q=$('#sq').value.trim();if(q)startJob({command:'search',query:q})});
+msBox.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const d=b.dataset;
+  if(d.grab)grab(+d.grab,b);else if(d.ltf&&d.lts==='srch'){LTF.srch=d.ltf;drawMsTable()}
+  else if(d.msort){const k=d.msort;if(MSF.key===k)MSF.dir=-MSF.dir;else{MSF.key=k;MSF.dir=(k==='title'||k==='indexer')?1:-1}drawMsTable()}});
+msBox.addEventListener('input',e=>{if(e.target.id==='msq'){MSF.q=e.target.value;drawMsTable()}});
+msBox.addEventListener('change',e=>{if(e.target.id==='msok'){MSF.ok=e.target.checked;drawMsTable()}});
 function drawPlex(j){const r=j.result||{};let st;
   if(j.status==='running')st='<span class="mut">En attente de la validation sur plex.tv (5 minutes max)…</span>';
   else if(j.status==='done')st=`<span class="o-ok">✔ ${esc((j.output.slice(-1)[0]||{}).text||'Compte Plex connecté')}</span>`;
@@ -1641,15 +1713,57 @@ async function loadLogs(reset){clearTimeout(logT);const v=$('#logv');if(tab!=='l
 /* ------------------------------------------------------------ Configuration */
 let cfgD=null;
 const dirty=()=>cfgD&&cfgD.text!==cfgD.orig;
-S.cfg=async()=>{const d=await api('config');if(!dirty())cfgD={text:d.text,orig:d.text};else cfgD.orig=d.text;
+/* formulaire (GET/POST api/config/form) + éditeur brut replié (« Mode avancé ») */
+let CFF=null,CFINIT={},CFQ='',CFADV=false;const CFOPEN=new Set(['general']);
+const cfId=(s,k)=>'cf_'+s+'__'+k;
+const cfVal=f=>f.type==='bool'?!!f.value:f.type==='list'?(Array.isArray(f.value)?f.value.join(', '):String(f.value||'')):(f.value==null?'':String(f.value));
+function cfInput(sec,f){const id=cfId(sec.name,f.key),a=`id="${id}" data-cs="${esc(sec.name)}" data-ck="${esc(f.key)}"`;
+  if(f.secret)return `<input type="password" ${a} autocomplete="new-password" placeholder="${f.has_value?'•••• défini (laisser vide = inchangé)':'non défini'}">${f.has_value?`<label class="chk"><input type="checkbox" id="${id}__clr" data-cclr="${id}"> effacer</label>`:''}`;
+  if(f.type==='bool')return `<label class="chk cfb"><input type="checkbox" ${a}${f.value?' checked':''}> ${f.value?'oui':'non'}</label>`;
+  const v=cfVal(f);
+  if(f.choices){const o=f.choices.some(c=>c[0]===v)?f.choices:f.choices.concat([[v,v]]);return `<select ${a}>${o.map(c=>`<option value="${esc(c[0])}"${c[0]===v?' selected':''}>${esc(c[1])}</option>`).join('')}</select>`}
+  if(f.type==='int'||f.type==='float')return `<input type="number" ${a} step="${f.type==='int'?1:'any'}" value="${esc(v)}">`;
+  return `<input type="text" ${a} spellcheck="false" value="${esc(v)}"${f.type==='list'?' placeholder="valeurs séparées par des virgules"':''}>`}
+const cfDef=f=>f.secret||f.default==null?'':` <span class="mut small">· défaut : ${esc(cfVal({type:f.type,value:f.default})||'vide')}</span>`;
+function cfForm(d){CFINIT={};
+  return d.sections.map(sec=>`<details class="card cfs" data-sec="${esc(sec.name)}"${CFOPEN.has(sec.name)||CFQ?' open':''}><summary><b>${esc(sec.title)}</b> <span class="mut small">[${esc(sec.name)}]</span> <span class="b b-grabbed" data-cfmod="${esc(sec.name)}" hidden></span></summary>
+  ${sec.help?`<p class="mut small cfsh">${esc(sec.help)}</p>`:''}${sec.fields.map(f=>{const id=cfId(sec.name,f.key);CFINIT[id]=f.secret?'':cfVal(f);
+    return `<div class="cff" data-q="${esc((f.key+' '+f.label+' '+f.help+' '+sec.title+' '+sec.name).toLowerCase())}"><label class="cfl" for="${id}"><b>${esc(f.label)}</b> <code>${esc(f.key)}</code>${cfDef(f)}</label>
+    <div class="cfi">${cfInput(sec,f)}<div class="small o-err" id="${id}__err"></div></div>${f.help?`<div class="mut small cfh">${esc(f.help)}</div>`:''}</div>`}).join('')}</details>`).join('')}
+function cfChanges(){const out={};let n=0;const per={};
+  document.querySelectorAll('#cff [data-cs]').forEach(el=>{const s=el.dataset.cs,k=el.dataset.ck,id=el.id;let v=null;
+    if(el.type==='password'){const c=$('#'+id+'__clr');if(el.value!=='')v=el.value;else if(c&&c.checked)v=''}
+    else{const cur=el.type==='checkbox'?el.checked:el.value;if(cur!==CFINIT[id])v=cur}
+    if(v!==null){(out[s]=out[s]||{})[k]=v;n++;per[s]=(per[s]||0)+1}});
+  return {out,n,per}}
+function cfUpdate(t){if(t&&t.type==='checkbox'&&t.dataset.cs&&t.parentNode.classList.contains('cfb'))t.parentNode.lastChild.textContent=t.checked?' oui':' non';
+  const c=cfChanges();document.querySelectorAll('[data-cfmod]').forEach(b=>{const k=c.per[b.dataset.cfmod]||0;b.hidden=!k;b.textContent=k+' modifié'+(k>1?'s':'')});
+  const cn=$('#cfn');if(cn)cn.textContent=c.n?c.n+' modification'+(c.n>1?'s':'')+' non enregistrée'+(c.n>1?'s':''):'';
+  document.querySelectorAll('[data-cffsave]').forEach(b=>b.disabled=!c.n);return c}
+function cfFilter(){const q=CFQ.trim().toLowerCase();let shown=0;
+  document.querySelectorAll('#cff .cfs').forEach(sec=>{let vis=0;sec.querySelectorAll('.cff').forEach(r=>{const ok=!q||r.dataset.q.includes(q);r.hidden=!ok;if(ok)vis++});
+    sec.hidden=!vis;if(q&&vis)sec.open=true;shown+=vis});const e=$('#cfqn');if(e)e.textContent=q?shown+' option(s)':''}
+async function cfgFormSave(){const c=cfChanges(),box=$('#cffr');if(!c.n){toast('Aucune modification');return}
+  document.querySelectorAll('#cff .o-err').forEach(e=>e.textContent='');
+  try{const r=await api('config/form','POST',{changes:c.out});toast(r.message);await S.cfg();$('#cffr').innerHTML=cfgResult(r)}
+  catch(e){const p=(e.data&&e.data.problems)||[];
+    p.forEach(x=>{const m=/^\[(\w+)\]\s+(?:\w+\.)?(\w+)/.exec(x);const el=m&&$('#'+cfId(m[1],m[2])+'__err');if(el){el.textContent=x;const d=el.closest('details');if(d)d.open=true}});
+    box.innerHTML=`<div class="msg ko"><b>${esc(e.message)}</b>${p.length?`<ul>${p.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`;box.scrollIntoView({block:'nearest'});toast(e.message,true)}}
+S.cfg=async()=>{const [d,f]=await Promise.all([api('config'),api('config/form').catch(e=>({error:e.message}))]);if(!dirty())cfgD={text:d.text,orig:d.text};else cfgD.orig=d.text;CFF=f;
   app.innerHTML=`${d.auth_enabled?'':`<div class="card alert"><h3>⚠ Interface web non protégée</h3><p>Aucun identifiant n'est défini dans la section <code>[web]</code> : toute personne connectée à votre réseau local peut ouvrir cette page, <b>lire la configuration avec tous les mots de passe</b> (Download Station, jeton Plex, clés d'API) et la modifier.</p>
-  <p>Renseignez <code>username</code> et <code>password</code> dans la section <code>[web]</code> ci-dessous, enregistrez, puis redémarrez synoarr.</p></div>`}
+  <p>Renseignez <b>Identifiant</b> et <b>Mot de passe</b> dans « Interface web » ci-dessous, enregistrez, puis redémarrez synoarr.</p></div>`}
   <div id="rsb">${rsBanner(d.restart_reasons)}</div>
-  <div class="card"><div class="cfgh"><div><h3>config.ini <span id="cfdirty" class="b b-grabbed" hidden>modifié</span></h3><div class="mut small brk">${esc(d.path)}${d.encoding!=='utf-8'?` · encodage actuel ${esc(d.encoding)} : sera enregistré en UTF-8`:''}</div></div>
-  <div class="acts"><button data-cfgsave="1">Enregistrer</button><button class="sec" data-cfgreset="1">Annuler les modifications</button><button class="sec" data-cfgrestore="1"${d.backups.length?'':' disabled'}>Restaurer la sauvegarde précédente</button></div></div>
+  <div class="card cfbar"><div class="row"><input id="cfq" type="search" placeholder="Rechercher une option (ex. langues, port, telegram)…" value="${esc(CFQ)}" aria-label="Rechercher une option"><span id="cfqn" class="mut small"></span></div>
+  <div class="row cfsv"><button data-cffsave="1" disabled>Enregistrer</button><button class="sec" data-cffreset="1">Annuler les modifications</button><span id="cfn" class="mut small"></span></div>
+  <div class="mut small brk">${esc(d.path)} · seules les options modifiées sont réécrites (commentaires conservés) ; le fichier est vérifié avant d'être remplacé.</div><div id="cffr"></div></div>
+  <div id="cff">${f.error?`<div class="msg ko">${esc(f.error)}</div>`:cfForm(f)}</div>
+  <div class="row cfsv"><button data-cffsave="1" disabled>Enregistrer</button></div>
+  <details class="card" id="cfadv"${CFADV?' open':''}><summary><b>Mode avancé (fichier config.ini)</b> <span id="cfdirty" class="b b-grabbed" hidden>modifié</span></summary>
+  <div class="cfgh"><div class="mut small brk">${esc(d.path)}${d.encoding!=='utf-8'?` · encodage actuel ${esc(d.encoding)} : sera enregistré en UTF-8`:''}</div>
+  <div class="acts"><button data-cfgsave="1">Enregistrer le fichier</button><button class="sec" data-cfgreset="1">Annuler les modifications</button><button class="sec" data-cfgrestore="1"${d.backups.length?'':' disabled'}>Restaurer la sauvegarde précédente</button></div></div>
   <div id="cfr"></div><textarea id="cft" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="Contenu de config.ini"></textarea>
-  <p class="mut small">Le fichier est vérifié avant d'être remplacé ; en cas d'erreur rien n'est modifié. Les 5 versions précédentes sont conservées (config.ini.bak1 à .bak5)${d.backups.length?' — dernière sauvegarde : '+esc(d.backups[0].modified):''}. Ctrl+S pour enregistrer.</p></div>`;
-  $('#cft').value=cfgD.text;markDirty()};
+  <p class="mut small">Le fichier est vérifié avant d'être remplacé ; en cas d'erreur rien n'est modifié. Les 5 versions précédentes sont conservées (config.ini.bak1 à .bak5)${d.backups.length?' — dernière sauvegarde : '+esc(d.backups[0].modified):''}. Ctrl+S pour enregistrer.</p></details>`;
+  $('#cft').value=cfgD.text;markDirty();cfFilter();cfUpdate()};
 function markDirty(){const b=$('#cfdirty');if(b)b.hidden=!dirty()}
 function cfgResult(r){let h=`<div class="msg ok">✔ ${esc(r.message)}</div>`;
   if(r.warnings&&r.warnings.length)h+=`<div class="msg wa"><b>Avertissements :</b><ul>${r.warnings.map(w=>`<li>${esc(w)}</li>`).join('')}</ul></div>`;
@@ -1666,7 +1780,7 @@ async function refresh(){clearTimeout(timer);document.querySelectorAll('nav a').
   if(tab!=='logs')clearTimeout(logT);
   if(S[tab]){if(mounted!==tab){mounted=tab;try{await S[tab]();$('#conn').textContent=''}catch(e){mounted=null;app.innerHTML=`<p class="card msg ko">${esc(e.message)}</p>`}}return}
   mounted=null;
-  const fa=document.activeElement;if(fa&&fa.dataset&&fa.dataset.prio&&app.contains(fa)){timer=setTimeout(refresh,15000);return}
+  const fa=document.activeElement;if(fa&&app.contains(fa)&&((fa.dataset&&fa.dataset.prio)||fa.type==='date')){timer=setTimeout(refresh,15000);return}
   dlActive=false;
   try{const html=await (V[tab]||V.dash)();const ae=document.activeElement,fid=ae&&ae.id,pos=fid&&ae.selectionStart;
     app.innerHTML=html;if(fid&&$('#'+fid)){const el=$('#'+fid);el.focus();if(pos!=null&&el.setSelectionRange)el.setSelectionRange(pos,pos)}
@@ -1674,15 +1788,20 @@ async function refresh(){clearTimeout(timer);document.querySelectorAll('nav a').
   catch(e){$('#conn').textContent='⚠ '+e.message}
   timer=setTimeout(refresh,dlActive&&(tab==='watch'||tab==='dash')?5000:15000)}
 addEventListener('hashchange',()=>{tab=(location.hash||'#dash').slice(1);mounted=null;app.innerHTML='<p class="mut">Chargement…</p>';syncBulk();refresh()});
-addEventListener('beforeunload',e=>{if(dirty()){e.preventDefault();e.returnValue=''}});
-document.addEventListener('keydown',e=>{if(tab==='cfg'&&(e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();cfgSave()}});
+addEventListener('beforeunload',e=>{if(dirty()||(tab==='cfg'&&$('#cff')&&cfChanges().n)){e.preventDefault();e.returnValue=''}});
+document.addEventListener('keydown',e=>{if(tab==='cfg'&&(e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();if(document.activeElement&&document.activeElement.id==='cft')cfgSave();else cfgFormSave()}});
 app.addEventListener('input',e=>{const id=e.target.id;if(id==='wq'||id==='wf')refresh();
   else if(id==='prwu')PRW.url=e.target.value;else if(id==='prwk')PRW.key=e.target.value;
   else if(id==='lq'){LG.q=e.target.value;saveLG();clearTimeout(lqT);lqT=setTimeout(()=>loadLogs(true),300)}
-  else if(id==='cft'&&cfgD){cfgD.text=e.target.value;markDirty()}});
+  else if(id==='cft'&&cfgD){cfgD.text=e.target.value;markDirty()}
+  else if(id==='cfq'){CFQ=e.target.value;cfFilter()}
+  else if(e.target.dataset.cs||e.target.dataset.cclr)cfUpdate(e.target)});
 app.addEventListener('change',e=>{const t=e.target,id=t.id;
   if(t.dataset.lang)act(()=>api('media/'+t.dataset.lang+'/language','POST',{languages:t.value}));
   else if(t.dataset.sel)selToggle(+t.dataset.sel,t.checked);
+  else if(t.dataset.cs||t.dataset.cclr)cfUpdate(t);
+  else if(id==='hp'){HP.p=t.value;if(HP.p==='custom'&&!HP.from){HP.from=isoD(new Date(Date.now()-29*864e5));HP.to=HP.to||isoD(new Date())}saveHP();refresh()}
+  else if(id==='hpf'||id==='hpt'){HP[id==='hpf'?'from':'to']=t.value;saveHP();t.blur();refresh()}
   else if(id==='cald'){CALD=t.value;try{localStorage.setItem('synoarr.cald',CALD)}catch(e){}refresh()}
   else if(t.dataset.prio)setPrio(t.dataset.prio,t.value);
   else if(id==='ln'||id==='lv'){LG[id==='ln'?'lines':'level']=t.value;saveLG();loadLogs(true)}
@@ -1713,6 +1832,8 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.grab)grab(+d.grab,b);
   else if(d.job)openJob(+d.job);
   else if(d.cfgsave)cfgSave();
+  else if(d.cffsave)cfgFormSave();
+  else if(d.cffreset){if(!cfChanges().n||confirm('Abandonner les modifications non enregistrées du formulaire ?')){mounted=null;refresh()}}
   else if(d.cfgreset){if(!dirty()||confirm('Abandonner les modifications non enregistrées ?')){cfgD=null;mounted=null;refresh()}}
   else if(d.cfgrestore)cfgRestore();
   else if(d.search)act(()=>api('media/'+d.search+'/search','POST'));
@@ -1910,8 +2031,9 @@ bulkBar.addEventListener('click',e=>{const b=e.target.closest('button[data-bk]')
 bulkBar.addEventListener('change',e=>{if(e.target.id!=='bkl'||e.target.value==='-')return;const v=e.target.value;e.target.value='-';bulk('language',{languages:v})});
 app.addEventListener('click',e=>{if(!SEL||tab!=='watch')return;const c=e.target.closest('.item[data-id]');
   if(!c||e.target.closest('button,a,input,select,label,summary,details,textarea,.dls'))return;selToggle(+c.dataset.id)});
+app.addEventListener('toggle',e=>{const t=e.target;if(t.id==='cfadv')CFADV=t.open;else if(t.dataset&&t.dataset.sec&&!CFQ){t.open?CFOPEN.add(t.dataset.sec):CFOPEN.delete(t.dataset.sec)}},true);
 app.addEventListener('error',e=>{const t=e.target;if(t&&t.tagName==='IMG'){BADIMG.add(t.getAttribute('src'));t.remove()}},true);
-const showForm=()=>{$('#addc').hidden=tab!=='idx'};addEventListener('hashchange',showForm);showForm();
+const showForm=()=>{$('#addc').hidden=tab!=='idx';msBox.hidden=!(tab==='dash'||!V[tab]&&!S[tab])};addEventListener('hashchange',showForm);showForm();
 refresh();
 """
 
@@ -1969,6 +2091,12 @@ th{color:var(--mut);font-weight:600;border-top:0}table.eps{table-layout:fixed}.e
 .alert{border:2px solid var(--ko);background:var(--kob)}.alert h3{color:var(--ko)}.alert p{margin:6px 0}
 form.add{display:grid;grid-template-columns:1fr 1fr;gap:8px}form.add .full{grid-column:1/-1}
 .cmds{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:10px}
+.cfs>summary{font-size:15px;color:var(--fg);padding:2px 0}.cfs[open]>summary{margin-bottom:6px}.cfsh{margin:0 0 6px}
+.cff{display:grid;grid-template-columns:minmax(220px,2fr) 3fr;gap:2px 16px;padding:9px 0;border-top:1px solid var(--bd);align-items:start}.cff .cfh{grid-column:1/-1}
+.cfl{font-size:14px}.cfl code{font-size:12px;color:var(--mut)}.cfi{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}.cfi>input[type=text],.cfi>input[type=number],.cfi>input[type=password],.cfi>select{flex:1;min-width:0;width:100%}
+.cfi .o-err:empty{display:none}.cfi .o-err{flex-basis:100%}.cfbar #cfq{flex:1;min-width:200px}.cfsv{margin:10px 0}.cfb{color:var(--fg)}
+.hper{gap:8px 12px}.hper input[type=date]{margin-left:4px}
+.cmdcats{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:10px}.cmdcats>.card{margin:0;min-width:0}.cmdl{display:flex;flex-direction:column;gap:8px}
 .cmd{display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding:10px 12px;border:1px solid var(--bd);border-radius:8px}.cmd>span{font-size:13px}
 .chk{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--mut)}
 .fl{display:block;margin:8px 0;font-size:13px;color:var(--mut)}.fl input,.fl select{display:block;width:100%;box-sizing:border-box;margin-top:4px}
@@ -2018,11 +2146,13 @@ body.selmode main{padding-bottom:calc(var(--bkh,64px) + 16px)}body.selmode #toas
 .pbar.sb{height:12px;margin:6px 0 5px}.pbar.wa i{background:var(--wa)}.imp li{display:block}
 .cday h4{margin:12px 0 4px;padding-bottom:4px;border-bottom:1px solid var(--bd)}.cday:first-of-type h4{margin-top:4px}.cday h4.tdy{color:var(--ac)}
 .crow{display:flex;gap:10px;align-items:center;padding:6px 0}.crow+.crow{border-top:1px dashed var(--bd)}.crow .cb{flex:1;min-width:0;gap:2px}.crow .meta{margin-top:2px}.cact{flex:0 0 auto}
-@media (max-width:600px){.pst{flex-basis:40px;width:40px;height:60px}.wck{margin-top:20px}.wr{gap:10px}.bkn{min-width:0;flex:1}.bka{order:3;flex-basis:100%}.bkx{margin-left:0}.crow{flex-wrap:wrap}.cact{margin-left:44px}table.eps td:last-child{width:auto}.modal{padding:8px}.mbox{padding:12px}.srt{max-height:52vh}.cand img,.noimg{width:48px;height:72px;flex-basis:48px}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
+@media (max-width:600px){.cff{grid-template-columns:1fr}.pst{flex-basis:40px;width:40px;height:60px}.wck{margin-top:20px}.wr{gap:10px}.bkn{min-width:0;flex:1}.bka{order:3;flex-basis:100%}.bkx{margin-left:0}.crow{flex-wrap:wrap}.cact{margin-left:44px}table.eps td:last-child{width:auto}.modal{padding:8px}.mbox{padding:12px}.srt{max-height:52vh}.cand img,.noimg{width:48px;height:72px;flex-basis:48px}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
 </style></head><body>
 <header><div class="hd"><h1><span>syno</span>arr</h1>
 <nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#cal">À venir</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
-<main><div id="app"><p class="mut">Chargement…</p></div>
+<main><div class="card" id="msearch" hidden><h3>Recherche manuelle</h3><form id="sf" class="row" autocomplete="off"><input id="sq" type="search" placeholder="ex. Night of the Living Dead 1968 · Série S01E02" required maxlength="200" aria-label="Recherche manuelle sur les indexers"><button type="submit">Rechercher</button></form>
+<p class="mut small">Rien n'est envoyé automatiquement : choisissez une release acceptable puis « Envoyer à Download Station ».</p><div id="sres"></div></div>
+<div id="app"><p class="mut">Chargement…</p></div>
 <div class="card" id="addc" hidden><h3>Ajouter un indexer par URL</h3>
 <form class="add" id="addf" autocomplete="off"><input name="name" placeholder="Nom" required><input name="url" placeholder="URL (Torznab, RSS…)" required>
 <input name="api_key" type="password" placeholder="Clé d'API (facultatif)" autocomplete="new-password"><input name="categories" placeholder="Catégories (ex. 2000,5000)">
