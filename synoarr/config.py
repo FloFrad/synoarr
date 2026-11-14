@@ -153,6 +153,8 @@ class TelegramConfig:
     chat_id: str = ""
     # grab | import | error | watchlist | upgrade | update
     events: List[str] = field(default_factory=lambda: ["grab", "import", "error"])
+    # True = the bot also answers commands (/help, /statut, /recherche...) sent from chat_id only
+    commands: bool = True
 
 
 # ---- [subtitles] sous-titres automatiques OpenSubtitles.com (F5)

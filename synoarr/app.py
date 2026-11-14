@@ -911,6 +911,8 @@ class App:
         self.searcher.stop_event = self._stop
         self._setup_subtitles()  # F5 : sous-titres automatiques (OpenSubtitles)
         self._setup_notifier()  # F2 : notifications Telegram (recréées à chaque rechargement de config.ini)
+        if getattr(self, "_bot_wanted", False):
+            self._setup_bot()  # commandes Telegram : relancées si le jeton / chat_id a changé
 
     # ---- sous-titres automatiques (F5)
     def _setup_subtitles(self) -> None:
@@ -960,6 +962,24 @@ class App:
         if not getattr(self, "_notify_hooked", False):
             self.db.add_listener(self._notify_event)
             self._notify_hooked = True
+
+    def _setup_bot(self) -> None:
+        """Commandes Telegram (/help...) : démarrées par run_forever, recréées si la configuration change."""
+        from .telegram_bot import from_app
+        self._bot_wanted = True
+        tcfg = self.cfg.telegram
+        key = (tcfg.bot_token, str(tcfg.chat_id), bool(getattr(tcfg, "commands", True)), self.telegram_api_url)
+        bot = getattr(self, "bot", None)
+        if bot is not None and getattr(self, "_bot_key", None) == key:
+            return
+        if bot is not None:
+            bot.stop()
+        self._bot_key = key
+        self.bot = from_app(self)
+        if self.bot is not None:
+            self.bot.start()
+            threading.Thread(target=self.bot.announce, name="telegram-announce", daemon=True).start()
+            log.info("Commandes Telegram actives (tapez /help dans la conversation du bot)")
 
     def _notify_event(self, kind: str, message: str, level: str = "INFO") -> None:
         notifier = getattr(self, "notifier", None)
@@ -2476,6 +2496,10 @@ class App:
                 log.info("Interface web : http://<ip-du-nas>:%s", self.cfg.web.port)
             except OSError as exc:
                 log.error("Interface web impossible sur le port %s : %s", self.cfg.web.port, exc)
+        try:
+            self._setup_bot()
+        except Exception as exc:  # pragma: no cover - the bot must never prevent synoarr from running
+            log.error("Commandes Telegram impossibles : %s", exc)
         next_watch = time.time() + 5
         next_process = time.time() + 2
         next_prowlarr = time.time() + 1  # before the first search: indexers are up to date
@@ -2662,6 +2686,8 @@ class App:
     def shutdown(self, timeout: float = 60.0) -> None:
         """Stop the web server, let running jobs finish (a file move is never cut), close the database."""
         self._stop.set()
+        if getattr(self, "bot", None) is not None:
+            self.bot.stop()
         if self.web is not None:
             try:
                 self.web.stop()

@@ -73,7 +73,7 @@ LABELS = {
                  "sync_interval_hours": "Synchronisation (heures, 0 = jamais)"},
     "jackett": {"url": "Adresse de Jackett", "api_key": "Clé API Jackett"},
     "telegram": {"bot_token": "Jeton du bot", "chat_id": "Identifiant de conversation (chat_id)",
-                 "events": "Événements notifiés"},
+                 "events": "Événements notifiés", "commands": "Commandes Telegram (/help)"},
     "subtitles": {"enabled": "Sous-titres automatiques", "api_key": "Clé API OpenSubtitles",
                   "username": "Compte OpenSubtitles", "password": "Mot de passe OpenSubtitles",
                   "languages": "Langues des sous-titres", "hearing_impaired": "Sous-titres pour malentendants",

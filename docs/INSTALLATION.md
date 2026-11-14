@@ -380,6 +380,25 @@ events = grab, import, error
 en échec, bloqué ou abandonné), `watchlist` (élément ajouté), `upgrade` (amélioration de qualité), `update`
 (synoarr mis à jour). Les rafales sont regroupées en un seul message (20 messages par minute au plus).
 
+### Piloter synoarr depuis Telegram
+
+Dès que `bot_token` et `chat_id` sont remplis, le bot répond aussi aux commandes (`commands = true` par défaut).
+Tapez `/help` dans la conversation du bot :
+
+| Commande | Effet |
+|---|---|
+| `/statut` | état de synoarr (Plex, Download Station, indexers, éléments recherchés) |
+| `/telechargements` | téléchargements en cours avec progression et vitesse |
+| `/watchlist` | résumé de la Watchlist et films encore recherchés |
+| `/avenir` | épisodes diffusés dans les 7 prochains jours |
+| `/recherche Titre 1968` puis `/envoyer 2` | recherche manuelle dans les indexers, puis envoi du résultat n° 2 |
+| `/ajouter Dune` puis `/ajouter 1` | ajoute un film ou une série à la Watchlist et lance la recherche |
+| `/sync`, `/traiter`, `/rss` | synchroniser la Watchlist, ranger les téléchargements, lire les flux RSS |
+| `/espace` | espace libre de la bibliothèque |
+
+Sécurité : seules les commandes venant de la conversation `chat_id` sont exécutées, les autres sont ignorées
+(et notées dans le journal). Pour couper les commandes en gardant les notifications : `commands = false`.
+
 ## Sous-titres automatiques (OpenSubtitles)
 
 Facultatif : synoarr peut télécharger tout seul les sous-titres manquants (comme Bazarr), depuis
