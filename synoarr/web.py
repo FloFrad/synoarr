@@ -85,6 +85,11 @@ Affiches, actions groupées, À venir (méthodes App facultatives) ::
 "languages", "remove_from_plex", "delete_downloads"}`` -> ``{"ok", "done", "skipped", "errors", "message", ...}``),
 ``GET /api/upcoming?days=30&past=7`` (``{"today", "upcoming", "recent"}`` : épisodes des séries suivies et films
 recherchés datés), ``GET /api/dashboard`` (``{"storage": espace disque de la vidéothèque, "imports": 10 derniers}``).
+``GET /api/config/form`` (sections et options du formulaire de configuration, voir configform.py ; secrets jamais
+renvoyés) et ``POST /api/config/form`` (``{"changes": {section: {clé: valeur}}}`` : seules les clés modifiées sont
+réécrites, puis app.save_config_text). ``GET /api/grabs`` et ``/api/events`` acceptent ``?since=AAAA-MM-JJ&until=``
+(inclus) et renvoient alors ``{"items", "total", "limit", "since", "until"}`` (sans ces paramètres : liste, comme
+avant). ``GET /api/status`` contient ``commands`` (app.COMMANDS) : l'onglet Commandes les range par catégorie.
 Fichiers publics, sans authentification ni contrôle Host (aucun secret) : ``/manifest.webmanifest``, ``/icon.svg``,
 ``/icon-192.png``, ``/icon-512.png``, ``/apple-touch-icon.png`` (icônes PNG dessinées en Python pur, zlib).
 
@@ -1896,11 +1901,11 @@ function drawSrcTable(){const r=srcJob&&srcJob.result,el=$('#srctbl');if(!r||!el
 function drawSrcRes(j){const first=srcJob!==j||!$('#srctbl');srcJob=j;const r=j.result,el=$('#sres2');drawFo(j.status==='error'?null:r);if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
   SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
   if(!r.results.length){const ts=(r.titles||[]).length?(r.titles||[]).map(esc).join(' · '):esc(r.request);
-    el.innerHTML=`<p class="mut">Aucun résultat. Titres cherchés : <b>${ts}</b>${r.french_title_only?' (titre français seulement)':''}${fbNote(r)} · langues : ${langs}. Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
+    el.innerHTML=`<p class="mut">Aucun résultat. Titres cherchés : <b>${ts}</b>${r.fallback?' (rien avec le titre français : recherche élargie au titre original)':r.french_title_only?' (titre français seulement)':''}${fbNote(r)} · langues : ${langs}. Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
   if(first){const ok=r.results.filter(x=>x.score!=null).length,idxs=[...new Set(r.results.map(x=>x.indexer))].sort();
     if(SF.idx&&!idxs.includes(SF.idx))SF.idx='';
     const opt=(v,l)=>`<option value="${esc(v)}"${SF.key===v?' selected':''}>${l}</option>`;
-    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)}${(r.titles||[]).length?` · titres cherchés : <b>${(r.titles||[]).map(esc).join(' · ')}</b>${r.french_title_only?' (titre français seulement)':''}`:''}${fbNote(r)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
+    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)}${(r.titles||[]).length?` · titres cherchés : <b>${(r.titles||[]).map(esc).join(' · ')}</b>${r.fallback?' (rien avec le titre français : recherche élargie au titre original)':r.french_title_only?' (titre français seulement)':''}`:''}${fbNote(r)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
     <div id="srcchips"></div>
     <div class="row sfil" role="group" aria-label="Filtrer les sources">
       <input id="sfq" type="search" placeholder="Filtrer le titre (ex. 1080p, MULTi…)" value="${esc(SF.q)}" aria-label="Filtrer le titre">
@@ -2091,7 +2096,7 @@ th{color:var(--mut);font-weight:600;border-top:0}table.eps{table-layout:fixed}.e
 .alert{border:2px solid var(--ko);background:var(--kob)}.alert h3{color:var(--ko)}.alert p{margin:6px 0}
 form.add{display:grid;grid-template-columns:1fr 1fr;gap:8px}form.add .full{grid-column:1/-1}
 .cmds{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:10px}
-.cfs>summary{font-size:15px;color:var(--fg);padding:2px 0}.cfs[open]>summary{margin-bottom:6px}.cfsh{margin:0 0 6px}
+.cfsh,.cfh{white-space:pre-line}.cfs>summary{font-size:15px;color:var(--fg);padding:2px 0}.cfs[open]>summary{margin-bottom:6px}.cfsh{margin:0 0 6px}
 .cff{display:grid;grid-template-columns:minmax(220px,2fr) 3fr;gap:2px 16px;padding:9px 0;border-top:1px solid var(--bd);align-items:start}.cff .cfh{grid-column:1/-1}
 .cfl{font-size:14px}.cfl code{font-size:12px;color:var(--mut)}.cfi{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}.cfi>input[type=text],.cfi>input[type=number],.cfi>input[type=password],.cfi>select{flex:1;min-width:0;width:100%}
 .cfi .o-err:empty{display:none}.cfi .o-err{flex-basis:100%}.cfbar #cfq{flex:1;min-width:200px}.cfsv{margin:10px 0}.cfb{color:var(--fg)}

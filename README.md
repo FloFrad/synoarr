@@ -9,8 +9,11 @@ Remplaçant léger de **Prowlarr + Radarr + Sonarr + Filebot**, pensé pour un N
 - **Download Station** : le meilleur torrent (1080p → 720p, en anglais, ou en français pour l'animation) est envoyé directement.
 - **Renommage façon Filebot** : le dossier `Download` est surveillé, les fichiers terminés sont renommés au format
   Plex puis déplacés dans `video/Films` et `video/TvShows`.
-- **Une seule interface web légère** (port 8778) : Watchlist, indexers, toutes les commandes, journal et
-  éditeur de configuration. Plus une ligne de commande complète.
+- **Une seule interface web légère** (port 8778, installable sur l'écran d'accueil du téléphone) : Watchlist avec
+  affiches et onglets de statut, « À venir », recherche manuelle, indexers, commandes, historique, journal et
+  configuration par formulaire.
+- **Bonus** : mises à niveau de qualité (720p → 1080p), flux RSS pour les nouveaux épisodes, recherche par titre
+  français, notifications **Telegram**, sous-titres automatiques **OpenSubtitles**.
 
 Aucune dépendance : **Python 3.8+ seul** (déjà présent dans DSM 7). Docker possible mais pas obligatoire.
 

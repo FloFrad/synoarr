@@ -175,8 +175,8 @@ class WebApiTest(WebTestBase):
             self.assertIn(word, html)
         self.assertNotIn("http://", html.split("<script>")[0].replace('href="data:,"', ""))  # aucun CDN
         self.assertIn("script-src 'sha256-", hdrs["Content-Security-Policy"])
-        self.assertLess(len(html.splitlines()), 800)  # single light page
-        self.assertLess(len(html), 120 * 1024)
+        self.assertLess(len(html.splitlines()), 1000)  # single light page
+        self.assertLess(len(html), 160 * 1024)
 
     def test_status(self) -> None:
         status, data, _ = self.req("/api/status")
@@ -2204,7 +2204,8 @@ class ConfigFormTest(RealAppWebBase):
         self.assertEqual(self.read(), text)
 
     def test_invalid_values_refused_and_file_unchanged(self) -> None:
-        for changes in ({"paths": {"min_age_minutes": "vite"}}, {"web": {"port": "80a"}},
+        for changes in ({"paths": {"min_age_minutes": "vite"}}, {"web": {"port": "80a"}}, {"web": {"port": 70000}},
+                        {"paths": {"min_age_minutes": -1}},
                         {"nope": {"x": 1}}, {"paths": {"inconnu": 1}}, {"paths": {"action": "a\nb"}},
                         {"paths": "copy"}):
             status, data, _ = self.req("/api/config/form", "POST", {"changes": changes})

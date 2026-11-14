@@ -105,7 +105,7 @@ def parse_help(text: str) -> Dict[Tuple[str, str], Tuple[str, bool]]:
     section = ""
     comments = []  # type: List[str]
     last = None  # type: Optional[Tuple[str, bool]]
-    first = False
+    first = in_step = False
     for line in (text or "").splitlines():
         m = _SECTION_LINE.match(line)
         if m:
@@ -119,11 +119,11 @@ def parse_help(text: str) -> Dict[Tuple[str, str], Tuple[str, bool]]:
             key = None  # « ; true = simulation… » is prose, not a commented-out option
         if key and section:
             if first and len(comments) >= 3:
-                out[(section, "")] = (" ".join(comments), False)
+                out[(section, "")] = (" ".join(comments).replace(" \n", "\n"), False)
                 comments = []
             first = False
             if comments:
-                last = (" ".join(comments), False)
+                last = (" ".join(comments).replace(" \n", "\n"), False)
             elif last is not None:
                 last = (last[0], True)
             if last is not None:
@@ -131,8 +131,15 @@ def parse_help(text: str) -> Dict[Tuple[str, str], Tuple[str, bool]]:
             comments = []
             continue
         if stripped.startswith((";", "#")):
-            body = stripped.lstrip(";#").strip()
+            raw = stripped.lstrip(";#")
+            body = raw.strip()
             if body and not set(body) <= set("=-_ "):
+                # numbered steps and indented lines start a new line (shown with white-space: pre-line)
+                numbered = bool(re.match(r"^\d+\.\s", body))
+                indented = raw.startswith("  ")
+                if comments and (numbered or (indented and not in_step)):
+                    body = "\n" + body
+                in_step = numbered or (in_step and indented)
                 comments.append(body)
         elif not stripped:
             comments, last = [], None
@@ -273,6 +280,12 @@ def normalize_changes(text: str, changes: Any) -> Tuple[Dict[str, Dict[str, str]
                 new = _config._convert(name, raw_text, default)
             except _config.ConfigError as exc:
                 problems.append("[%s] %s" % (section, exc))
+                continue
+            if (section, key) == ("web", "port") and not 1 <= new <= 65535:
+                problems.append("[web] port : nombre de 1 à 65535 attendu")
+                continue
+            if isinstance(new, (int, float)) and not isinstance(new, bool) and new < 0:
+                problems.append("[%s] %s : nombre positif ou nul attendu" % (section, key))
                 continue
             if parser.has_option(section, key):
                 try:

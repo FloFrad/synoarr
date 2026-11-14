@@ -241,14 +241,14 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 
 | Onglet | Contenu |
 |---|---|
-| Tableau de bord | état général, espace disque libre de la vidéothèque (dossier partagé de `movies_dir` / `series_dir`, en orange sous 10 % libres), téléchargements en cours (progression, vitesses, sources), échecs récents, derniers imports, activité récente |
+| Tableau de bord | recherche manuelle (requête libre → résultats notés, triables et filtrables → « Envoyer à Download Station »), état général, espace disque libre de la vidéothèque (dossier partagé de `movies_dir` / `series_dir`, en orange sous 10 % libres), téléchargements en cours (progression, vitesses, sources), échecs récents, derniers imports, activité récente |
 | Watchlist | films et séries suivis avec leur affiche (TMDb, si une clé `[tmdb] api_key` est configurée), épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » (option « Titre français seulement »), mode « Sélection » : cases à cocher et barre d'actions groupées (Rechercher, Langue, Ignorer, Reprendre, Supprimer) |
 | À venir | épisodes des séries suivies diffusés dans les 7 à 90 prochains jours, groupés par jour (« Aujourd'hui », « Demain », …), films recherchés dont la date de sortie est connue (TMDb), et sorties des 7 derniers jours avec leur statut |
 | Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), modifier (nom, URL, clé API, catégories, type), priorité (1 = le plus prioritaire), tester, activer, supprimer |
-| Historique | envois vers Download Station et événements |
-| Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer, mettre à jour synoarr (et revenir en arrière) |
+| Historique | envois vers Download Station et événements, sur une période au choix (aujourd'hui, 7, 30 — par défaut — ou 90 derniers jours, tout, ou du … au …), mémorisée dans le navigateur |
+| Commandes | rangées par catégorie : Watchlist & recherche (synchroniser, rechercher tout, flux RSS), Téléchargements (traiter, simulation, test d'envoi et diagnostic Download Station), Indexers, Bibliothèque (sous-titres), Connexions & notifications (vérifier la configuration, connexion Plex, Telegram), Maintenance (mises à jour, retour arrière, redémarrer) ; résultat et tâches récentes en dessous |
 | Journal | dernières lignes du journal, filtres, téléchargement |
-| Configuration | éditeur de `config.ini` : vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
+| Configuration | formulaire par section (Général, Plex, Download Station, Dossiers…), avec l'aide de chaque option et une recherche ; seules les options modifiées sont réécrites dans `config.ini` (commentaires conservés) ; mots de passe et clés jamais affichés (vide = inchangé, case « effacer »). « Mode avancé » : éditeur du fichier brut. Toujours vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
 
 **Sur le téléphone** : ouvrez l'interface dans Safari (iPhone) ou Chrome (Android), puis **Partager → Sur l'écran
 d'accueil** (iPhone) ou **⋮ → Ajouter à l'écran d'accueil** (Android) : synoarr s'ouvre ensuite comme une
