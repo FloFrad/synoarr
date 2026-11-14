@@ -296,8 +296,11 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig,
     # --- language
     wanted_langs = [w.lower() for w in (request.languages or cfg.languages)]
     langs = list(p.languages)
-    fr_title = bool(request.title_fr) and titles_match(p.title, request.title_fr) and \
-        not titles_match(p.title, request.title)
+    fr_title = False
+    if request.title_fr and titles_match(p.title, request.title_fr):
+        others = [t for t in [request.title] + list(request.alt_titles or [])
+                  if t and normalize_title(t) != normalize_title(request.title_fr)]
+        fr_title = not any(titles_match(p.title, t) for t in others)  # named after the French title only
     if not langs and fr_title:
         langs = ["fr"]  # named after the French title without a language tag: a French release
     lang_points, reason = _language_points(langs, wanted_langs)

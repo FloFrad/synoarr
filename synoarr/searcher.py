@@ -478,10 +478,11 @@ class Searcher:
         return alts
 
     def _title_fr_if_wanted(self, media: Dict[str, Any]) -> Optional[str]:
+        """French title when French is wanted (may equal the main title: a Plex account in French already
+        shows French titles). Used to search by text and to recognise untagged French releases."""
         if "fr" not in self.languages_for(media):
             return None
-        fr = self.french_title(media)
-        return fr if fr and fr.strip().lower() != (media.get("title") or "").strip().lower() else None
+        return self.french_title(media) or None
 
     def french_title(self, media: Dict[str, Any]) -> Optional[str]:
         """French title: typed by the user or fetched once from TMDb (cached in the database)."""
@@ -622,9 +623,17 @@ class Searcher:
         import dataclasses
         queries = [req]
         seen_titles = {(req.title or "").strip().lower()}
+        if "fr" in [x.lower() for x in (req.languages or [])] and (req.imdb or req.tvdb or req.tmdb):
+            # French wanted: also a plain text search of the main title (an id search returns the
+            # English-named releases only, and a Plex account in French already gives the French title)
+            queries.append(dataclasses.replace(req, imdb=None, tmdb=None, tvdb=None))
+        if req.title_fr and req.title_fr.strip().lower() not in seen_titles:
+            seen_titles.add(req.title_fr.strip().lower())
+            queries.append(dataclasses.replace(req, title=req.title_fr, imdb=None, tmdb=None, tvdb=None,
+                                               alt_titles=[req.title] + list(req.alt_titles or [])))
         for alt in req.alt_titles or []:
             key = (alt or "").strip().lower()
-            if key and key not in seen_titles and len(queries) <= self.MAX_EXTRA_TITLES:
+            if key and key not in seen_titles and len(queries) <= self.MAX_EXTRA_TITLES + 1:
                 seen_titles.add(key)
                 # text search only: an id search (imdbid/tvdbid) would return the same English-named results
                 queries.append(dataclasses.replace(req, title=alt, imdb=None, tmdb=None, tvdb=None,

@@ -852,3 +852,40 @@ class FrenchSearchEndToEndTests(SearcherTestBase):
         self.searcher.run_once(media_id=self.media("m10")["id"], force=True)
         self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
                          ["The.Shawshank.Redemption.1994.1080p.BluRay.x264-EN"])
+
+
+class FrenchPlexAccountTests(FrenchSearchEndToEndTests):
+    """Watchlist from a Plex account in French: the Plex title is already the French title."""
+
+    def test_french_selected_gets_a_french_release(self) -> None:  # type: ignore[override]
+        item = WatchItem(rating_key="p1", type="movie", title="Les Évadés", year=1994,
+                         original_title="The Shawshank Redemption", guids={"imdb": "tt0111161", "tmdb": "278"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        mid = self.media("p1")["id"]
+        self.db.set_language_override(mid, "fr")
+        self.searcher.run_once(media_id=mid, force=True)
+        self.assertIn(("Les Évadés", None), self.calls)  # text search of the (French) main title
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
+                         ["Les.Evades.1994.TRUEFRENCH.1080p.WEB-DL.x264-VF"])
+
+    def test_untagged_french_named_release_counts_as_french(self) -> None:
+        from synoarr import quality
+        from synoarr.models import SearchRequest
+        req = SearchRequest(kind="movie", title="Les Évadés", year=1994, alt_titles=["The Shawshank Redemption"],
+                            languages=["fr"], title_fr="Les Évadés")
+        ok = quality.evaluate(Release(title="Les.Evades.1994.1080p.BluRay.x264-X", indexer="i", seeders=5),
+                              req, self.cfg.quality)
+        en = quality.evaluate(Release(title="The.Shawshank.Redemption.1994.1080p.BluRay.x264-X", indexer="i",
+                                      seeders=5), req, self.cfg.quality)
+        self.assertIsNotNone(ok[0], ok[1])
+        self.assertIsNone(en[0], en[1])
+
+    def test_english_default_keeps_the_english_release(self) -> None:  # type: ignore[override]
+        item = WatchItem(rating_key="p2", type="movie", title="Les Évadés", year=1994,
+                         original_title="The Shawshank Redemption", guids={"imdb": "tt0111161", "tmdb": "278"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        self.searcher.run_once(media_id=self.media("p2")["id"], force=True)
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
+                         ["The.Shawshank.Redemption.1994.1080p.BluRay.x264-EN"])
