@@ -769,3 +769,22 @@ class FrenchTitleTests(SearcherTestBase):
         self.searcher.sync_watchlist()
         self.searcher.run_once(media_id=self.media("m8")["id"], force=True)
         self.assertNotIn("Les Évadés", self.queries)
+
+
+class VanishedTaskTests(SearcherTestBase):
+    def test_task_deleted_by_hand_closes_the_grab_after_grace(self) -> None:
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        m = self.media("m1")
+        rel = self.idx.add("Heat.1995.1080p.BluRay.x264-GRP")
+        self.assertTrue(self.searcher.grab(rel, m, None, None))
+        self.db.set_media_status(m["id"], "grabbed")
+        self.ds.tasks = []  # removed from Download Station
+        self.searcher.check_failed_downloads()
+        self.assertEqual(self.db.list_grabs()[0]["status"], "sent")  # grace period
+        self.db.execute("UPDATE grabs SET created_at = datetime('now', 'localtime', '-2 hours')")
+        self.searcher.check_failed_downloads()
+        g = self.db.list_grabs()[0]
+        self.assertEqual((g["status"], g["message"]), ("failed", "tâche absente de Download Station"))
+        self.assertFalse(self.db.is_blocked(rel.title))  # not the release's fault
+        self.assertEqual(self.media("m1")["status"], "wanted")

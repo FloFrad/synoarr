@@ -1473,8 +1473,8 @@ class App:
                 media["type"] == "movie" or (s.get("season") == g.get("season") and
                                              (s.get("episode") is None or s.get("episode") == g.get("episode"))))
                 for s in sent)
-            if covered or media.get("status") == "ignored":
-                continue
+            if covered or media.get("status") == "ignored" or not media.get("on_watchlist", 1):
+                continue  # no longer wanted, or removed from the Watchlist: nothing to show
             if media["type"] == "movie":
                 if media.get("status") != "wanted":
                     continue
@@ -1500,6 +1500,9 @@ class App:
         sent = self.db.list_grabs(status="sent", limit=500)
         items = [self._download_entry(g, index.find(g) if index is not None else None, medias, index is not None)
                  for g in sent]
+        # a vanished task of an item removed from the Watchlist is not worth showing (cleaned up by the searcher)
+        items = [d for d in items if not (d["status"] == "introuvable" and not (medias.get(d.get("media_id") or -1)
+                                                                               or {}).get("on_watchlist"))]
         failed = [self._download_entry(g, None, medias, False) for g in self._relevant_failed(sent, medias)]
         return {"ok": warning is None, "warning": warning, "items": items, "failed": failed,
                 "active": sum(1 for d in items if d["active"]), "updated_at": now_iso()}

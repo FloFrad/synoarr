@@ -802,6 +802,7 @@ class Searcher:
         for g in sent:
             task = index.find(g)
             if task is None:
+                self._forget_vanished(g)
                 continue
             if task.status == "error":
                 reason = task.error or "erreur Download Station"
@@ -827,6 +828,25 @@ class Searcher:
                     self.db.reset_grab_episodes(g)
                     self.db.execute("UPDATE episodes SET last_search_at = NULL WHERE media_id = ? AND season = ?",
                                     (media["id"], g["season"]))
+
+    VANISHED_GRACE_HOURS = 1.0
+
+    def _forget_vanished(self, g: Dict[str, Any]) -> None:
+        """The Download Station task of a grab was deleted (by hand, or never really created) and nothing was
+        imported: after a grace period the grab is closed (not blocklisted) and the item is searched again."""
+        sent_at = parse_iso(g.get("created_at"))
+        if sent_at is None or (_dt.datetime.now() - sent_at).total_seconds() < self.VANISHED_GRACE_HOURS * 3600:
+            return
+        name = g.get("torrent_name") or g.get("release_title") or ""
+        if name and os.path.exists(os.path.join(self.cfg.paths.download_dir, name)):
+            return  # files are there: the organizer will import them
+        log.info("Tâche Download Station disparue pour %s : téléchargement clos", g.get("release_title"))
+        self.db.set_grab_status(g["id"], "failed", "tâche absente de Download Station")
+        media = self.db.get_media(g["media_id"]) if g.get("media_id") else None
+        if media and media["type"] == "movie" and media.get("status") == "grabbed":
+            self.db.set_media_status(media["id"], "wanted")
+        elif media and g.get("season") is not None:
+            self.db.reset_grab_episodes(g)
 
     @staticmethod
     def _is_stalled(task: Any, grab: Dict[str, Any], hours: float) -> bool:

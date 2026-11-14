@@ -1018,12 +1018,23 @@ const evList=ev=>ev.length?`<ul class="ev">${ev.map(e=>`<li class="lv-${esc(e.le
 const LANGS=[['','Auto'],['en','Anglais (en)'],['fr','Français (fr)'],['en,fr','Anglais + Français']];
 const langSel=m=>{const v=m.language_override||'',o=LANGS.some(l=>l[0]===v)?LANGS:LANGS.concat([[v,v]]);
   return `<select class="lsel" data-lang="${m.id}" title="Langues recherchées" aria-label="Langues recherchées">${o.map(l=>`<option value="${esc(l[0])}"${l[0]===v?' selected':''}>${esc(l[1])}</option>`).join('')}</select>`};
+/* onglets de statut de la Watchlist */
+let WST='all';try{WST=localStorage.getItem('synoarr.wst')||'all'}catch(e){}
+const WTABS=[['all','Tous'],['wanted','Recherchés'],['dl','En téléchargement'],['done','Terminés'],['ignored','Ignorés'],['off','Retirés de la Watchlist']];
+const wcat=m=>{if(!m.on_watchlist)return 'off';if(m.status==='ignored')return 'ignored';const e=m.episodes,dls=m.downloads||[];
+  if(dls.some(d=>d.grab_status==='sent')||m.status==='grabbed'||(e&&e.grabbed>0))return 'dl';
+  if(m.type==='movie')return m.status==='done'?'done':'wanted';
+  if(e&&e.total>0&&e.wanted===0&&e.done>0)return 'done';return 'wanted'};
 V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads').catch(()=>null)]);const f=$('#wf')?$('#wf').value:'',q=$('#wq')?$('#wq').value.toLowerCase():'';
-  const items=ms.filter(m=>(!f||m.type===f)&&(!q||(m.title||'').toLowerCase().includes(q)));
+  const base=ms.filter(m=>(!f||m.type===f)&&(!q||(m.title||'').toLowerCase().includes(q)));
+  const cnt={};base.forEach(m=>{const c=wcat(m);cnt[c]=(cnt[c]||0)+1;if(c!=='off')cnt.all=(cnt.all||0)+1});
+  if(WST!=='all'&&!cnt[WST]&&WST==='off')WST='all';
+  const items=base.filter(m=>WST==='all'?wcat(m)!=='off':wcat(m)===WST);
+  const tabs=`<div class="row wtabs" role="tablist" aria-label="Filtrer par statut">${WTABS.filter(t=>t[0]!=='off'||cnt.off).map(t=>`<button type="button" role="tab" class="xs${WST===t[0]?'':' sec'}" aria-selected="${WST===t[0]}" data-wst="${t[0]}">${t[1]} (${cnt[t[0]]||0})</button>`).join('')}${WST==='off'&&cnt.off?'<span class="mut small">Ces éléments ne sont plus dans votre Watchlist Plex : supprimez-les ou remettez-les dans la Watchlist.</span>':''}</div>`;
   const eps=await Promise.all(items.filter(m=>exp.has(m.id)).map(async m=>[m.id,await api('media/'+m.id+'/episodes').catch(()=>[])]));
   const em=Object.fromEntries(eps);
   return `<div class="row tools"><select id="wf"><option value="">Tous</option><option value="movie"${f==='movie'?' selected':''}>Films</option><option value="show"${f==='show'?' selected':''}>Séries</option></select>
-  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"><button data-wadd="1">+ Ajouter</button></div>${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
+  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"><button data-wadd="1">+ Ajouter</button></div>${tabs}${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
   ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored',dls=m.downloads||[];
   if(dls.some(d=>d.active))dlActive=true;
   return `<div class="card item${m.on_watchlist?'':' off'}"><div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
@@ -1037,7 +1048,7 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
   ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div>
   ${dls.length?`<div class="dls">${dls.map(d=>dlRow(d,false)).join('')}</div>`:''}
-  ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>'}`};
+  ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):(ms.length?'<p class="mut card">Aucun élément dans cet onglet.</p>':'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>')}`};
 function epTable(eps,m){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
   return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}</summary>
   ${by[s].filter(e=>e.status==='wanted').length>1?`<div class="row spk">${srcBtn(m.id,+s,null,null,m.title+' saison '+s,'','Choisir un pack pour la saison '+esc(s))}</div>`:''}
@@ -1251,6 +1262,7 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.ltf&&d.lts==='srch'){LTF.srch=d.ltf;if(srch&&jobs[srch])drawSearch(jobs[srch])}
   else if(d.tfr){const v=prompt('Titre français utilisé pour chercher les releases françaises (vide = recherche automatique sur TMDb) :',d.v||'');
     if(v!==null)act(()=>api('media/'+d.tfr+'/title_fr','POST',{title_fr:v}))}
+  else if(d.wst){WST=d.wst;try{localStorage.setItem('synoarr.wst',WST)}catch(e){}refresh()}
   else if(d.iedit)openIdxEdit(d.iedit);
   else if(d.pd)setPrio(d.pd,d.v);
   else if(d.prws)prwSync();
@@ -1501,7 +1513,7 @@ button.xs{font-size:12px;padding:3px 8px}h4{margin:14px 0 6px;font-size:14px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow-y:auto}
 .mbox{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:12px;width:100%;max-width:920px;padding:14px 16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .mhd{display:flex;justify-content:space-between;align-items:center;gap:10px}.mhd h3{margin:0}.opts{margin:4px 0 6px;gap:6px 16px}
-#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
+#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.wtabs{gap:6px;margin:8px 0;align-items:center}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
 body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(--pub);color:var(--puf)}
 .cands{display:flex;flex-direction:column;gap:8px;margin-top:10px}.cand{display:flex;gap:12px;border:1px solid var(--bd);border-radius:8px;padding:8px}
 .cand img,.noimg{width:62px;height:93px;object-fit:cover;border-radius:6px;flex:0 0 62px;background:var(--neb)}.noimg{display:flex;align-items:center;justify-content:center;color:var(--mut)}

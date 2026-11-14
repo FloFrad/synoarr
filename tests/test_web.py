@@ -1732,3 +1732,18 @@ class SourceListControlsTest(unittest.TestCase):
         for needle in ('data-sort="${c[0]}"', 'id="sfseed"', 'id="sfsmin"', 'id="sfsmax"', 'id="sfq"', 'id="sfidx"',
                        'id="sfok"', "function srcRows"):
             self.assertIn(needle, INDEX_JS)
+
+
+class OffWatchlistDashboardTest(RealAppWebBase):
+    def test_removed_item_failures_are_not_shown(self) -> None:
+        mid = self.app.db.upsert_media("gone", "movie", "Night of the Living Dead", 1968, None, None, None)
+        gid = self.app.db.add_grab(mid, None, None, "NOTLD.1968", "NOTLD.1968", "ia", None, 10)
+        self.app.db.set_grab_status(gid, "failed", "broken")
+        self.app.invalidate_downloads() if hasattr(self.app, "invalidate_downloads") else None
+        self.assertTrue(any(d["grab_id"] == gid for d in self.req("/api/downloads")[1]["failed"]))
+        self.app.db.mark_off_watchlist([])  # removed from the Plex Watchlist
+        if hasattr(self.app, "invalidate_downloads"):
+            self.app.invalidate_downloads()
+        self.assertFalse(any(d["grab_id"] == gid for d in self.req("/api/downloads")[1]["failed"]))
+        from synoarr.web import INDEX_JS
+        self.assertIn("data-wst", INDEX_JS)
