@@ -108,7 +108,7 @@ class CommandsTest(BotTestBase):
         answer = self.say("/help")
         self.assertEqual(answer, HELP_TEXT)
         for name in ("/statut", "/telechargements", "/watchlist", "/avenir", "/recherche", "/envoyer", "/ajouter",
-                     "/sync", "/traiter", "/rss", "/espace", "/help"):
+                     "/sync", "/traiter", "/rss", "/espace", "/maj", "/help"):
             self.assertIn(name, HELP_TEXT)
         for handler in self.bot.handlers:
             self.assertIn("/" + handler, HELP_TEXT)
@@ -245,6 +245,58 @@ class CommandsTest(BotTestBase):
         parts = TelegramBot._split("\n".join("ligne %d %s" % (i, "x" * 80) for i in range(200)))
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(p) <= 4000 for p in parts))
+
+
+class UpdateCommandTest(BotTestBase):
+    def fake_update(self, check: Dict[str, Any], apply: Dict[str, Any]):
+        calls = []  # type: List[str]
+
+        def run(job: Any, command: str) -> Dict[str, Any]:
+            calls.append(command)
+            if command == "update_check":
+                job.emit("info", "2 fichier(s) modifié(s)")
+                return check
+            job.emit("ok", "Fichiers remplacés")
+            return dict(apply)
+        return mock.patch.object(self.app, "_cmd_update", side_effect=run), calls
+
+    def test_check_available_then_install(self) -> None:
+        patch, calls = self.fake_update({"available": True, "changed": ["a.py", "b.py"]},
+                                        {"updated": True, "restarting": True})
+        with patch:
+            answer = self.say("/maj")
+            self.assertIn("Mise à jour disponible", answer)
+            self.assertIn("2 fichier(s) modifié(s)", answer)
+            self.assertIn("/maj oui", answer)
+            answer = self.say("/update oui")
+        self.assertEqual(calls, ["update_check", "update"])
+        self.assertIn("Mise à jour installée", answer)
+        self.assertIn("Fichiers remplacés", answer)
+        self.assertEqual(self.api.sent()[1]["text"], "⏳ Mise à jour de synoarr en cours…")
+        self.assertEqual(self.app.db.get_kv("telegram_update_pending"), "1")
+        # after the restart: one confirmation, then nothing more
+        self.app.db.set_kv("telegram_announced", ANNOUNCE_ID)
+        self.bot.announce()
+        self.bot.announce()
+        texts = [m["text"] for m in self.api.sent()]
+        self.assertEqual(sum("a redémarré" in t for t in texts), 1)
+        self.assertIsNone(self.app.db.get_kv("telegram_update_pending"))
+
+    def test_up_to_date(self) -> None:
+        patch, _calls = self.fake_update({"available": False}, {"updated": False})
+        with patch:
+            self.assertIn("synoarr est à jour", self.say("/maj"))
+            self.assertIn("déjà à jour", self.say("/maj oui"))
+        self.assertIsNone(self.app.db.get_kv("telegram_update_pending"))
+
+    def test_failure_and_usage(self) -> None:
+        patch, _calls = self.fake_update({"ok": False, "message": "GitHub injoignable"},
+                                         {"ok": False, "message": "GitHub injoignable"})
+        with patch:
+            self.assertIn("Vérification impossible", self.say("/maj"))
+            self.assertIn("Mise à jour impossible", self.say("/maj oui"))
+        self.assertIsNone(self.app.db.get_kv("telegram_update_pending"))
+        self.assertIn("Usage", self.say("/maj peut-être"))
 
 
 class PollingTest(BotTestBase):

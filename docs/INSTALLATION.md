@@ -395,6 +395,7 @@ Tapez `/help` dans la conversation du bot :
 | `/ajouter Dune` puis `/ajouter 1` | ajoute un film ou une série à la Watchlist et lance la recherche |
 | `/sync`, `/traiter`, `/rss` | synchroniser la Watchlist, ranger les téléchargements, lire les flux RSS |
 | `/espace` | espace libre de la bibliothèque |
+| `/maj` puis `/maj oui` | vérifie s'il existe une mise à jour, puis l'installe et redémarre synoarr (un message confirme le redémarrage) |
 
 Sécurité : seules les commandes venant de la conversation `chat_id` sont exécutées, les autres sont ignorées
 (et notées dans le journal). Pour couper les commandes en gardant les notifications : `commands = false`.

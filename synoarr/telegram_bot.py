@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from . import __version__
@@ -21,7 +22,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-ANNOUNCE_ID = "telegram-commands-1"  # bump to announce a new batch of commands once
+ANNOUNCE_ID = "telegram-commands-2"  # bump to announce a new batch of commands once
 HELP_TEXT = """<b>Commandes synoarr</b>
 /statut — état de synoarr
 /telechargements — téléchargements en cours
@@ -35,11 +36,16 @@ HELP_TEXT = """<b>Commandes synoarr</b>
 /traiter — ranger les téléchargements terminés
 /rss — lire les flux RSS des indexers
 /espace — espace libre de la bibliothèque
+/maj — vérifier les mises à jour de synoarr
+/maj oui — installer la mise à jour et redémarrer
 /help — cette aide"""
 
 ALIASES = {"start": "help", "aide": "help", "status": "statut", "dl": "telechargements",
            "downloads": "telechargements", "search": "recherche", "grab": "envoyer", "add": "ajouter",
-           "process": "traiter", "space": "espace", "upcoming": "avenir"}
+           "process": "traiter", "space": "espace", "upcoming": "avenir", "update": "maj", "miseajour": "maj",
+           "mettreajour": "maj"}
+YES = ("oui", "o", "yes", "y", "ok", "go")
+LEVEL_ICON = {"ok": "✅", "err": "❌", "warn": "⚠️", "info": "•"}
 
 
 def esc(value: Any) -> str:
@@ -77,7 +83,7 @@ class TelegramBot(object):
             "help": self.cmd_help, "statut": self.cmd_status, "telechargements": self.cmd_downloads,
             "watchlist": self.cmd_watchlist, "avenir": self.cmd_upcoming, "recherche": self.cmd_search,
             "envoyer": self.cmd_grab, "ajouter": self.cmd_add, "sync": self.cmd_sync, "traiter": self.cmd_process,
-            "rss": self.cmd_rss, "espace": self.cmd_space,
+            "rss": self.cmd_rss, "espace": self.cmd_space, "maj": self.cmd_update,
         }  # type: Dict[str, Callable[[str], str]]
 
     @property
@@ -185,8 +191,13 @@ class TelegramBot(object):
         return answer
 
     def announce(self) -> None:
-        """Tell the user once that the commands are available (after an update)."""
-        if not self.enabled or self.app.db.get_kv("telegram_announced") == ANNOUNCE_ID:
+        """At startup: confirm an update asked with /maj oui, and tell once that the commands are available."""
+        if not self.enabled:
+            return
+        if self.app.db.get_kv("telegram_update_pending"):
+            if self.reply("✅ <b>synoarr a redémarré</b> après la mise à jour (version %s)." % esc(__version__)):
+                self.app.db.set_kv("telegram_update_pending", None)
+        if self.app.db.get_kv("telegram_announced") == ANNOUNCE_ID:
             return
         if self.reply("🔄 <b>synoarr %s est à jour</b>\nVous pouvez maintenant piloter synoarr depuis Telegram.\n\n%s"
                       % (esc(__version__), HELP_TEXT)):
@@ -335,6 +346,54 @@ class TelegramBot(object):
         except ValueError as exc:
             return "❌ %s" % esc(exc)
         return "📡 Lecture des flux RSS lancée." if created else "Une lecture des flux RSS est déjà en cours."
+
+    job_timeout = 600.0  # seconds: an update downloads the GitHub archive
+
+    def _run_job(self, command: str) -> Any:
+        """Start a web command and wait for its end; returns the Job (or None when one is already running)."""
+        job, created = self.app.start_command(command)
+        if not created:
+            return None
+        deadline = time.time() + self.job_timeout
+        while job.running and time.time() < deadline and not self._stop.is_set():
+            time.sleep(0.2)
+        return job
+
+    @staticmethod
+    def _job_lines(job: Any, limit: int = 15) -> List[str]:
+        out = list(getattr(job, "output", None) or [])[-limit:]
+        return ["%s %s" % (LEVEL_ICON.get(level, "•"), esc(text)) for level, text in out]
+
+    def cmd_update(self, args: str) -> str:
+        if args.strip().lower() in YES:
+            self.reply("⏳ Mise à jour de synoarr en cours…")
+            self.app.db.set_kv("telegram_update_pending", "1")
+            job = self._run_job("update")
+            if job is None:
+                self.app.db.set_kv("telegram_update_pending", None)
+                return "Une mise à jour est déjà en cours."
+            res = job.result if isinstance(job.result, dict) else {}
+            lines = self._job_lines(job)
+            if res.get("restarting"):
+                return "\n".join(["🔄 <b>Mise à jour installée</b>, synoarr redémarre…"] + lines
+                                 + ["Un message confirmera le redémarrage."])
+            self.app.db.set_kv("telegram_update_pending", None)
+            head = "❌ <b>Mise à jour impossible</b>" if (job.status == "error" or res.get("ok") is False) \
+                else "✅ <b>synoarr est déjà à jour</b>"
+            return "\n".join([head] + lines)
+        if args.strip():
+            return "Usage : /maj (vérifier) ou /maj oui (installer)"
+        job = self._run_job("update_check")
+        if job is None:
+            return "Une mise à jour est déjà en cours."
+        res = job.result if isinstance(job.result, dict) else {}
+        lines = self._job_lines(job)
+        if job.status == "error" or res.get("ok") is False:
+            return "\n".join(["❌ <b>Vérification impossible</b>"] + lines)
+        if res.get("available"):
+            return "\n".join(["🆕 <b>Mise à jour disponible</b> (version installée : %s)" % esc(__version__)] + lines
+                             + ["Installer et redémarrer : /maj oui"])
+        return "\n".join(["✅ <b>synoarr est à jour</b> (version %s)" % esc(__version__)] + lines)
 
     def cmd_space(self, args: str) -> str:
         lines = ["💾 <b>Espace disque</b>"]
