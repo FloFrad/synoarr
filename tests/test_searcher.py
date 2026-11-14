@@ -889,3 +889,29 @@ class FrenchPlexAccountTests(FrenchSearchEndToEndTests):
         self.searcher.run_once(media_id=self.media("p2")["id"], force=True)
         self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
                          ["The.Shawshank.Redemption.1994.1080p.BluRay.x264-EN"])
+
+
+class FrenchTitleOnlyTests(FrenchSearchEndToEndTests):
+    def test_only_the_french_title_is_searched(self) -> None:  # type: ignore[override]
+        self.cfg.quality.french_title_only = True
+        item = WatchItem(rating_key="m11", type="movie", title="The Shawshank Redemption", year=1994,
+                         guids={"imdb": "tt0111161", "tmdb": "278"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        mid = self.media("m11")["id"]
+        self.db.set_language_override(mid, "fr")
+        self.searcher.run_once(media_id=mid, force=True)
+        self.assertEqual(self.calls, [("Les Évadés", None)])
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
+                         ["Les.Evades.1994.TRUEFRENCH.1080p.WEB-DL.x264-VF"])
+
+    def test_english_plus_french_still_searches_both(self) -> None:
+        self.cfg.quality.french_title_only = True
+        item = WatchItem(rating_key="m12", type="movie", title="The Shawshank Redemption", year=1994,
+                         guids={"imdb": "tt0111161", "tmdb": "278"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        mid = self.media("m12")["id"]
+        self.db.set_language_override(mid, "en,fr")
+        self.searcher.run_once(media_id=mid, force=True)
+        self.assertGreater(len(self.calls), 1)

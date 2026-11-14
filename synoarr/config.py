@@ -97,6 +97,9 @@ class QualityConfig:
     languages: List[str] = field(default_factory=lambda: ["en"])
     # languages for animated movies/shows (genre "Animation" on Plex or TMDb)
     languages_animation: List[str] = field(default_factory=lambda: ["fr"])
+    # French only (item languages = fr) and a French title known: search ONLY the French title
+    # (fewer requests, but MULTi releases named after the original title are missed)
+    french_title_only: bool = False
     min_seeders: int = 1
     min_size_mb: float = 100.0
     max_size_gb_movie: float = 25.0
