@@ -24,6 +24,7 @@ Interface ``App`` attendue (fournie par ``app.py``) ::
         # --- onglet Commandes (Job : id, command, label, running, result, to_dict()) ---
         def start_command(self, command: str, force: bool = False, query: str = "") -> Tuple[Job, bool]
             # command ∈ sync | search_all | process | dry_run | check | test_indexers | search | plex_login
+            #           | telegram_test (F2)
             # (tâche, créée) ; créée=False si la même commande tourne déjà. ValueError -> 400
         def get_job(self, job_id: int) -> Optional[Job]
         def list_jobs(self) -> List[Job]                       # 20 dernières, la plus récente d'abord
@@ -81,15 +82,19 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime as _dt
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import shutil
 import socket
+import struct
 import threading
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -192,6 +197,137 @@ def mask_secrets(row: Any) -> Any:
     return out
 
 
+def _nearest_existing(path: str) -> Optional[str]:
+    """*path* or its nearest existing parent folder (the library folder may not exist yet), None if none."""
+    cur = os.path.abspath(path)
+    while True:
+        if os.path.isdir(cur):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def library_storage(cfg: Any) -> List[Dict[str, Any]]:
+    """Free space of the video library: one entry per volume holding [paths] movies_dir / series_dir (both on
+    the same share = one entry). {"labels", "dirs", "path", "total", "used", "free", "free_pct", "low"} or
+    {"labels", "dirs", "error"}. Never raises."""
+    paths = getattr(cfg, "paths", None)
+    out = []  # type: List[Dict[str, Any]]
+    by_dev = {}  # type: Dict[Any, Dict[str, Any]]
+    for label, folder in (("Films", getattr(paths, "movies_dir", "")), ("Séries", getattr(paths, "series_dir", ""))):
+        if not folder:
+            continue
+        existing = _nearest_existing(folder)
+        try:
+            if existing is None:
+                raise OSError("dossier introuvable")
+            dev = os.stat(existing).st_dev
+            if dev in by_dev:
+                by_dev[dev]["labels"].append(label)
+                by_dev[dev]["dirs"].append(folder)
+                continue
+            usage = shutil.disk_usage(existing)
+        except OSError as exc:
+            out.append({"labels": [label], "dirs": [folder], "error": "Espace disque illisible : %s" % (
+                exc.strerror or exc)})
+            continue
+        total, free = int(usage.total), int(usage.free)
+        pct = round(100.0 * free / total, 1) if total else None
+        entry = {"labels": [label], "dirs": [folder], "path": existing, "total": total, "used": max(0, total - free),
+                 "free": free, "free_pct": pct, "low": pct is not None and pct < 10}
+        by_dev[dev] = entry
+        out.append(entry)
+    return out
+
+
+# ---------------------------------------------------------------- écran d'accueil du téléphone (PWA légère)
+# Pas de service worker : il exige HTTPS. « Ajouter à l'écran d'accueil » marche quand même en HTTP sur le réseau
+# local (Safari iPhone, Chrome Android) : l'icône ouvre synoarr en plein écran, sans barre d'adresse.
+THEME_LIGHT, THEME_DARK, ICON_COLOR = "#ffffff", "#1b1f26", "#2563eb"
+
+ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" '
+            'y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#1d4ed8"/>'
+            '</linearGradient></defs><rect width="512" height="512" rx="104" fill="url(#g)"/>'
+            '<path d="M184 154L358 256L184 358Z" fill="#fff"/></svg>')
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def make_icon_png(size: int) -> bytes:
+    """The synoarr icon (blue gradient, white « play » triangle inside the maskable safe zone) as an RGB PNG of
+    *size* x *size*, drawn and encoded with the standard library only (zlib), antialiased."""
+    top, bottom = (0x3B, 0x82, 0xF6), (0x1D, 0x4E, 0xD8)
+    s = float(size)
+    x0, x1, yc, hh = s * 0.36, s * 0.70, s * 0.5, s * 0.20
+    sub = 4
+    raw = bytearray()
+    for y in range(size):
+        k = y / max(1.0, s - 1)
+        bg = tuple(int(round(top[c] + (bottom[c] - top[c]) * k)) for c in range(3))
+        row = bytearray(bytes(bg) * size)
+        rights = []
+        for j in range(sub):
+            d = abs(y + (j + 0.5) / sub - yc)
+            if d < hh:
+                rights.append(x0 + (x1 - x0) * (1.0 - d / hh))
+        if rights:
+            lo, hi = int(x0), min(size, int(max(rights)) + 1)
+            for i in range(lo, hi):
+                cov = 0.0
+                for r in rights:
+                    a = min(r, i + 1.0) - max(x0, float(i))
+                    if a > 0:
+                        cov += a if a < 1.0 else 1.0
+                cov /= sub
+                if cov > 0:
+                    row[3 * i:3 * i + 3] = bytes(int(round(bg[c] + (255 - bg[c]) * cov)) for c in range(3))
+        raw += b"\x00" + row
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + _png_chunk(b"IEND", b""))
+
+
+def manifest_json() -> bytes:
+    icons = [{"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+             {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+             {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+             {"src": "icon.svg", "sizes": "any", "type": "image/svg+xml"}]
+    data = {"name": "synoarr", "short_name": "synoarr", "lang": "fr", "dir": "ltr",
+            "description": "Watchlist Plex, recherche et rangement des films et séries sur le NAS",
+            "start_url": "./", "scope": "./", "display": "standalone", "orientation": "any",
+            "background_color": "#f4f5f7", "theme_color": ICON_COLOR, "icons": icons}
+    return json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+# fichiers publics (aucun secret) : servis sans authentification ni contrôle de l'en-tête Host, car les navigateurs
+# les demandent parfois sans identifiants (manifeste, icône de l'écran d'accueil)
+PUBLIC_FILES = {
+    "/manifest.webmanifest": ("application/manifest+json; charset=utf-8", manifest_json),
+    "/icon.svg": ("image/svg+xml", lambda: ICON_SVG.encode("utf-8")),
+    "/favicon.ico": ("image/png", lambda: make_icon_png(64)),
+    "/icon-192.png": ("image/png", lambda: make_icon_png(192)),
+    "/icon-512.png": ("image/png", lambda: make_icon_png(512)),
+    "/apple-touch-icon.png": ("image/png", lambda: make_icon_png(180)),
+    "/apple-touch-icon-precomposed.png": ("image/png", lambda: make_icon_png(180)),
+}
+_public_cache = {}  # type: Dict[str, bytes]
+_public_lock = threading.Lock()
+
+
+def public_file(path: str) -> Optional[Tuple[bytes, str]]:
+    entry = PUBLIC_FILES.get(path)
+    if entry is None:
+        return None
+    with _public_lock:
+        if path not in _public_cache:
+            _public_cache[path] = entry[1]()
+        return _public_cache[path], entry[0]
+
+
 def host_is_local(host_header: str) -> bool:
     """True for an IP address, localhost, a single-label LAN name ("diskstation") or *.local / *.lan / *.home."""
     import ipaddress
@@ -269,6 +405,9 @@ class WebServer:
             ("GET", r"/api/config", self.api_config),
             ("POST", r"/api/config", self.api_config_save),
             ("POST", r"/api/config/restore", self.api_config_restore),
+            ("POST", r"/api/media/bulk", self.api_media_bulk),
+            ("GET", r"/api/upcoming", self.api_upcoming),
+            ("GET", r"/api/dashboard", self.api_dashboard),
         ]  # type: List[Tuple[str, str, Any]]
         self._compiled = [(m, re.compile(p + r"/?\Z"), f) for m, p, f in self._routes]
 
@@ -413,7 +552,17 @@ class WebServer:
                 m["episodes"] = summary.get(m["id"], {"total": 0, "done": 0, "grabbed": 0, "wanted": 0})
             m["downloads"] = by_media.get(m["id"], [])
             out.append(m)
+        self._request_posters([m["id"] for m in out if m.get("poster") is None and m.get("on_watchlist")])
         return out
+
+    def _request_posters(self, ids: List[int]) -> None:
+        """Missing posters are looked up on TMDb in the background (throttled by the App), never blocking."""
+        func = getattr(self.app, "request_posters", None)
+        if ids and func is not None:
+            try:
+                func(ids)
+            except Exception as exc:  # pragma: no cover - a poster never breaks the list
+                log.debug("Affiches : %s", exc)
 
     def api_episodes(self, media_id: int, query: Dict[str, str], body: Any) -> List[Dict[str, Any]]:
         self._media_or_404(media_id)
@@ -630,7 +779,21 @@ class WebServer:
         langs = self._parse_add_languages(data.get("languages"))  # validated before anything is added
         row = self._app_func("add_to_watchlist")(cand, data.get("add_to_plex", True) is not False)
         self._apply_add_languages(row, langs)
+        self._keep_candidate_poster(row, cand.get("poster_url"))
         return self._added(row, data.get("search_now", True) is not False)
+
+    def _keep_candidate_poster(self, row: Dict[str, Any], url: Any) -> None:
+        """The poster shown in the « Ajouter » window (Plex or TMDb, public https URL) becomes the Watchlist
+        thumbnail: no TMDb lookup needed later."""
+        if not row.get("id") or not isinstance(url, str) or not re.match(r"^https://[^\s\"'<>]{1,500}\Z", url) \
+                or "token" in url.lower():
+            return
+        try:
+            media = self.app.db.get_media(int(row["id"])) or {}
+            if media.get("poster") is None:
+                self.app.db.set_media_artwork(int(row["id"]), url)
+        except Exception as exc:  # pragma: no cover - older database API
+            log.debug("Affiche du candidat non enregistrée : %s", exc)
 
     def _apply_add_languages(self, row: Dict[str, Any], value: Optional[str]) -> None:
         """Languages chosen in the « Ajouter » window, applied BEFORE the first search."""
@@ -740,6 +903,152 @@ class WebServer:
             self.app.db.execute("UPDATE media SET title_fr = NULL WHERE id = ?", (media_id,))
             msg = "Titre français de « %s » effacé (recherché à nouveau sur TMDb)" % media["title"]
         return {"ok": True, "title_fr": value, "message": msg}
+
+    # ------------------------------------------------- actions groupées, À venir, tableau de bord
+    BULK_ACTIONS = ("search", "language", "ignore", "unignore", "delete")
+    BULK_MAX = 500
+
+    def _search_many(self, ids: List[int]) -> None:
+        func = getattr(self.app, "search_many", None)
+        if func is not None:
+            func(list(ids))
+        else:
+            for mid in ids:
+                self.app.search_now(mid)
+
+    def api_media_bulk(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        data = self._body_dict(body)
+        action = data.get("action")
+        if action not in self.BULK_ACTIONS:
+            raise HttpProblem(400, "Action invalide : search, language, ignore, unignore ou delete attendu")
+        raw = data.get("ids")
+        if not isinstance(raw, list) or not raw:
+            raise HttpProblem(400, "Le champ « ids » (liste des éléments sélectionnés) est obligatoire")
+        if len(raw) > self.BULK_MAX:
+            raise HttpProblem(400, "Trop d'éléments sélectionnés (%d maximum)" % self.BULK_MAX)
+        ids = []  # type: List[int]
+        for v in raw:
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise HttpProblem(400, "Identifiant invalide dans « ids » : %s" % json.dumps(v, ensure_ascii=False)[:40])
+            if v not in ids:
+                ids.append(v)
+        langs = None  # type: Optional[str]
+        if action == "language":
+            raw_l = data.get("languages")
+            if raw_l is not None and not isinstance(raw_l, str):
+                raise HttpProblem(400, "Le champ « languages » doit être une chaîne (ex. \"fr\", \"en,fr\" ou \"\")")
+            langs = ",".join(x.strip().lower() for x in (raw_l or "").replace(";", ",").split(",") if x.strip())
+            if langs and not _LANG_LIST.match(langs):
+                raise HttpProblem(400, "Langues invalides : codes de 2 à 6 lettres séparés par des virgules (ex. en,fr)")
+        remove_from_plex = data.get("remove_from_plex", True) is not False
+        delete_downloads = data.get("delete_downloads") is True
+        if action == "delete":
+            self._app_func("remove_from_watchlist")
+        db = self.app.db
+        done, skipped, errors, warnings = [], [], [], []  # type: List[int], List[Dict[str, Any]], List[Dict[str, Any]], List[str]
+        to_search = []  # type: List[int]
+        downloads_deleted = 0
+        for mid in ids:
+            media = db.get_media(mid)
+            if not media:
+                errors.append({"id": mid, "title": None, "error": "Élément introuvable (id %d)" % mid})
+                continue
+            title = media["title"]
+            active = bool(media.get("on_watchlist")) and media.get("status") in ("wanted", "monitored")
+            try:
+                if action == "search":
+                    if not active:
+                        skipped.append({"id": mid, "title": title, "reason": "ignoré, terminé, en téléchargement "
+                                        "ou retiré de la Watchlist"})
+                        continue
+                    to_search.append(mid)
+                elif action == "language":
+                    db.set_language_override(mid, langs or None)
+                    if active:
+                        to_search.append(mid)
+                elif action == "ignore":
+                    self.app.set_media_status(mid, "ignored")
+                elif action == "unignore":
+                    if media.get("status") != "ignored":
+                        skipped.append({"id": mid, "title": title, "reason": "n'était pas ignoré"})
+                        continue
+                    self.app.set_media_status(mid, "monitored" if media["type"] == "show" else "wanted")
+                else:  # delete
+                    res = self.app.remove_from_watchlist(mid, remove_from_plex=remove_from_plex,
+                                                         delete_downloads=delete_downloads) or {}
+                    downloads_deleted += int(res.get("downloads_deleted") or 0)
+                    if res.get("warning"):
+                        warnings.append(str(res["warning"]))
+                done.append(mid)
+            except ValueError as exc:
+                errors.append({"id": mid, "title": title, "error": str(exc)})
+        if to_search:  # one background thread for the whole selection
+            self._search_many(to_search)
+        n = len(done)
+        msg = {"search": "Recherche lancée pour %d élément(s)",
+               "language": "Langues « " + (langs or "automatique") + " » appliquées à %d élément(s)",
+               "ignore": "%d élément(s) ignoré(s)",
+               "unignore": "%d élément(s) repris",
+               "delete": "%d élément(s) retiré(s) de la liste"}[action] % n
+        if action == "language" and to_search:
+            msg += " — nouvelle recherche lancée pour %d" % len(to_search)
+        if downloads_deleted:
+            msg += " — %d téléchargement(s) supprimé(s) de Download Station" % downloads_deleted
+        if skipped:
+            msg += " — %d non concerné(s)" % len(skipped)
+        if errors:
+            msg += " — %d erreur(s) : %s" % (len(errors), "; ".join(e["error"] for e in errors[:3]))
+        return {"ok": bool(done) or not errors, "action": action, "done": done, "skipped": skipped,
+                "errors": errors, "searched": len(to_search), "downloads_deleted": downloads_deleted,
+                "warning": " ; ".join(warnings[:5]) or None, "message": msg}
+
+    def api_upcoming(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        """Episodes of the monitored shows airing in the next *days* days (and those of the last *past* days, with
+        their status) + wanted movies whose release date (TMDb) falls in the same window."""
+        try:
+            days = int(query.get("days", 30))
+            past = int(query.get("past", 7))
+        except ValueError:
+            raise HttpProblem(400, "Paramètres days / past invalides")
+        if not 1 <= days <= 365 or not 0 <= past <= 60:
+            raise HttpProblem(400, "days doit être entre 1 et 365, past entre 0 et 60")
+        today = _dt.date.today()
+        start = (today - _dt.timedelta(days=past)).isoformat()
+        end = (today + _dt.timedelta(days=days)).isoformat()
+        db = self.app.db
+        rows = db.query(
+            "SELECT e.media_id, e.season, e.episode, e.title AS episode_title, substr(e.air_date, 1, 10) AS date, "
+            "e.status, m.title, m.year, m.poster FROM episodes e JOIN media m ON m.id = e.media_id "
+            "WHERE m.type = 'show' AND m.status = 'monitored' AND m.on_watchlist = 1 AND COALESCE(m.hidden, 0) = 0 "
+            "AND e.air_date IS NOT NULL AND substr(e.air_date, 1, 10) BETWEEN ? AND ? "
+            "ORDER BY date, m.title, e.season, e.episode LIMIT 1000", (start, end))
+        items = [dict(r, kind="episode") for r in rows]
+        movies = db.query(
+            "SELECT id AS media_id, title, year, poster, status, substr(release_date, 1, 10) AS date FROM media "
+            "WHERE type = 'movie' AND status = 'wanted' AND on_watchlist = 1 AND COALESCE(hidden, 0) = 0 "
+            "AND release_date IS NOT NULL AND substr(release_date, 1, 10) BETWEEN ? AND ? "
+            "ORDER BY date, title LIMIT 200", (start, end))
+        items += [dict(r, kind="movie") for r in movies]
+        t = today.isoformat()
+        upcoming = sorted([i for i in items if i["date"] >= t],
+                          key=lambda i: (i["date"], i["kind"] != "movie", i["title"] or "", i.get("season") or 0,
+                                         i.get("episode") or 0))
+        recent = sorted([i for i in items if i["date"] < t],
+                        key=lambda i: (i["date"], i["kind"] != "movie", i["title"] or "", i.get("season") or 0,
+                                       i.get("episode") or 0))
+        recent.reverse()
+        missing = db.query("SELECT id FROM media WHERE poster IS NULL AND on_watchlist = 1 AND COALESCE(hidden, 0) = 0 "
+                           "AND ((type = 'movie' AND status = 'wanted') OR (type = 'show' AND status = 'monitored'))")
+        self._request_posters([r["id"] for r in missing])
+        return {"today": t, "days": days, "past_days": past, "upcoming": upcoming, "recent": recent,
+                "tmdb_configured": bool(getattr(getattr(self.app, "tmdb", None), "enabled", False))}
+
+    def api_dashboard(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        imports = self.app.db.query(
+            "SELECT g.id, g.media_id, g.season, g.episode, g.release_title, g.size, g.indexer, g.updated_at, "
+            "m.title AS media_title, m.type AS media_type, m.poster FROM grabs g LEFT JOIN media m ON m.id = g.media_id "
+            "WHERE g.status = 'imported' ORDER BY g.updated_at DESC, g.id DESC LIMIT ?", (self._limit(query, 10),))
+        return {"storage": library_storage(self.app.cfg), "imports": imports}
 
     # ------------------------------------------------------------- commandes
     @staticmethod
@@ -861,7 +1170,8 @@ def _make_handler(server: WebServer) -> type:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            if "Cache-Control" not in (extra or {}):
+                self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
@@ -885,6 +1195,11 @@ def _make_handler(server: WebServer) -> type:
                     pass
 
         def _handle_inner(self) -> None:
+            if self.command in ("GET", "HEAD"):
+                static = public_file(urllib.parse.urlsplit(self.path).path)
+                if static is not None:  # manifeste et icônes : publics (voir PUBLIC_FILES)
+                    self._send(200, static[0], static[1], {"Cache-Control": "public, max-age=86400"})
+                    return
             if not server.auth_enabled and not host_is_local(self.headers.get("Host", "")):
                 # protection contre le « DNS rebinding » quand aucun mot de passe n'est configuré
                 self._send(403, {"error": "Accès refusé : utilisez l'adresse IP du NAS, ou configurez [web] "
@@ -1025,13 +1340,19 @@ const V={}, S={};
 function dlBlock(dl){if(!dl)return '';const it=dl.items||[],fl=dl.failed||[];if(dl.active)dlActive=true;
   return `<div class="card"><h3>Téléchargements en cours${it.length?` <span class="mut small">(${it.length}${dl.active?' dont '+dl.active+' actif'+(dl.active>1?'s':''):''})</span>`:''}</h3>
   ${dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}${it.length?it.map(d=>dlRow(d,true)).join(''):'<p class="mut">Aucun téléchargement en cours.</p>'}
-  ${fl.length?`<h4 class="mut">Échecs (toujours recherchés)</h4>${fl.map(d=>dlRow(d,true)).join('')}`:''}</div>`}
-V.dash=async()=>{const [s,ev,dl]=await Promise.all([api('status'),api('events?limit=8'),api('downloads').catch(()=>null)]);const c=s.counts||{};
+  ${fl.length?`<h4 class="mut">Échecs récents (toujours recherchés)</h4>${fl.map(d=>dlRow(d,true)).join('')}`:''}</div>`}
+const stoBlock=st=>!st||!st.length?'':`<div class="card"><h3>Espace disque de la vidéothèque</h3>${st.map(v=>{const lb=esc((v.labels||[]).join(' · '));
+  if(v.error)return `<div class="msg wa">${lb} : ${esc(v.error)}</div>`;const used=Math.max(0,Math.min(100,100-(v.free_pct||0)));
+  return `<div class="sto"><div class="stoh"><b>${lb}</b><span class="mut small brk">${esc(v.path)}</span></div>
+  <div class="pbar sb${v.free_pct<5?' ko':v.low?' wa':''}" role="meter" aria-label="Espace utilisé : ${lb}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(used)}"><i style="width:${used}%"></i></div>
+  <div class="small"><b class="${v.low?'o-warn':''}">${size(v.free)||'0 o'} libres (${fpct(v.free_pct||0)})</b> <span class="mut">· ${size(v.used)||'0 o'} utilisés sur ${size(v.total)}</span>${v.low?' <span class="b b-grabbed">espace faible</span>':''}</div></div>`}).join('')}</div>`;
+const impBlock=im=>`<div class="card"><h3>Derniers imports</h3>${im&&im.length?`<ul class="ev imp">${im.map(g=>`<li><time>${esc(fdate(g.updated_at))}</time> <b>${esc((g.media_title||'')+tgt(g))||esc(g.release_title)}</b><div class="mut small brk">${esc(g.release_title)}</div></li>`).join('')}</ul>`:'<p class="mut">Aucun import pour le moment.</p>'}</div>`;
+V.dash=async()=>{const [s,ev,dl,db]=await Promise.all([api('status'),api('events?limit=8'),api('downloads').catch(()=>null),api('dashboard').catch(()=>null)]);const c=s.counts||{};
   const errs=(s.last_errors||[]).map(e=>`<li>${typeof e==='object'?esc(fdate(e.ts||e.at||''))+' — '+esc(e.message||e.error||JSON.stringify(e)):esc(e)}</li>`).join('');
   return `${rsBanner(s.restart_required)}<div class="grid">
   <div class="card stat"><b>${c.movies||0}</b><span>Films suivis</span></div><div class="card stat"><b>${c.shows||0}</b><span>Séries suivies</span></div>
   <div class="card stat"><b>${(c.movies_wanted||0)+(c.episodes_wanted||0)}</b><span>Recherchés</span></div>
-  <div class="card stat"><b>${c.downloading||0}</b><span>En téléchargement</span></div></div>${dlBlock(dl)}
+  <div class="card stat"><b>${c.downloading||0}</b><span>En téléchargement</span></div></div>${stoBlock(db&&db.storage)}${dlBlock(dl)}
   <div class="card"><div class="row"><button data-run="watchlist">Synchroniser la Watchlist</button><button data-run="process">Traiter les téléchargements</button><a class="btn sec" href="#cmd">Autres commandes…</a></div>
   <dl><dt>Dernière synchro Watchlist</dt><dd>${esc(fdate(s.last_watchlist_run))}</dd><dt>Dernier traitement</dt><dd>${esc(fdate(s.last_process_run))}</dd>
   <dt>Plex</dt><dd>${yn(s.plex_configured)}</dd><dt>Download Station</dt><dd>${yn(s.ds_configured)}</dd>
@@ -1039,7 +1360,7 @@ V.dash=async()=>{const [s,ev,dl]=await Promise.all([api('status'),api('events?li
   ${s.jobs_running&&s.jobs_running.length?`<dt>En cours</dt><dd>${esc(s.jobs_running.join(', '))}</dd>`:''}
   <dt>Démarré le</dt><dd>${esc(fdate(s.started_at))}</dd><dt>Version</dt><dd>${esc(s.version)}</dd></dl></div>
   ${errs?`<div class="card err"><h3>Dernières erreurs</h3><ul>${errs}</ul></div>`:''}
-  <div class="card"><h3>Activité récente</h3>${evList(ev)}</div>`};
+  <div class="grid2">${impBlock(db&&db.imports)}<div class="card"><h3>Activité récente</h3>${evList(ev)}</div></div>`};
 const evList=ev=>ev.length?`<ul class="ev">${ev.map(e=>`<li class="lv-${esc(e.level)}"><time>${esc(fdate(e.ts))}</time> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</li>`).join('')}</ul>`:'<p class="mut">Aucun événement.</p>';
 const LANGS=[['','Auto'],['en','Anglais (en)'],['fr','Français (fr)'],['en,fr','Anglais + Français']];
 const langSel=m=>{const v=m.language_override||'',o=LANGS.some(l=>l[0]===v)?LANGS:LANGS.concat([[v,v]]);
@@ -1051,19 +1372,25 @@ const wcat=m=>{if(!m.on_watchlist)return 'off';if(m.status==='ignored')return 'i
   if(dls.some(d=>d.grab_status==='sent')||m.status==='grabbed'||(e&&e.grabbed>0))return 'dl';
   if(m.type==='movie')return m.status==='done'?'done':'wanted';
   if(e&&e.total>0&&e.wanted===0&&e.done>0)return 'done';return 'wanted'};
+/* affiches + mode Sélection (actions groupées) */
+const BADIMG=new Set();
+const okImg=u=>typeof u==='string'&&/^https:\/\/[^\s"'<>]+$/.test(u)&&!BADIMG.has(u);
+const pst=(m,c)=>`<div class="pst${c?' '+c:''}" data-l="${esc(String(m.title||'?').trim().charAt(0).toUpperCase())}" aria-hidden="true">${okImg(m.poster)?`<img src="${esc(m.poster)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`:''}</div>`;
+let SEL=null,WMAP={},WVIS=[];
 V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads').catch(()=>null)]);const f=$('#wf')?$('#wf').value:'',q=$('#wq')?$('#wq').value.toLowerCase():'';
   const base=ms.filter(m=>(!f||m.type===f)&&(!q||(m.title||'').toLowerCase().includes(q)));
   const cnt={};base.forEach(m=>{const c=wcat(m);cnt[c]=(cnt[c]||0)+1;if(c!=='off')cnt.all=(cnt.all||0)+1});
   if(WST!=='all'&&!cnt[WST]&&WST==='off')WST='all';
   const items=base.filter(m=>WST==='all'?wcat(m)!=='off':wcat(m)===WST);
+  WMAP={};ms.forEach(m=>WMAP[m.id]=m);WVIS=items.map(m=>m.id);if(SEL)[...SEL].forEach(id=>{if(!WMAP[id])SEL.delete(id)});
   const tabs=`<div class="row wtabs" role="tablist" aria-label="Filtrer par statut">${WTABS.filter(t=>t[0]!=='off'||cnt.off).map(t=>`<button type="button" role="tab" class="xs${WST===t[0]?'':' sec'}" aria-selected="${WST===t[0]}" data-wst="${t[0]}">${t[1]} (${cnt[t[0]]||0})</button>`).join('')}${WST==='off'&&cnt.off?'<span class="mut small">Ces éléments ne sont plus dans votre Watchlist Plex : supprimez-les ou remettez-les dans la Watchlist.</span>':''}</div>`;
   const eps=await Promise.all(items.filter(m=>exp.has(m.id)).map(async m=>[m.id,await api('media/'+m.id+'/episodes').catch(()=>[])]));
   const em=Object.fromEntries(eps);
   return `<div class="row tools"><select id="wf"><option value="">Tous</option><option value="movie"${f==='movie'?' selected':''}>Films</option><option value="show"${f==='show'?' selected':''}>Séries</option></select>
-  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"><button data-wadd="1">+ Ajouter</button></div>${tabs}${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
+  <input id="wq" type="search" placeholder="Filtrer…" value="${esc(q)}"><button class="sec" data-selmode="1" aria-pressed="${!!SEL}">${SEL?'Terminer':'Sélection'}</button><button data-wadd="1">+ Ajouter</button></div>${tabs}${dl&&dl.warning?`<div class="msg wa">${esc(dl.warning)}</div>`:''}
   ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored',dls=m.downloads||[];
   if(dls.some(d=>d.active))dlActive=true;
-  return `<div class="card item${m.on_watchlist?'':' off'}"><div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
+  return `<div class="card item${m.on_watchlist?'':' off'}${SEL&&SEL.has(m.id)?' sel':''}" data-id="${m.id}"><div class="wr">${SEL?`<input type="checkbox" class="wck" data-sel="${m.id}"${SEL.has(m.id)?' checked':''} aria-label="Sélectionner ${esc(m.title)}">`:''}${pst(m)}<div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
   <div class="meta">${badge(m.type)} ${badge(m.status)} ${String(m.plex_key||'').startsWith('local:')?'<span class="b b-local" title="Entrée locale, hors Watchlist Plex">local</span>':''} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
   ${m.collection?`<span class="mut">Collection : ${esc(m.collection)}</span>`:''}
   ${e?`<span class="mut">${e.done}/${e.total} épisodes · ${e.wanted} recherchés${e.grabbed?' · '+e.grabbed+' en cours':''}</span>`:''}
@@ -1072,13 +1399,30 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
   ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
-  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div>
+  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div></div>
   ${dls.length?`<div class="dls">${dls.map(d=>dlRow(d,false)).join('')}</div>`:''}
   ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):(ms.length?'<p class="mut card">Aucun élément dans cet onglet.</p>':'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>')}`};
 function epTable(eps,m){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
   return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}</summary>
   ${by[s].filter(e=>e.status==='wanted').length>1?`<div class="row spk">${srcBtn(m.id,+s,null,null,m.title+' saison '+s,'','Choisir un pack pour la saison '+esc(s))}</div>`:''}
   <table class="eps">${by[s].map(e=>`<tr><td>E${pad(e.episode)}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}${e.status==='wanted'?' '+srcBtn(m.id,e.season,e.episode,null,m.title+` S${pad(e.season)}E${pad(e.episode)}`,'','Source…'):''}</td></tr>`).join('')}</table></details>`).join('')}
+/* ------------------------------------------------------------------ À venir */
+let CALD='30';try{CALD=localStorage.getItem('synoarr.cald')||'30'}catch(e){}
+const pday=s=>{const a=String(s).split('-');return new Date(+a[0],+a[1]-1,+a[2])};
+function dayLbl(d,t){const n=Math.round((pday(d)-pday(t))/864e5);if(n===0)return 'Aujourd\'hui';if(n===1)return 'Demain';if(n===-1)return 'Hier';
+  const o={weekday:'long',day:'numeric',month:'long'};if(d.slice(0,4)!==t.slice(0,4))o.year='numeric';const x=pday(d).toLocaleDateString('fr-FR',o);return x.charAt(0).toUpperCase()+x.slice(1)}
+function calRow(i,t){const ep=i.kind==='episode',code=ep?`S${pad(i.season)}E${pad(i.episode)}`:'',fut=i.date>t;
+  const st=fut&&i.status==='wanted'?badge('planned'):badge(i.status);
+  return `<div class="crow">${pst(i,'sm')}<div class="cb"><div><b>${esc(i.title)}</b>${ep?` <span class="mut nw">${code}</span>`:(i.year?` <span class="mut">(${esc(i.year)})</span>`:'')}</div>
+  ${ep&&i.episode_title?`<div class="small brk">${esc(i.episode_title)}</div>`:''}<div class="meta">${badge(ep?'show':'movie')} ${st}${ep?'':' <span class="mut small">date de sortie (TMDb)</span>'}</div></div>
+  ${i.status==='wanted'&&!fut?`<div class="cact">${srcBtn(i.media_id,ep?i.season:null,ep?i.episode:null,null,i.title+(ep?' '+code:''),'',ep?'Source…':'Choisir une source')}</div>`:''}</div>`}
+function calList(list,t){const g=[];list.forEach(i=>{let x=g[g.length-1];if(!x||x.d!==i.date){x={d:i.date,a:[]};g.push(x)}x.a.push(i)});
+  return g.map(x=>`<section class="cday"><h4${x.d===t?' class="tdy"':''}>${esc(dayLbl(x.d,t))}${/^Aujourd|^Demain|^Hier/.test(dayLbl(x.d,t))?` <span class="mut small">${esc(pday(x.d).toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'long'}))}</span>`:''}</h4>${x.a.map(i=>calRow(i,t)).join('')}</section>`).join('')}
+V.cal=async()=>{const r=await api('upcoming?days='+encodeURIComponent(CALD));const t=r.today;
+  const sel=`<select id="cald" aria-label="Période">${[['7','7 jours'],['14','14 jours'],['30','30 jours'],['60','60 jours'],['90','90 jours']].map(o=>`<option value="${o[0]}"${CALD===o[0]?' selected':''}>${o[1]}</option>`).join('')}</select>`;
+  const hint=`<p class="mut small">Épisodes des séries suivies (dates de diffusion TMDb / Plex, mises à jour à chaque synchronisation de la Watchlist)${r.tmdb_configured?' et films recherchés avec une date de sortie connue':' ; configurez une clé TMDb pour voir aussi les dates de sortie des films'}.</p>`;
+  return `<div class="card"><div class="cfgh"><h3>À venir <span class="mut small">(${r.upcoming.length})</span></h3>${sel}</div>${r.upcoming.length?calList(r.upcoming,t):`<p class="mut">Rien de prévu dans les ${esc(r.days)} prochains jours.</p>`}${hint}</div>
+  <div class="card"><h3>${esc(r.past_days)} derniers jours <span class="mut small">(${r.recent.length})</span></h3>${r.recent.length?calList(r.recent,t):'<p class="mut">Aucune sortie récente.</p>'}</div>`};
 const PRW={url:'http://127.0.0.1:9696',key:'',res:''};
 async function prowlarr(){const u=$('#prwu').value.trim(),k=$('#prwk').value.trim();PRW.url=u;PRW.key=k;
   if(!u||!k){toast('Saisissez l\'adresse et la clé API de Prowlarr',true);return}
@@ -1138,9 +1482,11 @@ const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (f
   ['test_indexers','Tester tous les indexers','Vérifie que chaque indexer répond.'],
   ['ds_test','Test d\'envoi Download Station','Envoie un torrent libre très partagé (Ubuntu) des 3 façons possibles (fichier, lien, magnet) et indique lesquelles démarrent (≈ 5 min).'],
   ['ds_diag','Diagnostic Download Station','Explique pourquoi des téléchargements restent « En attente » ou en erreur.'],
+  ['subtitles_scan','Rechercher les sous-titres manquants','Télécharge depuis OpenSubtitles les sous-titres manquants ([subtitles] languages) des films et séries de la bibliothèque.'],
   ['update_check','Vérifier les mises à jour','Compare votre version avec GitHub, sans rien modifier.'],
   ['update','Mettre à jour synoarr','Télécharge la dernière version, la vérifie, garde config.ini et data/, puis redémarre.'],
-  ['update_rollback','Revenir à la version précédente','Restaure les fichiers sauvegardés lors de la dernière mise à jour, puis redémarre.']];
+  ['update_rollback','Revenir à la version précédente','Restaure les fichiers sauvegardés lors de la dernière mise à jour, puis redémarre.'],
+  ['telegram_test','Tester Telegram','Envoie un message de test (ou affiche votre chat_id).']];
 const PFX={ok:'[OK]  ',err:'[ERR] ',warn:'[!]   ',info:''};
 let jobs={}, cur=null, srch=null, plexId=null;
 const polling=new Set();
@@ -1262,10 +1608,10 @@ async function refresh(){clearTimeout(timer);document.querySelectorAll('nav a').
   dlActive=false;
   try{const html=await (V[tab]||V.dash)();const ae=document.activeElement,fid=ae&&ae.id,pos=fid&&ae.selectionStart;
     app.innerHTML=html;if(fid&&$('#'+fid)){const el=$('#'+fid);el.focus();if(pos!=null&&el.setSelectionRange)el.setSelectionRange(pos,pos)}
-    $('#conn').textContent='';}
+    $('#conn').textContent='';syncBulk()}
   catch(e){$('#conn').textContent='⚠ '+e.message}
   timer=setTimeout(refresh,dlActive&&(tab==='watch'||tab==='dash')?5000:15000)}
-addEventListener('hashchange',()=>{tab=(location.hash||'#dash').slice(1);mounted=null;app.innerHTML='<p class="mut">Chargement…</p>';refresh()});
+addEventListener('hashchange',()=>{tab=(location.hash||'#dash').slice(1);mounted=null;app.innerHTML='<p class="mut">Chargement…</p>';syncBulk();refresh()});
 addEventListener('beforeunload',e=>{if(dirty()){e.preventDefault();e.returnValue=''}});
 document.addEventListener('keydown',e=>{if(tab==='cfg'&&(e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();cfgSave()}});
 app.addEventListener('input',e=>{const id=e.target.id;if(id==='wq'||id==='wf')refresh();
@@ -1274,6 +1620,8 @@ app.addEventListener('input',e=>{const id=e.target.id;if(id==='wq'||id==='wf')re
   else if(id==='cft'&&cfgD){cfgD.text=e.target.value;markDirty()}});
 app.addEventListener('change',e=>{const t=e.target,id=t.id;
   if(t.dataset.lang)act(()=>api('media/'+t.dataset.lang+'/language','POST',{languages:t.value}));
+  else if(t.dataset.sel)selToggle(+t.dataset.sel,t.checked);
+  else if(id==='cald'){CALD=t.value;try{localStorage.setItem('synoarr.cald',CALD)}catch(e){}refresh()}
   else if(t.dataset.prio)setPrio(t.dataset.prio,t.value);
   else if(id==='ln'||id==='lv'){LG[id==='ln'?'lines':'level']=t.value;saveLG();loadLogs(true)}
   else if(id==='la'){LG.auto=t.checked;saveLG();loadLogs()}});
@@ -1284,6 +1632,7 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   if(d.run)act(()=>api('run/'+d.run,'POST'));
   else if(d.src)openSrc(d);
   else if(d.wadd)openAdd();
+  else if(d.selmode){SEL=SEL?null:new Set();refresh()}
   else if(d.wdel)openDel(d);
   else if(d.ltf&&d.lts==='srch'){LTF.srch=d.ltf;if(srch&&jobs[srch])drawSearch(jobs[srch])}
   else if(d.tfr){const v=prompt('Titre français utilisé pour chercher les releases françaises (vide = recherche automatique sur TMDb) :',d.v||'');
@@ -1354,7 +1703,8 @@ function drawSrcTable(){const r=srcJob&&srcJob.result,el=$('#srctbl');if(!r||!el
   :'<p class="mut">Aucun résultat ne correspond aux filtres.</p>'}
 function drawSrcRes(j){const first=srcJob!==j||!$('#srctbl');srcJob=j;const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
   SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
-  if(!r.results.length){el.innerHTML=`<p class="mut">Aucun résultat pour ${esc(r.request)} (langues : ${langs}). Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
+  if(!r.results.length){const ts=(r.titles||[]).length?(r.titles||[]).map(esc).join(' · '):esc(r.request);
+    el.innerHTML=`<p class="mut">Aucun résultat. Titres cherchés : <b>${ts}</b>${r.french_title_only?' (titre français seulement)':''} · langues : ${langs}. Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
   if(first){const ok=r.results.filter(x=>x.score!=null).length,idxs=[...new Set(r.results.map(x=>x.indexer))].sort();
     if(SF.idx&&!idxs.includes(SF.idx))SF.idx='';
     const opt=(v,l)=>`<option value="${esc(v)}"${SF.key===v?' selected':''}>${l}</option>`;
@@ -1459,15 +1809,50 @@ async function wDel(id,b){b.disabled=true;
     closeGM();toast(r.message+(r.warning?' — '+r.warning:''),false);await refresh()}
   catch(e){b.disabled=false;toast(e.message,true)}}
 gm.addEventListener('click',e=>{if(e.target===gm||e.target.closest('[data-gmclose]')){closeGM();return}const b=e.target.closest('button');if(!b)return;
-  if(b.dataset.wpick)wAdd(+b.dataset.wpick,b);else if(b.dataset.wdelok)wDel(b.dataset.wdelok,b)});
+  if(b.dataset.wpick)wAdd(+b.dataset.wpick,b);else if(b.dataset.wdelok)wDel(b.dataset.wdelok,b);else if(b.dataset.bdelok)bulkDel(b)});
 gm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='wsf')wSearch();else if(e.target.id==='wmf')wManual();else if(e.target.id==='ief')saveIdx(e.target)});
+/* ------------------------------------------------- Watchlist : actions groupées */
+const bulkBar=$('#bulk');
+function syncBulk(){const on=tab==='watch'&&!!SEL,n=SEL?SEL.size:0;bulkBar.hidden=!on;document.body.classList.toggle('selmode',on);
+  if(!on)return;$('#bkn').textContent=n?n+' sélectionné'+(n>1?'s':''):'Aucun élément sélectionné';
+  bulkBar.querySelectorAll('[data-bk]').forEach(b=>{if(!['all','none','exit'].includes(b.dataset.bk))b.disabled=!n});$('#bkl').disabled=!n;
+  document.body.style.setProperty('--bkh',bulkBar.offsetHeight+'px')}
+function selToggle(id,on){if(!SEL)return;if(on===undefined)on=!SEL.has(id);on?SEL.add(id):SEL.delete(id);
+  const c=app.querySelector(`.item[data-id="${id}"]`);if(c){c.classList.toggle('sel',on);const k=c.querySelector('[data-sel]');if(k)k.checked=on}syncBulk()}
+async function bulk(action,extra){if(!SEL||!SEL.size){toast('Aucun élément sélectionné',true);return null}
+  try{const r=await api('media/bulk','POST',Object.assign({ids:[...SEL],action},extra||{}));
+    toast(r.message+(r.warning?' — '+r.warning:''),!r.ok);if(action==='delete')(r.done||[]).forEach(id=>SEL&&SEL.delete(id));await refresh();return r}
+  catch(e){toast(e.message,true);return null}}
+function openBulkDel(){const ms=SEL?[...SEL].map(id=>WMAP[id]).filter(Boolean):[];if(!ms.length){toast('Aucun élément sélectionné',true);return}
+  const plex=ms.filter(m=>!String(m.plex_key||'').startsWith('local:')).length,dl=ms.reduce((n,m)=>n+(m.downloads||[]).filter(d=>d.grab_status==='sent').length,0);
+  openGM('bdel','Supprimer de la Watchlist',`<p>Retirer <b>${ms.length} élément${ms.length>1?'s':''}</b> de synoarr ?</p>
+  <ul class="bdl small">${ms.slice(0,8).map(m=>`<li>${esc(m.title)}${m.year?` <span class="mut">(${esc(m.year)})</span>`:''}</li>`).join('')}${ms.length>8?`<li class="mut">… et ${ms.length-8} autre(s)</li>`:''}</ul>
+  ${plex?`<label class="chk"><input type="checkbox" id="wdp" checked> Retirer aussi de la Watchlist Plex${plex<ms.length?` (${plex} sur ${ms.length})`:''}</label>`:'<p class="mut small">Entrées locales (hors Watchlist Plex).</p>'}
+  <label class="chk"><input type="checkbox" id="wdd"> Supprimer aussi les téléchargements en cours${dl?` (${dl})`:''}</label>
+  <p class="mut small">Les fichiers déjà rangés dans la bibliothèque ne sont jamais supprimés. Un téléchargement interrompu peut perdre ses données partielles.</p>
+  <div class="row"><button class="danger" data-bdelok="1">Supprimer ${ms.length} élément${ms.length>1?'s':''}</button><button class="sec" data-gmclose="1">Annuler</button></div>`);gm.querySelector('[data-bdelok]').focus()}
+async function bulkDel(b){b.disabled=true;const r=await bulk('delete',{remove_from_plex:!!($('#wdp')&&$('#wdp').checked),delete_downloads:!!($('#wdd')&&$('#wdd').checked)});
+  if(r)closeGM();else b.disabled=false}
+bulkBar.addEventListener('click',e=>{const b=e.target.closest('button[data-bk]');if(!b||!SEL)return;const k=b.dataset.bk;
+  if(k==='all'){WVIS.forEach(id=>SEL.add(id));refresh()}else if(k==='none'){SEL.clear();refresh()}else if(k==='exit'){SEL=null;refresh()}
+  else if(k==='delete')openBulkDel();else bulk(k)});
+bulkBar.addEventListener('change',e=>{if(e.target.id!=='bkl'||e.target.value==='-')return;const v=e.target.value;e.target.value='-';bulk('language',{languages:v})});
+app.addEventListener('click',e=>{if(!SEL||tab!=='watch')return;const c=e.target.closest('.item[data-id]');
+  if(!c||e.target.closest('button,a,input,select,label,summary,details,textarea,.dls'))return;selToggle(+c.dataset.id)});
+app.addEventListener('error',e=>{const t=e.target;if(t&&t.tagName==='IMG'){BADIMG.add(t.getAttribute('src'));t.remove()}},true);
 const showForm=()=>{$('#addc').hidden=tab!=='idx'};addEventListener('hashchange',showForm);showForm();
 refresh();
 """
 
 INDEX_HTML = """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>synoarr</title><link rel="icon" href="data:,"><meta name="color-scheme" content="light dark">
+<title>synoarr</title><meta name="color-scheme" content="light dark">
+<link rel="icon" href="icon.svg" type="image/svg+xml"><link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="synoarr">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1b1f26">
 <style>
 :root{--bg:#f4f5f7;--card:#fff;--fg:#1d2330;--mut:#6b7280;--bd:#e3e6eb;--ac:#2563eb;--acf:#fff;--ok:#15803d;--okb:#dcfce7;
 --ko:#b91c1c;--kob:#fee2e2;--wa:#a16207;--wab:#fef3c7;--inb:#e0e7ff;--inf:#3730a3;--neb:#eceff3;--pub:#f3e8ff;--puf:#7e22ce}
@@ -1546,10 +1931,26 @@ body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(
 .cand img,.noimg{width:62px;height:93px;object-fit:cover;border-radius:6px;flex:0 0 62px;background:var(--neb)}.noimg{display:flex;align-items:center;justify-content:center;color:var(--mut)}
 .cb{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}.ov{margin:0;color:var(--mut);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .yr{width:96px}#wsq,#prwu,#prwk{flex:1;min-width:180px}#gm details{margin-top:14px}#wmf{margin-top:8px}
-@media (max-width:600px){table.eps td:last-child{width:auto}.modal{padding:8px}.mbox{padding:12px}.srt{max-height:52vh}.cand img,.noimg{width:48px;height:72px;flex-basis:48px}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
+.wr{display:flex;gap:12px;align-items:flex-start}.wr>.it{flex:1;min-width:0}
+.pst{position:relative;flex:0 0 46px;width:46px;height:69px;border-radius:6px;overflow:hidden;background:var(--neb);display:flex;align-items:center;justify-content:center}
+.pst::before{content:attr(data-l);color:var(--mut);font-weight:700;font-size:18px}.pst img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:var(--neb)}
+.pst.sm{flex-basis:34px;width:34px;height:51px}.pst.sm::before{font-size:14px}
+.wck{flex:0 0 auto;width:20px;height:20px;margin:24px 0 0;accent-color:var(--ac);cursor:pointer}
+body.selmode #app .item{cursor:pointer}body.selmode #app .item .acts{display:none}.card.item.sel{border-color:var(--ac);box-shadow:0 0 0 1px var(--ac) inset}
+#bulk{position:fixed;left:0;right:0;bottom:0;z-index:4;background:var(--card);border-top:1px solid var(--bd);box-shadow:0 -4px 18px rgba(0,0,0,.12);padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px))}
+.bkin{max-width:1000px;margin:auto;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}.bkn{font-weight:600;font-size:14px;min-width:120px}
+.bkg,.bka{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.bka{flex:1}.bkx{margin-left:auto}#bkl{font-size:13px;padding:5px 6px}
+body.selmode main{padding-bottom:calc(var(--bkh,64px) + 16px)}body.selmode #toast{bottom:calc(var(--bkh,64px) + 12px)}
+.bdl{margin:4px 0 10px;padding-left:20px;max-height:180px;overflow:auto}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-bottom:14px}.grid2>.card{margin:0;min-width:0}
+.sto+.sto{margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)}.stoh{display:flex;gap:4px 10px;flex-wrap:wrap;align-items:baseline}
+.pbar.sb{height:12px;margin:6px 0 5px}.pbar.wa i{background:var(--wa)}.imp li{display:block}
+.cday h4{margin:12px 0 4px;padding-bottom:4px;border-bottom:1px solid var(--bd)}.cday:first-of-type h4{margin-top:4px}.cday h4.tdy{color:var(--ac)}
+.crow{display:flex;gap:10px;align-items:center;padding:6px 0}.crow+.crow{border-top:1px dashed var(--bd)}.crow .cb{flex:1;min-width:0;gap:2px}.crow .meta{margin-top:2px}.cact{flex:0 0 auto}
+@media (max-width:600px){.pst{flex-basis:40px;width:40px;height:60px}.wck{margin-top:20px}.wr{gap:10px}.bkn{min-width:0;flex:1}.bka{order:3;flex-basis:100%}.bkx{margin-left:0}.crow{flex-wrap:wrap}.cact{margin-left:44px}table.eps td:last-child{width:auto}.modal{padding:8px}.mbox{padding:12px}.srt{max-height:52vh}.cand img,.noimg{width:48px;height:72px;flex-basis:48px}.prio label{display:none}.hm{display:none}.sm{display:block}.mo{display:inline}nav{width:100%;flex-wrap:wrap;row-gap:0}nav a{padding:6px 8px;font-size:14px}.hd{padding-top:8px}h1{margin-bottom:2px}.eps td:nth-child(3){display:none}.eps td:last-child{width:auto;text-align:right}form.add{grid-template-columns:1fr}main{padding:12px}.it>div:first-child{min-width:100%}.card{padding:12px}.logv{height:calc(100vh - 330px)}.code{font-size:28px}}
 </style></head><body>
 <header><div class="hd"><h1><span>syno</span>arr</h1>
-<nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
+<nav><a href="#dash"><span class="hm">Tableau de bord</span><span class="mo">Accueil</span></a><a href="#watch">Watchlist</a><a href="#cal">À venir</a><a href="#idx">Indexers</a><a href="#hist">Historique</a><a href="#cmd">Commandes</a><a href="#logs">Journal</a><a href="#cfg"><span class="hm">Configuration</span><span class="mo">Config</span></a></nav><div id="conn"></div></div></header>
 <main><div id="app"><p class="mut">Chargement…</p></div>
 <div class="card" id="addc" hidden><h3>Ajouter un indexer par URL</h3>
 <form class="add" id="addf" autocomplete="off"><input name="name" placeholder="Nom" required><input name="url" placeholder="URL (Torznab, RSS…)" required>
@@ -1560,10 +1961,16 @@ body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(
 <div class="mhd"><h3 id="srch">Changer de source</h3><button type="button" class="sec xs" id="srcx" data-mclose="1">Fermer</button></div><div id="srcb"></div></div></div>
 <div id="gm" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="gmh"><div class="mbox">
 <div class="mhd"><h3 id="gmh">Watchlist</h3><button type="button" class="sec xs" data-gmclose="1">Fermer</button></div><div id="gmb"></div></div></div>
+<div id="bulk" hidden role="region" aria-label="Actions sur la sélection"><div class="bkin">
+<span id="bkn" class="bkn" aria-live="polite"></span><span class="bkg"><button type="button" class="xs sec" data-bk="all">Tout</button><button type="button" class="xs sec" data-bk="none">Aucun</button></span>
+<span class="bka"><button type="button" data-bk="search">Rechercher</button>
+<select id="bkl" aria-label="Langues des éléments sélectionnés"><option value="-">Langue…</option><option value="">Auto</option><option value="en">en</option><option value="fr">fr</option><option value="en,fr">en+fr</option></select>
+<button type="button" class="sec" data-bk="ignore">Ignorer</button><button type="button" class="sec" data-bk="unignore">Reprendre</button>
+<button type="button" class="danger" data-bk="delete">Supprimer</button></span><button type="button" class="xs sec bkx" data-bk="exit" aria-label="Quitter le mode Sélection">Fermer</button></div></div>
 <div id="toast" role="status"></div>
 <script>""" + INDEX_JS + """</script></body></html>
 """
 
-CSP = ("default-src 'none'; script-src 'sha256-%s'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https:; "
+CSP = ("default-src 'none'; script-src 'sha256-%s'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https:; manifest-src 'self'; "
        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
        % base64.b64encode(hashlib.sha256(INDEX_JS.encode("utf-8")).digest()).decode("ascii"))

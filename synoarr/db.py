@@ -167,6 +167,7 @@ class Database:
                 pass
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._migrate_quality()  # F3 (quality upgrades)
             self._conn.commit()
 
     # ----------------------------------------------------------- primitives
@@ -214,6 +215,24 @@ class Database:
                      (now_iso(), level, kind, message))
         # keep the table small
         self.execute("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - 2000")
+        # listeners (notifications Telegram...): called after the event is stored, errors swallowed
+        for listener in list(getattr(self, "_listeners", None) or []):
+            try:
+                listener(kind, message, level)
+            except Exception:  # never break the caller (searcher, organizer...) because of a notifier
+                pass
+
+    def add_listener(self, listener: Any) -> None:
+        """listener(kind, message, level) appelé après chaque add_event (exceptions ignorées).
+        Doit rester rapide (mettre en file, pas d'appel réseau)."""
+        if not hasattr(self, "_listeners"):
+            self._listeners = []  # type: List[Any]
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener: Any) -> None:
+        if listener in (getattr(self, "_listeners", None) or []):
+            self._listeners.remove(listener)
 
     def recent_events(self, limit: int = 100) -> List[Dict[str, Any]]:
         return self.query("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
@@ -277,6 +296,8 @@ class Database:
         ("language_override", "TEXT"), # manual languages for this item, e.g. "fr" or "en,fr"
         ("hidden", "INTEGER"),         # 1 = removed by the user but still in the Plex Watchlist (kept hidden)
         ("title_fr", "TEXT"),          # French title (TMDb or typed by the user), "" = none / same as title
+        ("poster", "TEXT"),            # web UI poster URL (https, TMDb w185), "" = none, NULL = not looked up
+        ("release_date", "TEXT"),      # movie release date YYYY-MM-DD (TMDb), NULL = unknown
     )
 
     def _migrate(self) -> None:
@@ -301,6 +322,14 @@ class Database:
             params.append(1 if is_animation else 0)
         if sets:
             self.execute("UPDATE media SET %s WHERE id = ?" % ", ".join(sets), params + [media_id])
+
+    def set_media_artwork(self, media_id: int, poster: Optional[str], release_date: Optional[str] = None) -> None:
+        """Poster URL ("" = none found) and, for a movie, its release date (only written when known)."""
+        if release_date:
+            self.execute("UPDATE media SET poster = ?, release_date = ? WHERE id = ?",
+                         (poster or "", str(release_date)[:10], media_id))
+        else:
+            self.execute("UPDATE media SET poster = ? WHERE id = ?", (poster or "", media_id))
 
     def set_title_fr(self, media_id: int, title: Optional[str]) -> None:
         self.execute("UPDATE media SET title_fr = ? WHERE id = ?", ((title or "").strip(), media_id))
@@ -494,3 +523,56 @@ class Database:
     def is_blocked(self, release_title: str) -> bool:
         return self.query_one("SELECT 1 AS x FROM blocklist WHERE lower(release_title) = lower(?)",
                               (release_title,)) is not None
+
+    # ---- quality upgrades (F3): quality of the file in the library, upgrade grabs
+    # media/episodes: resolution ("1080p", "" = unknown/checked, NULL = never checked), source, release name of
+    # the imported file and its path in the library; grabs.upgrade = 1 for a better version of an item "done"
+    _QUALITY_COLUMNS = (
+        ("media", "quality_resolution", "TEXT"),
+        ("media", "quality_source", "TEXT"),
+        ("media", "imported_release", "TEXT"),
+        ("media", "library_file", "TEXT"),
+        ("episodes", "quality_resolution", "TEXT"),
+        ("episodes", "quality_source", "TEXT"),
+        ("episodes", "imported_release", "TEXT"),
+        ("episodes", "library_file", "TEXT"),
+        ("grabs", "upgrade", "INTEGER"),
+    )
+
+    def _migrate_quality(self) -> None:
+        cols = {}  # type: Dict[str, set]
+        for table, name, sqltype in self._QUALITY_COLUMNS:
+            if table not in cols:
+                cols[table] = {r[1] for r in self._conn.execute("PRAGMA table_info(%s)" % table).fetchall()}
+            if name not in cols[table]:
+                self._conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, sqltype))
+                cols[table].add(name)
+        self._conn.commit()
+
+    def set_media_quality(self, media_id: int, resolution: Optional[str], source: Optional[str] = None,
+                          release: Optional[str] = None, library_file: Optional[str] = None) -> None:
+        """Quality of the movie file now in the library. resolution "" = unknown (not looked up again)."""
+        self.execute("UPDATE media SET quality_resolution = ?, quality_source = ?, "
+                     "imported_release = COALESCE(?, imported_release), library_file = COALESCE(?, library_file) "
+                     "WHERE id = ?", (resolution or "", source or None, release, library_file, media_id))
+
+    def set_episode_quality(self, media_id: int, season: int, episode: int, resolution: Optional[str],
+                            source: Optional[str] = None, release: Optional[str] = None,
+                            library_file: Optional[str] = None) -> None:
+        self.execute("UPDATE episodes SET quality_resolution = ?, quality_source = ?, "
+                     "imported_release = COALESCE(?, imported_release), library_file = COALESCE(?, library_file) "
+                     "WHERE media_id = ? AND season = ? AND episode = ?",
+                     (resolution or "", source or None, release, library_file, media_id, season, episode))
+
+    def mark_grab_upgrade(self, grab_id: int) -> None:
+        self.execute("UPDATE grabs SET upgrade = 1 WHERE id = ?", (grab_id,))
+
+    def has_active_grab(self, media_id: int, season: Optional[int] = None, episode: Optional[int] = None) -> bool:
+        """A download still in progress ('sent') for this movie, or covering this episode (pack or episode)."""
+        if season is None:
+            row = self.query_one("SELECT 1 AS x FROM grabs WHERE media_id = ? AND status = 'sent'", (media_id,))
+        else:
+            row = self.query_one("SELECT 1 AS x FROM grabs WHERE media_id = ? AND status = 'sent' AND season = ? "
+                                 "AND (episode IS NULL OR episode = ?)", (media_id, season, episode))
+        return row is not None
+    # ---- end quality upgrades

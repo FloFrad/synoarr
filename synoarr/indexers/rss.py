@@ -41,6 +41,9 @@ class RssIndexer(Indexer):
                 out.append(rel)
         return out
 
+    def _recent(self) -> List[Release]:
+        return self._fetch()  # the feed itself lists the latest releases
+
     def _test(self) -> Tuple[bool, str]:
         try:
             releases = self._fetch()

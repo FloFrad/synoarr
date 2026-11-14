@@ -11,6 +11,7 @@ import http.client
 import http.cookiejar
 import json
 import logging
+import re
 import socket
 import ssl
 import time
@@ -71,8 +72,13 @@ class Response:
                             self.status, self.body, self.url)
 
 
+_TELEGRAM_BOT_RE = re.compile(r"/bot\d+:[A-Za-z0-9_-]+")
+
+
 def redact(url: str) -> str:
     """Hide secrets (tokens, api keys, passwords) from URLs before logging."""
+    # Telegram Bot API: the token is in the path (https://api.telegram.org/bot<TOKEN>/sendMessage)
+    url = _TELEGRAM_BOT_RE.sub("/bot***", url or "")
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:

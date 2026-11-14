@@ -34,7 +34,8 @@ from .parser import normalize_title, parse, titles_match
 log = logging.getLogger(__name__)
 
 __all__ = ["evaluate", "pick_best", "rank_releases", "parse_for_request", "indexer_priority", "priority_points",
-           "clamp_priority"]
+           "clamp_priority", "resolution_rank", "upgrade_cutoff_rank", "needs_upgrade", "is_better_resolution",
+           "pick_upgrade"]
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -393,3 +394,60 @@ def pick_best(releases: List[Release], request: SearchRequest, cfg: QualityConfi
     *priorities* (indexer name -> 1..50) favours the preferred indexers (see the module docstring)."""
     ranked = rank_releases(releases, request, cfg, is_blocked, priorities)
     return ranked[0][1] if ranked else None
+
+
+# ---------------------------------------------------------------- quality upgrades (F3)
+def resolution_rank(resolution: Optional[str], cfg: QualityConfig) -> Optional[int]:
+    """Rank of *resolution* in cfg.resolutions: 0 = best. A resolution missing from the list (accepted through
+    allow_other_resolutions) ranks after every listed one. Unknown resolution -> None."""
+    res = (resolution or "").strip().lower()
+    if not res:
+        return None
+    resolutions = [r.lower() for r in cfg.resolutions if r]
+    if res in resolutions:
+        return resolutions.index(res)
+    return len(resolutions)
+
+
+def upgrade_cutoff_rank(cfg: QualityConfig) -> int:
+    """Rank of [quality] upgrade_until ("1080p"): no upgrade once the library file reaches it. A value missing
+    from cfg.resolutions means "the best accepted resolution"."""
+    rank = resolution_rank(getattr(cfg, "upgrade_until", "") or "", cfg)
+    resolutions = [r for r in cfg.resolutions if r]
+    if rank is None or rank >= len(resolutions):
+        return 0
+    return rank
+
+
+def needs_upgrade(current_resolution: Optional[str], cfg: QualityConfig) -> bool:
+    """True when upgrades are enabled and the library file (resolution known) is below the cutoff."""
+    if not getattr(cfg, "upgrade", False):
+        return False
+    rank = resolution_rank(current_resolution, cfg)
+    if rank is None:  # unknown quality: never replace a file we know nothing about
+        return False
+    return rank > upgrade_cutoff_rank(cfg)
+
+
+def is_better_resolution(new_resolution: Optional[str], current_resolution: Optional[str],
+                         cfg: QualityConfig) -> bool:
+    """Strictly better resolution rank (both known)."""
+    new, cur = resolution_rank(new_resolution, cfg), resolution_rank(current_resolution, cfg)
+    return new is not None and cur is not None and new < cur
+
+
+def pick_upgrade(releases: List[Release], request: SearchRequest, cfg: QualityConfig, current_resolution: str,
+                 is_blocked: Callable[[str], bool] = lambda t: False,
+                 priorities: Optional[Mapping[str, int]] = None) -> Optional[Release]:
+    """Best acceptable release (every usual filter) whose resolution is strictly better than
+    *current_resolution*, or None."""
+    if resolution_rank(current_resolution, cfg) is None:
+        return None
+    for _score, rel in rank_releases(releases, request, cfg, is_blocked, priorities):
+        try:
+            res = parse_for_request(rel.title, request).resolution
+        except Exception:  # pragma: no cover - parser is defensive
+            continue
+        if is_better_resolution(res, current_resolution, cfg):
+            return rel
+    return None

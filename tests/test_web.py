@@ -175,7 +175,7 @@ class WebApiTest(WebTestBase):
             self.assertIn(word, html)
         self.assertNotIn("http://", html.split("<script>")[0].replace('href="data:,"', ""))  # aucun CDN
         self.assertIn("script-src 'sha256-", hdrs["Content-Security-Policy"])
-        self.assertLess(len(html.splitlines()), 600)  # single light page
+        self.assertLess(len(html.splitlines()), 800)  # single light page
         self.assertLess(len(html), 120 * 1024)
 
     def test_status(self) -> None:
@@ -1789,6 +1789,317 @@ class FrenchTitleOnlyDisplayTest(RealAppWebBase):
         self.assertIn("Les 3 Ninjas contre-attaquent", r["titles"])
         self.assertTrue(any(t.startswith("3 Ninjas Kick Back") for t in r["titles"]))
         self.app.cfg.quality.french_title_only = True
+        self.app.cfg.quality.french_title_fallback = False
         r = titles()
         self.assertTrue(r["french_title_only"])
         self.assertEqual(r["titles"], ["Les 3 Ninjas contre-attaquent"])
+        self.assertFalse(r["french_title_fallback"])
+        # F1: nothing acceptable with the French title -> widened to the original title (shown in the job)
+        self.app.cfg.quality.french_title_fallback = True
+        r = titles()
+        self.assertTrue(r["french_title_fallback"])
+        self.assertEqual(r["titles"][0], "Les 3 Ninjas contre-attaquent")
+        self.assertTrue(any(t.startswith("3 Ninjas Kick Back") for t in r["titles"][1:]))
+
+
+# ---------------------------------------------------------------- affiches, actions groupées, À venir, PWA
+class FakeTmdbArt:
+    """TMDb simulé pour les affiches : artwork() / find_by_imdb() seulement."""
+    enabled = True
+
+    def __init__(self) -> None:
+        self.calls = []  # type: List[Tuple[str, str]]
+        self.art = {}  # type: Dict[str, Any]
+
+    def find_by_imdb(self, imdb: str) -> Optional[Dict[str, str]]:
+        self.calls.append(("find", imdb))
+        return {"movie": "603"} if imdb == "tt0133093" else None
+
+    def artwork(self, tmdb_id: str, kind: str) -> Optional[Dict[str, Any]]:
+        self.calls.append((kind, tmdb_id))
+        return self.art.get(tmdb_id)
+
+
+class PosterTest(RealAppWebBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tmdb = FakeTmdbArt()
+        self.tmdb.art = {"603": {"poster": "https://image.tmdb.org/t/p/w185/matrix.jpg", "release_date": "1999-03-31"},
+                         "1399": {"poster": "", "release_date": None},
+                         "66": {"poster": "http://insecure/x.jpg", "release_date": None}}
+        self.app.tmdb = self.tmdb
+        db = self.app.db
+        self.matrix = db.upsert_media("p1", "movie", "The Matrix", 1999, "tt0133093", None, None)
+        self.got = db.upsert_media("p2", "show", "Game of Thrones", 2011, None, "1399", None)
+        self.noid = db.upsert_media("p3", "movie", "Sans identifiant", 2001, None, None, None)
+        self.http = db.upsert_media("p4", "movie", "Insecure", 2001, None, "66", None)
+        self.down = db.upsert_media("p5", "movie", "TMDb muet", 2002, None, "999", None)
+
+    def test_columns_and_fill(self) -> None:
+        cols = {r["name"] for r in self.app.db.query("PRAGMA table_info(media)")}
+        self.assertTrue({"poster", "release_date"} <= cols)
+        n = self.app.fill_posters([self.matrix, self.got, self.noid, self.http, self.down])
+        self.assertEqual(n, 3)
+        get = self.app.db.get_media
+        self.assertEqual(get(self.matrix)["poster"], "https://image.tmdb.org/t/p/w185/matrix.jpg")
+        self.assertEqual(get(self.matrix)["release_date"], "1999-03-31")
+        self.assertEqual(get(self.got)["poster"], "")  # looked up, none
+        self.assertEqual(get(self.http)["poster"], "")  # never an http:// image (mixed content)
+        self.assertIsNone(get(self.noid)["poster"])  # no id yet: asked again later
+        self.assertIsNone(get(self.down)["poster"])  # TMDb did not answer
+        self.assertIn(("show", "1399"), self.tmdb.calls)
+        # cached: nothing asked again; failed ones are not retried before poster_retry_after
+        self.tmdb.calls.clear()
+        self.assertEqual(self.app.fill_posters([self.matrix, self.got]), 0)
+        self.assertEqual(self.tmdb.calls, [])
+        self.assertFalse(self.app.request_posters([self.noid, self.down]))
+
+    def test_request_is_background_and_throttled(self) -> None:
+        self.assertTrue(self.app.request_posters([self.matrix]))
+        self.assertFalse(self.app.request_posters([self.got]))  # throttled (poster_min_interval)
+        deadline = time.time() + 5
+        while self.app.db.get_media(self.matrix)["poster"] is None and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(self.app.db.get_media(self.matrix)["poster"])
+        self.app.tmdb = mock.Mock(enabled=False)
+        self.app._poster_last = 0
+        self.assertFalse(self.app.request_posters([self.got]))  # no TMDb key: nothing
+
+    def test_media_list_requests_missing_posters(self) -> None:
+        asked = []
+        self.app.request_posters = lambda ids: asked.append(sorted(ids))  # type: ignore[assignment]
+        self.app.db.set_media_artwork(self.matrix, "https://image.tmdb.org/t/p/w185/m.jpg")
+        status, data, _ = self.req("/api/media")
+        self.assertEqual(status, 200)
+        self.assertEqual(asked, [sorted([self.got, self.noid, self.http, self.down])])
+        row = next(m for m in data if m["id"] == self.matrix)
+        self.assertEqual(row["poster"], "https://image.tmdb.org/t/p/w185/m.jpg")
+
+    def test_candidate_poster_kept_when_adding(self) -> None:
+        self.app.request_posters = lambda ids: None  # type: ignore[assignment]
+        cand = {"type": "movie", "title": "Brazil", "year": 1985, "source": "tmdb",
+                "poster_url": "https://image.tmdb.org/t/p/w185/brazil.jpg"}
+        status, data, _ = self.req("/api/watchlist/add", "POST", {"candidate": cand, "add_to_plex": False,
+                                                                  "search_now": False})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.app.db.get_media(data["media"]["id"])["poster"], cand["poster_url"])
+        cand = {"type": "movie", "title": "Alien", "year": 1979, "poster_url": "javascript:alert(1)"}
+        status, data, _ = self.req("/api/watchlist/add", "POST", {"candidate": cand, "add_to_plex": False,
+                                                                  "search_now": False})
+        self.assertEqual(status, 200, data)
+        self.assertIsNone(self.app.db.get_media(data["media"]["id"])["poster"])
+
+    def test_tmdb_client_artwork(self) -> None:
+        from synoarr.tmdb import TmdbClient
+        http = mock.Mock()
+        http.get.return_value.json.return_value = {"poster_path": "/abc.jpg", "release_date": "2026-12-18"}
+        client = TmdbClient("KEY", "fr-FR", http)
+        self.assertEqual(client.artwork("12", "movie"), {"poster": "https://image.tmdb.org/t/p/w185/abc.jpg",
+                                                          "release_date": "2026-12-18"})
+        self.assertIn("/movie/12", http.get.call_args[0][0])
+        http.get.return_value.json.return_value = {"poster_path": None, "first_air_date": "2011-04-17"}
+        self.assertEqual(client.artwork("1399", "show"), {"poster": "", "release_date": None})
+        self.assertIn("/tv/1399", http.get.call_args[0][0])
+        self.assertIsNone(TmdbClient("", "fr-FR", http).artwork("12", "movie"))
+
+
+class BulkActionsTest(RealAppWebBase):
+    def setUp(self) -> None:
+        super().setUp()
+        db = self.app.db
+        self.searched = []  # type: List[List[int]]
+        self.app.search_many = lambda ids: self.searched.append(list(ids))  # type: ignore[assignment]
+        self.app.request_posters = lambda ids: None  # type: ignore[assignment]
+        self.m1 = db.upsert_media("local:movie:a", "movie", "Film A", 2000, None, None, None)
+        self.m2 = db.upsert_media("local:movie:b", "movie", "Film B", 2001, None, None, None)
+        self.s1 = db.upsert_media("plex://show/c", "show", "Série C", 2010, None, None, None)
+        self.ign = db.upsert_media("local:movie:d", "movie", "Film D", 2002, None, None, None)
+        db.set_media_status(self.ign, "ignored")
+
+    def bulk(self, body: Dict[str, Any]) -> Tuple[int, Any]:
+        status, data, _ = self.req("/api/media/bulk", "POST", body)
+        return status, data
+
+    def test_validation(self) -> None:
+        for body in ({"ids": [self.m1], "action": "explode"}, {"ids": [], "action": "search"},
+                     {"ids": "1,2", "action": "search"}, {"ids": [True], "action": "search"},
+                     {"ids": ["1"], "action": "search"}, {"ids": [0], "action": "search"},
+                     {"ids": list(range(1, 502)), "action": "search"},
+                     {"ids": [self.m1], "action": "language", "languages": "fr!"},
+                     {"ids": [self.m1], "action": "language", "languages": 3}):
+            status, data = self.bulk(body)
+            self.assertEqual(status, 400, (body, data))
+            self.assertIn("error", data)
+        self.assertEqual(self.req("/api/media/bulk", "POST", ["x"])[0], 400)
+        self.assertEqual(self.req("/api/media/bulk")[0], 405)
+
+    def test_search_skips_inactive_and_reports_unknown(self) -> None:
+        status, data = self.bulk({"ids": [self.m1, self.s1, self.ign, 9999, self.m1], "action": "search"})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["done"], [self.m1, self.s1])
+        self.assertEqual(self.searched, [[self.m1, self.s1]])  # ONE background run for the selection
+        self.assertEqual([s["id"] for s in data["skipped"]], [self.ign])
+        self.assertEqual([e["id"] for e in data["errors"]], [9999])
+        self.assertIn("Recherche lancée pour 2 élément(s)", data["message"])
+        status, data = self.bulk({"ids": [9999], "action": "search"})
+        self.assertEqual(status, 200)
+        self.assertFalse(data["ok"])
+
+    def test_language_ignore_unignore(self) -> None:
+        db = self.app.db
+        status, data = self.bulk({"ids": [self.m1, self.ign], "action": "language", "languages": "EN; fr"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual([db.get_media(i)["language_override"] for i in (self.m1, self.ign)], ["en,fr", "en,fr"])
+        self.assertEqual(self.searched, [[self.m1]])  # only the active one is searched again
+        status, data = self.bulk({"ids": [self.m1], "action": "language", "languages": ""})
+        self.assertIsNone(db.get_media(self.m1)["language_override"])
+        self.assertIn("automatique", data["message"])
+        status, data = self.bulk({"ids": [self.m1, self.s1], "action": "ignore"})
+        self.assertEqual(data["done"], [self.m1, self.s1])
+        self.assertEqual({db.get_media(i)["status"] for i in (self.m1, self.s1)}, {"ignored"})
+        status, data = self.bulk({"ids": [self.m1, self.s1, self.m2], "action": "unignore"})
+        self.assertEqual((db.get_media(self.m1)["status"], db.get_media(self.s1)["status"]), ("wanted", "monitored"))
+        self.assertEqual([s["id"] for s in data["skipped"]], [self.m2])
+
+    def test_delete_with_options(self) -> None:
+        status, data = self.bulk({"ids": [self.m1, self.s1], "action": "delete", "remove_from_plex": False,
+                                  "delete_downloads": False})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["done"], [self.m1, self.s1])
+        self.assertIsNone(self.app.db.get_media(self.m1))  # local entry: deleted
+        self.assertEqual(self.app.db.get_media(self.s1)["hidden"], 1)  # kept in Plex: hidden + ignored
+        self.assertIn("Watchlist Plex", data["warning"])
+        ids = [m["id"] for m in self.req("/api/media")[1]]
+        self.assertNotIn(self.s1, ids)
+        self.assertIn(self.m2, ids)
+
+
+class UpcomingTest(RealAppWebBase):
+    def test_upcoming_and_recent(self) -> None:
+        import datetime as dt
+        db = self.app.db
+        day = lambda n: (dt.date.today() + dt.timedelta(days=n)).isoformat()  # noqa: E731
+        show = db.upsert_media("plex://show/u", "show", "Severance", 2022, None, None, None)
+        for ep, n, st in ((1, -10, "done"), (2, -3, "done"), (3, -1, "wanted"), (4, 0, "wanted"), (5, 1, "wanted"),
+                          (6, 6, "wanted"), (7, 40, "wanted")):
+            db.upsert_episode(show, 2, ep, "Épisode %d" % ep, day(n), st)
+        ign = db.upsert_media("plex://show/i", "show", "Ignorée", 2020, None, None, None)
+        db.upsert_episode(ign, 1, 1, None, day(1), "wanted")
+        db.set_media_status(ign, "ignored")
+        off = db.upsert_media("plex://show/o", "show", "Retirée", 2020, None, None, None)
+        db.upsert_episode(off, 1, 1, None, day(2), "wanted")
+        db.mark_off_watchlist(["plex://show/u", "plex://show/i", "plex://movie/m", "plex://movie/x"])
+        movie = db.upsert_media("plex://movie/m", "movie", "Dune 3", 2026, None, None, None)
+        db.set_media_artwork(movie, "https://image.tmdb.org/t/p/w185/d.jpg", day(3))
+        done = db.upsert_media("plex://movie/x", "movie", "Déjà là", 2026, None, None, None)
+        db.set_media_artwork(done, "", day(2))
+        db.set_media_status(done, "done")
+        status, data, _ = self.req("/api/upcoming?days=30")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["today"], day(0))
+        self.assertEqual([(i["kind"], i.get("episode"), i["date"]) for i in data["upcoming"]],
+                         [("episode", 4, day(0)), ("episode", 5, day(1)), ("movie", None, day(3)),
+                          ("episode", 6, day(6))])
+        self.assertEqual([(i.get("episode"), i["status"]) for i in data["recent"]],
+                         [(3, "wanted"), (2, "done")])  # last 7 days, most recent first
+        mv = next(i for i in data["upcoming"] if i["kind"] == "movie")
+        self.assertEqual((mv["media_id"], mv["title"], mv["poster"]), (movie, "Dune 3", "https://image.tmdb.org/t/p/w185/d.jpg"))
+        ep = data["upcoming"][0]
+        self.assertEqual((ep["title"], ep["season"], ep["episode_title"]), ("Severance", 2, "Épisode 4"))
+        data = self.req("/api/upcoming?days=60&past=0")[1]
+        self.assertEqual(data["recent"], [])
+        self.assertEqual(data["upcoming"][-1]["episode"], 7)
+        for q in ("days=0", "days=999", "days=abc", "past=-1", "past=61"):
+            self.assertEqual(self.req("/api/upcoming?" + q)[0], 400, q)
+
+
+class DashboardStorageTest(RealAppWebBase):
+    def test_storage_same_volume_and_missing_dirs(self) -> None:
+        from synoarr.web import library_storage
+        # movies_dir and series_dir do not exist yet: their nearest existing parent is used, one volume
+        st = library_storage(self.app.cfg)
+        self.assertEqual(len(st), 1)
+        self.assertEqual(st[0]["labels"], ["Films", "Séries"])
+        self.assertTrue(os.path.isdir(st[0]["path"]))
+        self.assertEqual(st[0]["used"] + st[0]["free"], st[0]["total"])
+        self.assertIsInstance(st[0]["low"], bool)
+        Usage = __import__("collections").namedtuple("Usage", "total used free")
+        with mock.patch("synoarr.web.shutil.disk_usage", return_value=Usage(1000, 950, 50)):
+            st = library_storage(self.app.cfg)
+        self.assertEqual((st[0]["free_pct"], st[0]["low"], st[0]["used"]), (5.0, True, 950))
+        with mock.patch("synoarr.web.shutil.disk_usage", side_effect=PermissionError(13, "Permission refusée")):
+            st = library_storage(self.app.cfg)
+        self.assertIn("Permission refusée", st[0]["error"])
+
+    def test_dashboard_api(self) -> None:
+        db = self.app.db
+        mid = db.upsert_media("plex://movie/z", "movie", "Zodiac", 2007, None, None, None)
+        g1 = db.add_grab(mid, None, None, "Zodiac.2007.1080p", "Zodiac.2007.1080p", "Fake", None, 10)
+        g2 = db.add_grab(None, None, None, "Orphan.Release", "Orphan.Release", "Fake", None, 10)
+        db.add_grab(mid, None, None, "Zodiac.2007.720p", "Zodiac.2007.720p", "Fake", None, 10)  # still sent
+        db.set_grab_status(g2, "imported")
+        db.execute("UPDATE grabs SET updated_at = '2026-01-01 10:00:00' WHERE id = ?", (g2,))
+        db.set_grab_status(g1, "imported")
+        status, data, _ = self.req("/api/dashboard")
+        self.assertEqual(status, 200, data)
+        self.assertEqual([g["id"] for g in data["imports"]], [g1, g2])
+        self.assertEqual(data["imports"][0]["media_title"], "Zodiac")
+        self.assertEqual(len(data["storage"]), 1)
+        self.assertEqual(len(self.req("/api/dashboard?limit=1")[1]["imports"]), 1)
+
+
+class PwaRoutesTest(WebTestBase):
+    username = "admin"
+    password = "pa ss"
+
+    def test_public_files_without_auth(self) -> None:
+        import struct
+        import zlib
+        status, data, hdrs = self.req("/manifest.webmanifest", auth=("", ""))
+        self.assertEqual(status, 200, data)
+        self.assertIn("application/manifest+json", hdrs["Content-Type"])
+        man = json.loads(data) if isinstance(data, str) else data
+        self.assertEqual((man["name"], man["display"], man["start_url"]), ("synoarr", "standalone", "./"))
+        self.assertEqual({i["sizes"] for i in man["icons"]}, {"192x192", "512x512", "any"})
+        self.assertIn("max-age", hdrs["Cache-Control"])
+        for path, size in (("/icon-192.png", 192), ("/icon-512.png", 512), ("/apple-touch-icon.png", 180)):
+            r = urllib.request.Request(self.base + path)
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                png = resp.read()
+                self.assertEqual(resp.headers["Content-Type"], "image/png")
+            self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+            w, h = struct.unpack(">II", png[16:24])
+            self.assertEqual((w, h), (size, size))
+            idat = png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8]
+            raw = zlib.decompress(idat)
+            self.assertEqual(len(raw), size * (1 + 3 * size))
+            mid = (size // 2) * (1 + 3 * size) + 1 + 3 * (size // 2)
+            self.assertEqual(raw[mid:mid + 3], b"\xff\xff\xff")  # white triangle in the centre
+            self.assertNotEqual(raw[1:4], b"\xff\xff\xff")  # blue corner
+        status, svg, hdrs = self.req("/icon.svg", auth=("", ""))
+        self.assertEqual(status, 200)
+        self.assertTrue(svg.startswith("<svg"))
+        # everything else still requires the password
+        self.assertEqual(self.req("/", auth=("", ""))[0], 401)
+        self.assertEqual(self.req("/api/status", auth=("", ""))[0], 401)
+        self.assertEqual(self.req("/manifest.webmanifest", "POST", {}, auth=("", ""))[0], 401)
+        status, html, hdrs = self.req("/")
+        self.assertEqual(status, 200)
+        for tag in ('rel="manifest" href="manifest.webmanifest"', 'rel="apple-touch-icon"',
+                    'name="apple-mobile-web-app-capable"', 'name="theme-color"', 'href="#cal"', 'id="bulk"'):
+            self.assertIn(tag, html)
+        self.assertIn("manifest-src 'self'", hdrs["Content-Security-Policy"])
+
+
+class PwaHostCheckTest(WebTestBase):
+    def test_icons_allowed_with_any_host_but_page_refused(self) -> None:
+        self.assertEqual(self.req("/manifest.webmanifest", headers={"Host": "evil.example.com"})[0], 200)
+        self.assertEqual(self.req("/", headers={"Host": "evil.example.com"})[0], 403)
+        self.assertEqual(self.req("/api/media", headers={"Host": "evil.example.com"})[0], 403)
+
+    def test_ui_template(self) -> None:
+        from synoarr.web import INDEX_JS
+        for word in ("media/bulk", "upcoming?days=", "api('dashboard')", "data-selmode", "Derniers imports",
+                     "Espace disque de la vidéothèque", "Aujourd", "Demain", 'loading="lazy"'):
+            self.assertIn(word, INDEX_JS)

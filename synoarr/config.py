@@ -30,6 +30,8 @@ class GeneralConfig:
     watchlist_interval_minutes: int = 15
     process_interval_minutes: int = 2
     research_interval_hours: float = 6.0
+    # RSS sync (Sonarr-like): latest releases of every indexer matched against wanted items (0 = off)
+    rss_interval_minutes: int = 15
     dry_run: bool = False
     # GitHub repository used by the "Mettre à jour" command (owner/name)
     update_repo: str = "FloFrad/synoarr"
@@ -100,6 +102,12 @@ class QualityConfig:
     # French only (item languages = fr) and a French title known: search ONLY the French title
     # (fewer requests, but MULTi releases named after the original title are missed)
     french_title_only: bool = False
+    # ---- upgrades / French-title fallback (F1/F3)
+    # french_title_only found nothing acceptable: search the original title / ids too (same filters)
+    french_title_fallback: bool = True
+    # keep searching a better resolution for items already in the library, until upgrade_until is reached
+    upgrade: bool = True
+    upgrade_until: str = "1080p"
     min_seeders: int = 1
     min_size_mb: float = 100.0
     max_size_gb_movie: float = 25.0
@@ -140,6 +148,29 @@ class JackettConfig:
     api_key: str = ""
 
 
+# ---- [telegram] notifications (F2)
+@dataclass
+class TelegramConfig:
+    # Disabled while bot_token or chat_id is empty (see config.example.ini to create the bot)
+    bot_token: str = ""
+    chat_id: str = ""
+    # grab | import | error | watchlist | upgrade | update
+    events: List[str] = field(default_factory=lambda: ["grab", "import", "error"])
+
+
+# ---- [subtitles] sous-titres automatiques OpenSubtitles.com (F5)
+@dataclass
+class SubtitlesConfig:
+    enabled: bool = False
+    api_key: str = ""  # opensubtitles.com > Profile > API consumers
+    username: str = ""  # free account: needed for the daily download quota
+    password: str = ""
+    languages: List[str] = field(default_factory=lambda: ["en"])
+    hearing_impaired: bool = False
+    scan_interval_hours: float = 12.0  # periodic scan of the library (0 = never)
+    scan_limit: int = 20  # videos searched per scan (oldest first)
+
+
 @dataclass
 class WebConfig:
     enabled: bool = True
@@ -163,6 +194,8 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     prowlarr: ProwlarrConfig = field(default_factory=ProwlarrConfig)
     jackett: JackettConfig = field(default_factory=JackettConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)  # F2
+    subtitles: SubtitlesConfig = field(default_factory=SubtitlesConfig)  # F5
     warnings: List[str] = field(default_factory=list)  # non fatal problems found while loading (French)
 
     @property
@@ -223,6 +256,8 @@ _SECTIONS = {
     "web": WebConfig,
     "prowlarr": ProwlarrConfig,
     "jackett": JackettConfig,
+    "telegram": TelegramConfig,  # F2
+    "subtitles": SubtitlesConfig,  # F5
 }
 
 _TRUE = ("1", "true", "yes", "on", "oui", "vrai")
@@ -338,4 +373,11 @@ def load_config(path: Optional[str]) -> Config:
         setattr(cfg.paths, attr, os.path.expanduser(value))
     cfg.naming.video_extensions = [e.lower().lstrip(".") for e in cfg.naming.video_extensions]
     cfg.naming.subtitle_extensions = [e.lower().lstrip(".") for e in cfg.naming.subtitle_extensions]
+    # ---- [telegram] (F2)
+    cfg.telegram.events = [e.lower() for e in cfg.telegram.events]
+    _tg_known = ("grab", "import", "error", "watchlist", "upgrade", "update")
+    _tg_bad = [e for e in cfg.telegram.events if e not in _tg_known]
+    if _tg_bad:
+        cfg.warnings.append("[telegram] events : valeur(s) inconnue(s) %s ignorée(s) (possibles : %s)"
+                            % (", ".join(_tg_bad), ", ".join(_tg_known)))
     return cfg

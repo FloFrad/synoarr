@@ -684,6 +684,9 @@ COMMANDS = {
     "update_check": "Vérifier les mises à jour",
     "update": "Mettre à jour synoarr",
     "update_rollback": "Revenir à la version précédente",
+    "rss_sync": "Synchroniser les flux RSS",  # F4
+    "telegram_test": "Tester Telegram",  # F2
+    "subtitles_scan": "Rechercher les sous-titres manquants",  # F5
 }
 MAX_JOBS = 20
 # statuts Download Station d'un téléchargement qui avance (rafraîchissement rapide de l'interface)
@@ -832,6 +835,7 @@ def _merge_candidates(plex: List[Dict[str, Any]], tmdb: List[Dict[str, Any]]) ->
 
 class App:
     plex_urls = {}  # type: Dict[str, str]  # tests : discover_url / metadata_url / plextv_url de PlexClient
+    telegram_api_url = None  # type: Optional[str]  # tests : faux serveur Telegram (F2)
     pin_poll_interval = 3.0
     pin_timeout = 300.0
 
@@ -905,6 +909,102 @@ class App:
         self.searcher = Searcher(cfg, self.db, self.http, self.plex, self.ds,
                                  self.tmdb if self.tmdb.enabled else None, self.indexer_manager.active)
         self.searcher.stop_event = self._stop
+        self._setup_subtitles()  # F5 : sous-titres automatiques (OpenSubtitles)
+        self._setup_notifier()  # F2 : notifications Telegram (recréées à chaque rechargement de config.ini)
+
+    # ---- sous-titres automatiques (F5)
+    def _setup_subtitles(self) -> None:
+        from .subtitles import SubtitleService
+        self.subtitles = SubtitleService(self.cfg, self.db, self.http, self.tmdb if self.tmdb.enabled else None)
+        self.subtitles.stop_event = self._stop
+        if self.subtitles.enabled:
+            self.organizer.on_file_imported = self.subtitles.enqueue
+
+    def _cmd_subtitles_scan(self, job: Any) -> Dict[str, Any]:
+        if not self.subtitles.configured:
+            raise ValueError("Sous-titres non configurés : renseignez [subtitles] api_key (et username/password) "
+                             "dans config.ini (clé gratuite sur opensubtitles.com)")
+        stats = self.subtitles.scan_library()
+        level = "warn" if stats.get("quota_reached") or stats.get("errors") else "ok"
+        job.emit(level, "%d vidéo(s) sans sous-titre %s, %d recherchée(s), %d sous-titre(s) téléchargé(s)%s" % (
+            stats["missing"], "/".join(self.subtitles.languages()), stats["searched"], stats["downloaded"],
+            " — quota OpenSubtitles atteint, la suite au prochain passage" if stats.get("quota_reached") else ""))
+        return stats
+
+    def _start_subtitles_scan(self) -> bool:
+        """Scan périodique de la bibliothèque (thread en arrière-plan, un seul à la fois)."""
+        subs = getattr(self, "subtitles", None)
+        if subs is None or not subs.enabled or subs.scanning or getattr(self, "_subtitles_running", False):
+            return False
+        self._subtitles_running = True
+
+        def run() -> None:
+            try:
+                subs.scan_library()
+            finally:
+                self._subtitles_running = False
+        threading.Thread(target=run, name="synoarr-subtitles-scan", daemon=True).start()
+        return True
+
+    # ---- notifications Telegram (F2)
+    def _new_notifier(self) -> Any:
+        from .httpclient import HttpClient as _Http
+        from .notify import from_config
+        return from_config(self.cfg.telegram, _Http(timeout=20, retries=1), api_url=self.telegram_api_url)
+
+    def _setup_notifier(self) -> None:
+        old = getattr(self, "notifier", None)
+        self.notifier = self._new_notifier()
+        if old is not None:
+            old.close(timeout=2.0)  # envoie ce qui attendait encore avec l'ancienne configuration
+        if not getattr(self, "_notify_hooked", False):
+            self.db.add_listener(self._notify_event)
+            self._notify_hooked = True
+
+    def _notify_event(self, kind: str, message: str, level: str = "INFO") -> None:
+        notifier = getattr(self, "notifier", None)
+        if notifier is not None:
+            notifier.on_event(kind, message, level)
+
+    def _flush_notifier(self, timeout: float = 5.0) -> None:
+        notifier = getattr(self, "notifier", None)
+        if notifier is not None:
+            try:
+                notifier.close(timeout=timeout)
+            except Exception:  # pragma: no cover
+                pass
+
+    def _cmd_telegram_test(self, job: Any) -> Dict[str, Any]:
+        """Sans chat_id : liste les conversations du bot (getUpdates) ; sinon envoie un message de test."""
+        tcfg = self.cfg.telegram
+        notifier = self._new_notifier()
+        if not notifier.bot_token:
+            job.emit("err", "Renseignez [telegram] bot_token dans config.ini : créez un bot en écrivant /newbot "
+                            "à @BotFather sur Telegram, puis collez le jeton qu'il vous donne.")
+            return {"ok": False}
+        if not notifier.chat_id:
+            job.emit("info", "chat_id vide : recherche des conversations de votre bot (getUpdates)…")
+            ok, chats, err = notifier.get_chats()
+            if not ok:
+                job.emit("err", err)
+                return {"ok": False, "message": err}
+            if not chats:
+                job.emit("warn", "Aucune conversation trouvée : ouvrez votre bot dans Telegram, envoyez-lui un "
+                                 "message (ex. /start), puis relancez ce test.")
+                return {"ok": False, "chats": []}
+            for c in chats:
+                job.emit("ok", "chat_id = %s — %s%s" % (c["id"], c["name"], " (%s)" % c["type"] if c["type"] else ""))
+            job.emit("info", "Copiez le chat_id voulu dans [telegram] chat_id de config.ini (onglet Configuration), "
+                             "puis relancez « Tester Telegram ».")
+            return {"ok": True, "chats": chats}
+        events = ", ".join(notifier.events) or "aucun"
+        ok, msg = notifier.send_now("🔔 <b>synoarr</b>\nMessage de test : les notifications Telegram fonctionnent.\n"
+                                    "Événements notifiés : %s" % events, escape_html=False)
+        if ok:
+            job.emit("ok", "Message de test envoyé au chat %s (événements notifiés : %s)" % (tcfg.chat_id, events))
+            return {"ok": True}
+        job.emit("err", msg)
+        return {"ok": False, "message": msg}
 
     # ------------------------------------------------------------- settings
     @property
@@ -1038,8 +1138,14 @@ class App:
             target, args = self._cmd_test_indexers, ()
         elif command == "ds_diag":
             target, args = self._cmd_ds_diag, ()
+        elif command == "telegram_test":  # F2
+            target, args, capture = self._cmd_telegram_test, (), False
         elif command == "ds_test":
             target, args = self._cmd_ds_test, ()
+        elif command == "subtitles_scan":  # F5
+            target, args = self._cmd_subtitles_scan, ()
+        elif command == "rss_sync":  # F4
+            target, args = self._cmd_rss_sync, ()
         elif command in ("update_check", "update", "update_rollback"):
             target, args, key = self._cmd_update, (command,), "update"  # one update job at a time
         else:  # search
@@ -1569,7 +1675,16 @@ class App:
             job.emit("info", "Réglage [quality] french_title_only : inactif (titre français ET titre original)")
         if not self.db.list_indexers(enabled_only=True):
             job.emit("warn", "Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
-        report = self.searcher.search_report(req)[:300]
+        info = {}  # type: Dict[str, Any]
+        report = self.searcher.search_report(req, info=info)[:300]
+        if info.get("fallback"):  # F1: [quality] french_title_fallback
+            from .searcher import FRENCH_FALLBACK_MESSAGE
+            job.emit("warn", FRENCH_FALLBACK_MESSAGE)
+            for q in info.get("queries") or []:
+                label = q.title.strip() + (" (identifiant IMDb/TVDB)" if (q.imdb or q.tvdb) else "")
+                if label.lower() not in [x.lower() for x in titles]:
+                    titles.append(label)
+            job.emit("info", "Titres cherchés : %s" % " · ".join(titles))
         prios = self.indexer_manager.priorities()
         job.private["releases"] = [rel for rel, _s, _r in report]
         job.private["verdicts"] = [(score, reason) for _rel, score, reason in report]
@@ -1583,7 +1698,7 @@ class App:
         accepted = sum(1 for r in results if r["score"] is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(results), accepted))
         return {"media_id": target[0], "season": target[1], "episode": target[2], "request": req.describe(),
-                "titles": titles, "french_title_only": only,
+                "titles": titles, "french_title_only": only, "french_title_fallback": bool(info.get("fallback")),
                 "kind": req.kind, "languages": list(req.languages), "total": len(results), "results": results}
 
     LINK_PROBE_MAX = 40  # results whose link is checked (best first)
@@ -1827,6 +1942,7 @@ class App:
                     h.flush()
                 except Exception:  # pragma: no cover
                     pass
+            self._flush_notifier(3.0)  # F2 : « synoarr mis à jour » part avant le redémarrage
             os.execv(argv[0], argv)
         except Exception as exc:
             log.error("Redémarrage impossible : %s", exc)
@@ -2351,6 +2467,8 @@ class App:
         next_watch = time.time() + 5
         next_process = time.time() + 2
         next_prowlarr = time.time() + 1  # before the first search: indexers are up to date
+        next_subtitles = time.time() + 600  # F5 : premier scan des sous-titres 10 min après le démarrage
+        next_rss = time.time() + 120  # F4 : première synchronisation RSS 2 min après le démarrage
         while not self._stop.is_set():
             try:
                 now = time.time()
@@ -2366,13 +2484,53 @@ class App:
                 if prowlarr_hours > 0 and now >= next_prowlarr and not self._stop.is_set():
                     next_prowlarr = time.time() + max(0.25, prowlarr_hours) * 3600
                     self._start_prowlarr_sync()
+                subs_hours = float(getattr(getattr(self.cfg, "subtitles", None), "scan_interval_hours", 0) or 0)
+                if subs_hours > 0 and now >= next_subtitles and not self._stop.is_set():  # F5
+                    next_subtitles = time.time() + max(0.5, subs_hours) * 3600
+                    self._start_subtitles_scan()
                 if now >= next_watch and not self._stop.is_set():
                     self._start_watchlist_thread()
                     next_watch = time.time() + watch_every
+                rss_minutes = float(getattr(self.cfg.general, "rss_interval_minutes", 0) or 0)
+                if rss_minutes > 0 and now >= next_rss and not self._stop.is_set():  # F4
+                    next_rss = time.time() + max(5.0, rss_minutes) * 60
+                    self._start_rss_thread()
             except Exception as exc:  # pragma: no cover - jobs already catch everything; never die
                 log.exception("Boucle principale : erreur inattendue : %s", exc)
             self._stop.wait(2)
         self.shutdown()
+
+    # ---- RSS sync (F4)
+    def job_rss(self) -> Dict[str, int]:
+        """One RSS sync (latest releases of every indexer matched against the wanted items). Never raises."""
+        try:
+            return self.searcher.rss_sync()
+        except Exception as exc:
+            log.exception("Synchronisation RSS en erreur : %s", exc)
+            self._record_error("rss", exc)
+            return {}
+
+    def _start_rss_thread(self) -> bool:
+        """Daemon loop: RSS sync in its own thread (no-op while one is running)."""
+        t = getattr(self, "_rss_thread", None)
+        if t is not None and t.is_alive():
+            return False
+        self._rss_thread = threading.Thread(target=self.job_rss, daemon=True, name="synoarr-rss")
+        self._rss_thread.start()
+        return True
+
+    def _cmd_rss_sync(self, job: Any) -> Dict[str, Any]:
+        if not self.db.list_indexers(enabled_only=True):
+            raise ValueError("Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
+        stats = self.searcher.rss_sync()
+        if stats.get("skipped"):
+            job.emit("warn", "Une recherche est en cours : synchronisation RSS reportée, réessayez dans un instant")
+        else:
+            job.emit("ok", "%d release(s) récente(s) de %d indexer(s), %d élément(s) voulu(s), %d envoi(s) vers "
+                           "Download Station" % (stats.get("releases", 0), stats.get("indexers", 0),
+                                                 stats.get("wanted", 0), stats.get("grabbed", 0)))
+        return stats
+    # ---- end RSS sync
 
     def _start_prowlarr_sync(self) -> bool:
         """Synchronise the Prowlarr indexers in a background thread (no-op if not configured or running)."""
@@ -2404,6 +2562,91 @@ class App:
         st["running"] = bool(getattr(self, "_prowlarr_running", False))
         return st
 
+    # ---- web UI: posters + bulk search (interface web, onglets Watchlist / À venir)
+    _poster_mutex = threading.Lock()  # check-and-set of the flags below only (never held during a TMDb call)
+    poster_batch = 30            # posters looked up per run
+    poster_min_interval = 20.0   # seconds between two runs triggered by the web UI
+    poster_retry_after = 6 * 3600.0  # an item TMDb did not answer for is not asked again before this delay
+
+    def request_posters(self, media_ids: Any) -> bool:
+        """Look up, in a background thread, the missing posters (and movie release dates) of *media_ids* on
+        TMDb, cached in the media table (poster "" = none). Throttled; False when nothing was started."""
+        if not getattr(self.tmdb, "enabled", False) or self._stop.is_set():
+            return False
+        now = time.time()
+        failed = getattr(self, "_poster_failed", {})  # type: Dict[int, float]
+        ids = []  # type: List[int]
+        for mid in media_ids or []:
+            try:
+                mid = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if mid not in ids and now - failed.get(mid, 0.0) >= self.poster_retry_after:
+                ids.append(mid)
+        if not ids:
+            return False
+        with self._poster_mutex:
+            if getattr(self, "_poster_running", False) or \
+                    now - getattr(self, "_poster_last", 0.0) < self.poster_min_interval:
+                return False
+            self._poster_running = True
+            self._poster_last = now
+
+        def run() -> None:
+            try:
+                self.fill_posters(ids[:self.poster_batch])
+            except Exception as exc:  # pragma: no cover - never break the web UI for a poster
+                log.debug("Affiches TMDb : %s", exc)
+            finally:
+                self._poster_running = False
+        threading.Thread(target=run, name="synoarr-posters", daemon=True).start()
+        return True
+
+    def fill_posters(self, media_ids: List[int]) -> int:
+        """Synchronous part of request_posters(): returns the number of media rows updated. Never raises."""
+        tmdb = self.tmdb
+        if not getattr(tmdb, "enabled", False):
+            return 0
+        if not hasattr(self, "_poster_failed"):
+            self._poster_failed = {}  # type: Dict[int, float]
+        done = 0
+        for mid in media_ids:
+            if self._stop.is_set():
+                break
+            media = self.db.get_media(int(mid))
+            if not media or media.get("poster") is not None:
+                continue
+            kind = "movie" if media["type"] == "movie" else "show"
+            try:
+                tmdb_id = media.get("tmdb")
+                if not tmdb_id and media.get("imdb"):
+                    tmdb_id = (tmdb.find_by_imdb(media["imdb"]) or {}).get("movie" if kind == "movie" else "tv")
+                art = tmdb.artwork(str(tmdb_id), kind) if tmdb_id else None
+            except Exception as exc:
+                log.debug("Affiche TMDb indisponible pour %s : %s", media["title"], exc)
+                art = None
+            if art is None:  # no id (yet) or TMDb did not answer: asked again later
+                self._poster_failed[int(mid)] = time.time()
+                continue
+            poster = str(art.get("poster") or "")
+            if poster and not poster.startswith("https://"):
+                poster = ""
+            self.db.set_media_artwork(int(mid), poster, art.get("release_date"))
+            done += 1
+        return done
+
+    def search_many(self, media_ids: List[int]) -> None:
+        """Search several Watchlist items one after the other, in ONE background thread."""
+        ids = [int(m) for m in media_ids]
+
+        def run() -> None:
+            for mid in ids:
+                if self._stop.is_set():
+                    break
+                self.job_watchlist(mid, True)
+        self._background(run)
+    # ---- end web UI: posters + bulk search
+
     def shutdown(self, timeout: float = 60.0) -> None:
         """Stop the web server, let running jobs finish (a file move is never cut), close the database."""
         self._stop.set()
@@ -2416,6 +2659,9 @@ class App:
         if self._watch_thread is not None and self._watch_thread.is_alive():
             log.info("Attente de la fin de la recherche en cours…")
             self._watch_thread.join(max(0.0, deadline - time.time()))
+        rss_thread = getattr(self, "_rss_thread", None)  # F4
+        if rss_thread is not None and rss_thread.is_alive():
+            rss_thread.join(max(0.0, deadline - time.time()))
         got_watch = self._watch_lock.acquire(timeout=max(0.1, deadline - time.time()))
         got_process = self._process_lock.acquire(timeout=max(0.1, deadline - time.time()))
         try:
@@ -2428,6 +2674,7 @@ class App:
                 self._process_lock.release()
             if got_watch:
                 self._watch_lock.release()
+        self._flush_notifier(3.0)  # F2
         log.info("synoarr arrêté")
 
     def run_once(self) -> None:

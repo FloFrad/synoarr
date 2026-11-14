@@ -245,6 +245,24 @@ class TorznabIndexer(Indexer):
             raise last_exc
         return []
 
+    RECENT_CATEGORIES = [5000, 2000]
+
+    def recent_categories(self) -> List[int]:
+        """Categories of the RSS sync: configured TV/movie ones (5xxx, 2xxx), tracker specific ones, else 5000,2000."""
+        configured = list(self.categories or [])
+        matching = [c for c in configured if 2000 <= c <= 2999 or 5000 <= c <= 5999]
+        if matching:
+            return matching
+        if configured and all(c >= 100000 for c in configured):
+            return configured
+        return list(self.RECENT_CATEGORIES)
+
+    def _recent(self) -> List[Release]:
+        """Latest releases: t=search without q (Prowlarr/Jackett answer with their RSS feed)."""
+        cats = ",".join(str(c) for c in self.recent_categories())
+        root = self._get_xml([("t", "search"), ("cat", cats), ("extended", "1"), ("limit", "100")], expect="feed")
+        return parse_feed(root, self.name, self._endpoint or self.url)
+
     @staticmethod
     def _matches(release: Release, request: SearchRequest) -> bool:
         try:

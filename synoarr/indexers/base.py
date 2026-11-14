@@ -370,6 +370,17 @@ class Indexer:
                         redact(self.url), request.describe(), self._safe(exc))
             return []
 
+    def recent(self) -> List[Release]:
+        """Latest releases of the indexer (RSS sync). Never raises: logs a warning and returns [] on any error.
+        Indexers without such a feed (Internet Archive) return []."""
+        try:
+            results = self._recent()
+            return [r for r in (results or []) if isinstance(r, Release)]
+        except Exception as exc:
+            log.warning("Indexer « %s » (%s) : lecture des dernières releases impossible : %s", self.name,
+                        redact(self.url), self._safe(exc))
+            return []
+
     def test(self) -> Tuple[bool, str]:
         """Check that the indexer answers. Returns (ok, message in French). Never raises."""
         try:
@@ -383,3 +394,6 @@ class Indexer:
 
     def _test(self) -> Tuple[bool, str]:  # pragma: no cover - abstract
         raise NotImplementedError
+
+    def _recent(self) -> List[Release]:
+        return []  # no "latest releases" feed (e.g. Internet Archive): skipped by the RSS sync

@@ -386,3 +386,54 @@ class IndexerPriorityTests(unittest.TestCase):
         self.assertEqual(priority_points("Dernier", self.prios), 0)
         self.assertEqual(priority_points("x", {"x": 999}), 0)  # clamped to 50
         self.assertEqual(priority_points("x", {"x": "abc"}), 25 * 200)
+
+
+class UpgradeTests(unittest.TestCase):
+    """F3: resolution ranks, cutoff ([quality] upgrade_until) and choice of a strictly better release."""
+
+    def setUp(self):
+        from synoarr import quality
+        self.q = quality
+        self.cfg = QualityConfig(languages=["en"], prefer_words=[], resolutions=["2160p", "1080p", "720p"])
+
+    def test_resolution_rank(self):
+        self.assertEqual(self.q.resolution_rank("2160p", self.cfg), 0)
+        self.assertEqual(self.q.resolution_rank("720P", self.cfg), 2)
+        self.assertEqual(self.q.resolution_rank("480p", self.cfg), 3)  # not listed: after every listed one
+        self.assertIsNone(self.q.resolution_rank(None, self.cfg))
+        self.assertIsNone(self.q.resolution_rank("", self.cfg))
+
+    def test_cutoff_and_needs_upgrade(self):
+        self.cfg.upgrade, self.cfg.upgrade_until = True, "1080p"
+        self.assertEqual(self.q.upgrade_cutoff_rank(self.cfg), 1)
+        self.assertTrue(self.q.needs_upgrade("720p", self.cfg))
+        self.assertTrue(self.q.needs_upgrade("480p", self.cfg))
+        self.assertFalse(self.q.needs_upgrade("1080p", self.cfg))  # cutoff reached
+        self.assertFalse(self.q.needs_upgrade("2160p", self.cfg))
+        self.assertFalse(self.q.needs_upgrade(None, self.cfg))  # unknown quality: never upgraded
+        self.cfg.upgrade_until = "4320p"  # not listed: the best accepted resolution
+        self.assertEqual(self.q.upgrade_cutoff_rank(self.cfg), 0)
+        self.assertTrue(self.q.needs_upgrade("1080p", self.cfg))
+        self.cfg.upgrade = False
+        self.assertFalse(self.q.needs_upgrade("720p", self.cfg))
+
+    def test_defaults(self):
+        cfg = QualityConfig()
+        self.assertTrue(cfg.upgrade)
+        self.assertEqual(cfg.upgrade_until, "1080p")
+        self.assertTrue(cfg.french_title_fallback)
+
+    def test_pick_upgrade_only_strictly_better(self):
+        releases = [rel("Dune.2021.720p.BluRay.x264-A", seeders=900),
+                    rel("Dune.2021.1080p.WEB-DL.x264-B", seeders=5),
+                    rel("Dune.2021.1080p.iTALiAN.BluRay.x264-C", seeders=500)]  # better but rejected (language)
+        best = self.q.pick_upgrade(releases, MOVIE, self.cfg, "720p")
+        self.assertEqual(best.title, "Dune.2021.1080p.WEB-DL.x264-B")
+        self.assertIsNone(self.q.pick_upgrade(releases, MOVIE, self.cfg, "1080p"))
+        self.assertIsNone(self.q.pick_upgrade(releases, MOVIE, self.cfg, ""))  # unknown current quality
+        blocked = self.q.pick_upgrade(releases, MOVIE, self.cfg, "720p",
+                                      is_blocked=lambda t: t.endswith("-B"))
+        self.assertIsNone(blocked)
+        self.assertTrue(self.q.is_better_resolution("1080p", "720p", self.cfg))
+        self.assertFalse(self.q.is_better_resolution("720p", "720p", self.cfg))
+        self.assertFalse(self.q.is_better_resolution(None, "720p", self.cfg))

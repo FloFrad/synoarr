@@ -36,6 +36,8 @@ Objectif : remplacer Prowlarr + Radarr + Sonarr + Filebot sur un NAS Synology, *
 | `downloadstation.py` | API DSM Download Station (login, ajout .torrent/magnet/URL, liste, suppression) |
 | `organizer.py` | surveille `download_dir`, renomme au format Plex, déplace vers Films/Séries |
 | `searcher.py` | orchestration : Watchlist → épisodes voulus → recherche indexers → choix → envoi DS |
+| `notify.py` | notifications Telegram (`TelegramNotifier`, file + thread, limite de débit) branchées sur `Database.add_listener` (événements `add_event`) |
+| `subtitles.py` | sous-titres automatiques OpenSubtitles.com (`SubtitleService` : `fetch_for`, `scan_library`, file d'attente alimentée par `Organizer.on_file_imported`) |
 | `app.py` | `App` : construit tous les composants depuis `Config`, boucle démon, threads |
 | `web.py` | mini interface web (http.server) + API JSON |
 | `cli.py` / `__main__.py` | ligne de commande `python3 synoarr.py <commande>` |
@@ -196,6 +198,26 @@ supprimer la tâche DS correspondante, si `delete_leftovers` et action move supp
 (seulement s'il ne reste ni vidéo ni sous-dossier non vide de vidéos), `db.add_event`, puis `on_imported()`
 (refresh Plex) une fois par cycle s'il y a eu au moins un import. Dossiers créés avec `os.makedirs(exist_ok=True)`.
 Mode `dry_run` : ne rien modifier, renvoyer les actions prévues.
+
+### subtitles.py (F5)
+```python
+def opensubtitles_hash(path: str) -> Optional[str]   # taille + somme 64 bits des premiers/derniers 64 Kio
+class SubtitleService:
+    def __init__(self, cfg: Config, db: Database, http: HttpClient, tmdb: Optional[TmdbClient] = None)
+    base_url: str                                     # https://api.opensubtitles.com/api/v1 (tests : faux serveur)
+    def fetch_for(self, video_path, kind=None, imdb=None, tmdb=None, season=None, episode=None,
+                  languages=None, release_name="", title="", year=None) -> Dict   # ne lève jamais
+    def scan_library(self, limit=None, force=False) -> Dict   # plus anciennes d'abord, petits lots
+    def enqueue(self, video_path, meta) -> None       # branché sur Organizer.on_file_imported (thread)
+```
+API : `POST /login` (jeton Bearer, une fois), `GET /subtitles` (paramètres triés : `imdb_id`/`tmdb_id`, épisodes
+`parent_imdb_id`/`parent_tmdb_id` + `season_number`/`episode_number`, sinon `query`/`year` ; `languages`,
+`moviehash`, `type`), `POST /download {file_id}` → `link`, `remaining`. Choix : `moviehash_match`, préférence
+malentendants, ressemblance du nom de release, `download_count`. Fichier `<vidéo>.<langue>.srt`, jamais écrasé.
+Quota : `remaining` 0 ou HTTP 406 → pause jusqu'à `reset_time_utc` (kv `subtitles_quota_until`), 429 → pause
+courte. Table `subtitle_searches` (créée par le module) : nouvel essai d'une vidéo sans résultat après 2, 4, 8…
+30 jours. `Organizer.on_file_imported(dst, meta)` (attribut, défaut None) : appelé après l'import des
+sous-titres de la release pour chaque vidéo nouvellement importée.
 
 ### web.py
 ```python

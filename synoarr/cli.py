@@ -634,6 +634,18 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rss(args: argparse.Namespace) -> int:
+    """RSS sync (F4): latest releases of every indexer matched against the wanted items."""
+    app = _app(args)
+    stats = app.searcher.rss_sync()
+    if stats.get("skipped"):
+        _out(WARN + "Une recherche est en cours : synchronisation RSS reportée, réessayez dans un instant")
+        return 1
+    _out("%d release(s) récente(s) de %d indexer(s), %d élément(s) voulu(s), %d envoi(s) vers Download Station"
+         % (stats.get("releases", 0), stats.get("indexers", 0), stats.get("wanted", 0), stats.get("grabbed", 0)))
+    return 0
+
+
 def _quiet_console(args: argparse.Namespace) -> None:
     """The command prints its own report: console log lines would only duplicate it."""
     if getattr(args, "verbose", False):
@@ -703,6 +715,45 @@ def cmd_ds_test(args: argparse.Namespace) -> int:
             _out(_PREFIX.get(level, "") + msg)
     res = app._cmd_ds_test(_Out())
     return 0 if res.get("working") else 1
+
+
+def cmd_telegram_test(args: argparse.Namespace) -> int:
+    """F2 : sans chat_id, affiche les conversations du bot ; sinon envoie un message de test."""
+    app = _app(args)
+
+    class _Out(object):
+        private = {}  # type: dict
+
+        @staticmethod
+        def emit(level: str, msg: str) -> None:
+            _out(_PREFIX.get(level, "") + msg)
+    res = app._cmd_telegram_test(_Out())
+    return 0 if res.get("ok") else 1
+
+
+def cmd_subtitles(args: argparse.Namespace) -> int:  # F5
+    """Download the missing subtitles of the library (or of one video) from OpenSubtitles."""
+    app = _app(args)
+    subs = app.subtitles
+    if not subs.configured:
+        _out(KO + "Renseignez [subtitles] api_key (et username/password) dans config.ini : clé gratuite sur "
+                  "opensubtitles.com (Profile > API consumers)")
+        return 1
+    if args.file:
+        res = subs.fetch_for(os.path.abspath(args.file))
+        for path in res["downloaded"]:
+            _out(OK + "Sous-titre enregistré : %s" % path)
+        if res["status"] in ("present", "found"):
+            _out(OK + ("Sous-titres déjà présents" if res["status"] == "present" else "Terminé"))
+            return 0
+        _out((WARN if res["status"] in ("partial", "none", "quota") else KO) + (res["message"] or res["status"]))
+        return 0 if res["status"] in ("partial", "none") else 1
+    stats = subs.scan_library(limit=args.limit, force=args.force)
+    _out((WARN if stats.get("quota_reached") else OK) +
+         "%d vidéo(s), %d sans sous-titre %s, %d recherchée(s), %d sous-titre(s) téléchargé(s)%s" % (
+             stats["videos"], stats["missing"], "/".join(subs.languages()), stats["searched"], stats["downloaded"],
+             " (quota OpenSubtitles atteint)" if stats.get("quota_reached") else ""))
+    return 0 if not stats.get("errors") else 1
 
 
 def cmd_once(args: argparse.Namespace) -> int:
@@ -844,14 +895,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("process", parents=[common], help="renommer/déplacer les téléchargements terminés") \
         .set_defaults(func=cmd_process)
+    sub.add_parser("rss", parents=[common], help="synchroniser les flux RSS des indexers (nouveaux épisodes, "
+                                                 "améliorations)").set_defaults(func=cmd_rss)  # F4
     sub.add_parser("ds-test", parents=[common], help="tester l'envoi à Download Station (torrent Ubuntu, 3 méthodes)") \
         .set_defaults(func=cmd_ds_test)
     sub.add_parser("ds-diag", parents=[common], help="diagnostic des téléchargements Download Station en attente") \
         .set_defaults(func=cmd_ds_diag)
+    sub.add_parser("telegram-test", parents=[common],  # F2
+                   help="tester les notifications Telegram (ou afficher votre chat_id)") \
+        .set_defaults(func=cmd_telegram_test)
     pu = sub.add_parser("update", parents=[common], help="mettre à jour synoarr depuis GitHub")
     pu.add_argument("--check", action="store_true", help="seulement vérifier s'il existe une mise à jour")
     pu.add_argument("--rollback", action="store_true", help="revenir à la version précédente")
     pu.set_defaults(func=cmd_update)
+    psub = sub.add_parser("subtitles", parents=[common],  # F5
+                          help="télécharger les sous-titres manquants (OpenSubtitles)")
+    psub.add_argument("--limit", type=int, default=None, help="nombre maximum de vidéos recherchées")
+    psub.add_argument("--force", action="store_true", help="ignorer le délai avant de rechercher à nouveau")
+    psub.add_argument("--file", default="", help="une seule vidéo (chemin complet)")
+    psub.set_defaults(func=cmd_subtitles)
     sub.add_parser("once", parents=[common], help="un cycle complet puis quitter (mode tâche planifiée)") \
         .set_defaults(func=cmd_once)
     sub.add_parser("run", parents=[common], help="lancer le démon (+ interface web)").set_defaults(func=cmd_run)

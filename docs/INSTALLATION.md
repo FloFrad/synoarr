@@ -331,6 +331,54 @@ Les vidéos que vous déposez vous-même dans `Download` sont aussi renommées e
 (désactivable : `[paths] only_known_downloads = true`). Les autres fichiers (documents, photos…) ne sont jamais
 supprimés.
 
+## Notifications Telegram
+
+Facultatif : synoarr peut vous prévenir sur Telegram (envoi à Download Station, import, échec…).
+
+1. Dans Telegram, écrivez `/newbot` à **@BotFather**, choisissez un nom puis un identifiant finissant par `bot`.
+   Copiez le jeton reçu (`123456789:AAH…`) dans `[telegram] bot_token` de `config.ini` (gardez-le secret).
+2. Ouvrez la conversation avec votre bot et envoyez-lui un message (`/start`).
+3. Laissez `chat_id` vide et lancez **Tester Telegram** (onglet Commandes) ou
+   `sudo python3 synoarr.py telegram-test` : les conversations trouvées s'affichent avec leur `chat_id`
+   (sinon : ouvrez `https://api.telegram.org/bot<TOKEN>/getUpdates` dans un navigateur et relevez `"chat":{"id":…}`).
+4. Copiez le `chat_id` dans `config.ini`, puis relancez **Tester Telegram** : un message de test arrive.
+
+```ini
+[telegram]
+bot_token = 123456789:AAH...
+chat_id = 987654321
+events = grab, import, error
+```
+
+`events` : `grab` (envoyé à Download Station), `import` (importé dans la bibliothèque), `error` (téléchargement
+en échec, bloqué ou abandonné), `watchlist` (élément ajouté), `upgrade` (amélioration de qualité), `update`
+(synoarr mis à jour). Les rafales sont regroupées en un seul message (20 messages par minute au plus).
+
+## Sous-titres automatiques (OpenSubtitles)
+
+Facultatif : synoarr peut télécharger tout seul les sous-titres manquants (comme Bazarr), depuis
+OpenSubtitles.com, juste après chaque import et lors d'un passage régulier sur toute la bibliothèque.
+
+1. Créez un compte gratuit sur [opensubtitles.com](https://www.opensubtitles.com).
+2. Dans votre profil : **Profile → API consumers → New consumer** (nom : `synoarr`) et copiez la clé API.
+3. Remplissez la section `[subtitles]` de `config.ini` puis lancez **Rechercher les sous-titres manquants**
+   (onglet Commandes) ou `sudo python3 synoarr.py subtitles`.
+
+```ini
+[subtitles]
+enabled = true
+api_key = VotreCleAPI
+username = votre_compte_opensubtitles
+password = votre_mot_de_passe
+languages = en
+```
+
+Les sous-titres sont enregistrés à côté de la vidéo au format Plex (`Film (2010).en.srt`) ; un sous-titre déjà
+présent n'est jamais remplacé. Le meilleur est choisi par empreinte du fichier vidéo (correspondance exacte),
+puis ressemblance du nom de la release, puis popularité. Un compte gratuit a une **limite quotidienne de
+téléchargements** : une fois atteinte, synoarr attend la remise à zéro du quota et reprend tout seul (les vidéos
+les plus anciennes d'abord, `scan_limit` par passage toutes les `scan_interval_hours` heures).
+
 ## Commandes utiles
 
 | Commande | Effet |
@@ -341,6 +389,8 @@ supprimés.
 | `sudo python3 synoarr.py search "Titre 1968"` | teste une recherche et affiche les scores (n'envoie rien) |
 | `sudo python3 synoarr.py process` | traite le dossier Download maintenant |
 | `sudo python3 synoarr.py status` | derniers envois et événements |
+| `sudo python3 synoarr.py subtitles` | télécharge les sous-titres manquants (`--file VIDEO` pour une seule vidéo) |
+| `sudo python3 synoarr.py telegram-test` | teste les notifications Telegram (ou affiche votre `chat_id`) |
 | `sudo python3 synoarr.py indexer list` | liste les indexers (avec leur priorité) |
 | `sudo python3 synoarr.py indexer edit 3 --api-key CLE --priority 10` | modifie un indexer (aussi `--name`, `--url`, `--categories`, `--type`) |
 | `sudo python3 synoarr.py indexer priority <id\|nom> <1-50>` | change la priorité d'un indexer (1 = le plus prioritaire) |

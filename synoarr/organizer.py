@@ -235,6 +235,8 @@ class _Item(object):
 class Organizer:
     min_video_size = MIN_VIDEO_SIZE
     sample_max_size = SAMPLE_MAX_SIZE
+    # F5 (sous-titres) : appelé une fois par vidéo nouvellement importée, (chemin final, meta + "source_name")
+    on_file_imported = None  # type: Optional[Callable[[str, Dict[str, Any]], None]]
 
     def __init__(self, cfg: "Config", db: "Database", ds: Optional["DownloadStation"],
                  tmdb: Optional["TmdbClient"], on_imported: Optional[Callable[[], None]] = None):
@@ -406,7 +408,12 @@ class Organizer:
         videos = [it for it in items if it.meta["kind"] != "subtitle"]
         subs = [it for it in items if it.meta["kind"] == "subtitle"]
         for it in videos:
-            status, msg, ok = self._transfer(it.src, it.dst)
+            old_files = self._upgrade_old_files(it)  # F3: library file(s) replaced by this upgrade
+            status, msg, ok = self._transfer(it.src, it.dst, upgrade=bool(it.meta.get("upgrade")))
+            if status == "imported":  # F3: quality of the file now in the library, old version removed
+                self._record_quality(it)
+                if old_files and msg != "déjà présent":
+                    self._remove_replaced(it, old_files)
             present[it.src] = ok
             actions.append(self._action(it.src, it.dst, status, msg))
             if status == "imported":
@@ -427,11 +434,27 @@ class Organizer:
             actions.append(self._action(it.src, it.dst, status, msg))
             if status == "error":
                 log.warning("Sous-titre %s non importé : %s", it.src, msg)
+        if self.on_file_imported is not None:  # F5 : après les sous-titres de la release
+            self._notify_file_imported(videos, actions)
 
         settled = bool(videos) and all(present.get(it.src) for it in videos)
         if settled:
             self._entry_done(entry_path, name, is_dir, grab, matching, ds_ok, videos, imported > 0)
         return actions + problem_actions, imported, settled
+
+    def _notify_file_imported(self, videos: List[_Item], actions: List[Dict]) -> None:
+        """F5 : on_file_imported(dst, meta) pour chaque vidéo réellement importée (pas « déjà présent »)."""
+        done = set((a.get("src"), a.get("dst")) for a in actions
+                   if a.get("status") == "imported" and a.get("message") != "déjà présent")
+        for it in videos:
+            if (it.src, it.dst) not in done:
+                continue
+            meta = dict(it.meta)
+            meta["source_name"] = _stem(it.src)
+            try:
+                self.on_file_imported(it.dst, meta)  # type: ignore[misc]
+            except Exception as exc:
+                log.warning("Action après import de %s en erreur : %s", it.dst, exc)
 
     def _entry_done(self, entry_path: str, name: str, is_dir: bool, grab: Optional[Dict[str, Any]],
                     matching: List["DSTask"], ds_ok: bool, videos: List[_Item], new_files: bool) -> None:
@@ -478,6 +501,120 @@ class Organizer:
                     self.db.set_episode_status(int(media_id), int(meta["season"]), int(ep), "done")
         except Exception as exc:
             log.warning("Mise à jour du statut en base impossible : %s", exc)
+
+    # ---- quality upgrades (F3)
+    def _plan_quality(self, items: List[_Item], grab: Optional[Dict[str, Any]]) -> None:
+        """Resolution/source of each video (file name, else release name) and, for an upgrade grab whose file
+        is really better than the one in the library, meta["upgrade"] (destination = normal name)."""
+        from . import quality as _quality
+        release = (grab or {}).get("release_title") or ""
+        for it in items:
+            if it.meta.get("kind") not in ("movie", "episode"):
+                continue
+            p = parse(os.path.basename(it.src))
+            res, src = p.resolution, p.source
+            if release and (not res or not src):
+                pr = parse(release)
+                res, src = res or pr.resolution, src or pr.source
+            it.meta["resolution"], it.meta["source"] = res, src
+            it.meta["release"] = release or _stem(it.src)
+            if not grab or not grab.get("upgrade") or not it.meta.get("media_id"):
+                continue
+            current = self._stored_resolutions(it.meta)
+            if current and all(_quality.is_better_resolution(res, c, self.cfg.quality) for c in current):
+                it.meta["upgrade"] = True
+                natural = it.meta.get("natural_dst")
+                if natural and natural != it.dst:  # existing episode under another name/extension
+                    it.meta["replaces"] = it.dst
+                    it.dst = natural
+            else:
+                log.info("%s : pas meilleur que la version de la bibliothèque (%s), règles habituelles appliquées",
+                         os.path.basename(it.src), ", ".join(c for c in current) or "qualité inconnue")
+
+    def _stored_rows(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        try:
+            media_id = int(meta["media_id"])
+            if meta["kind"] == "movie":
+                row = self.db.get_media(media_id)
+                return [row] if row else []
+            rows = [self.db.get_episode(media_id, int(meta["season"]), int(ep)) for ep in meta.get("episodes") or []]
+            return [r for r in rows if r]
+        except Exception as exc:
+            log.debug("Lecture de la qualité en base impossible : %s", exc)
+            return []
+
+    def _stored_resolutions(self, meta: Dict[str, Any]) -> List[str]:
+        """Known resolutions of the library file(s) of this movie / these episodes (empty = unknown)."""
+        rows = self._stored_rows(meta)
+        res = [r.get("quality_resolution") for r in rows]
+        return [x for x in res if x] if rows and all(res) else []
+
+    def _upgrade_old_files(self, it: _Item) -> List[str]:
+        """Library files of the item that the upgrade replaces (only for an upgrade): the episode found under
+        another name, the file recorded at the previous import, the movie under another extension."""
+        if not it.meta.get("upgrade"):
+            return []
+        found = []  # type: List[str]
+        if it.meta.get("replaces"):
+            found.append(it.meta["replaces"])
+        for row in self._stored_rows(it.meta):
+            if row.get("library_file"):
+                found.append(row["library_file"])
+        if it.meta.get("kind") == "movie":
+            folder, stem = os.path.dirname(it.dst), _stem(it.dst)
+            for ext in sorted(self._video_exts()):
+                found.append(os.path.join(folder, "%s.%s" % (stem, ext)))
+        out = []  # type: List[str]
+        for f in found:
+            if f and f not in out and os.path.isfile(f):
+                out.append(f)
+        return out
+
+    def _remove_replaced(self, it: _Item, old_files: List[str]) -> None:
+        """Delete the previous version(s) of an upgraded movie/episode, now that the new file is in place.
+        Only video files of this very item inside the library folder are ever deleted."""
+        kind = it.meta.get("kind")
+        root = self.cfg.paths.movies_dir if kind == "movie" else self.cfg.paths.series_dir
+        if not os.path.isfile(it.dst):
+            return
+        for old in old_files:
+            try:
+                if os.path.islink(old) or not os.path.isfile(old) or _ext(old) not in self._video_exts():
+                    continue
+                if not _inside(old, root) or _inside(old, self.cfg.paths.download_dir):
+                    continue
+                if os.path.samefile(old, it.dst):
+                    continue
+                if kind == "episode":
+                    p = parse(os.path.basename(old))
+                    if p.season != it.meta.get("season") or not p.episodes or \
+                            not set(p.episodes) <= set(it.meta.get("episodes") or []):
+                        log.info("Ancienne version %s conservée : elle contient d'autres épisodes", old)
+                        continue
+                os.remove(old)
+                log.info("Ancienne version supprimée (amélioration de qualité) : %s", old)
+                self.db.add_event("upgrade", "Amélioration importée : %s remplace %s"
+                                  % (os.path.basename(it.dst), os.path.basename(old)))
+            except OSError as exc:
+                log.warning("Suppression de l'ancienne version %s impossible : %s", old, exc)
+
+    def _record_quality(self, it: _Item) -> None:
+        """Store the quality of the file now in the library (used by the upgrade search)."""
+        meta = it.meta
+        if not meta.get("media_id") or meta.get("kind") not in ("movie", "episode"):
+            return
+        try:
+            media_id = int(meta["media_id"])
+            if meta["kind"] == "movie":
+                self.db.set_media_quality(media_id, meta.get("resolution") or "", meta.get("source"),
+                                          meta.get("release"), it.dst)
+            else:
+                for ep in meta.get("episodes") or []:
+                    self.db.set_episode_quality(media_id, int(meta["season"]), int(ep), meta.get("resolution") or "",
+                                                meta.get("source"), meta.get("release"), it.dst)
+        except Exception as exc:
+            log.warning("Enregistrement de la qualité importée impossible : %s", exc)
+    # ---- end quality upgrades
 
     # ================================================================== guards
     def _video_exts(self) -> Set[str]:
@@ -774,6 +911,7 @@ class Organizer:
         if grab:
             for it in items:
                 it.meta["grab_id"] = grab.get("id")
+        self._plan_quality(items, grab)  # F3 (before subtitles: an upgrade may change the destination)
         items.extend(self._plan_subtitles(entry_path, items, subs, kind))
         return items, problems
 
@@ -925,7 +1063,8 @@ class Organizer:
             dst_path = self._existing_episode_variant(stem, season, episodes[0]) or stem + "." + _ext(v)
             items.append(_Item(v, dst_path, {
                 "kind": "episode", "media_id": media.get("id") if media else None, "title": show, "year": year,
-                "season": season, "episodes": episodes, "size": _file_size(v)}))
+                "season": season, "episodes": episodes, "size": _file_size(v),
+                "natural_dst": stem + "." + _ext(v)}))
         return items, problems
 
     def _existing_episode_variant(self, stem: str, season: int, episode: int) -> Optional[str]:
@@ -1084,8 +1223,10 @@ class Organizer:
         return out
 
     # ================================================================== file operations
-    def _transfer(self, src: str, dst: str) -> Tuple[str, str, bool]:
-        """Import one file. Returns (status, message, destination_holds_this_media)."""
+    def _transfer(self, src: str, dst: str, upgrade: bool = False) -> Tuple[str, str, bool]:
+        """Import one file. Returns (status, message, destination_holds_this_media).
+        *upgrade* (F3): better resolution of an item already in the library -> replaces the existing file even
+        when it is bigger."""
         action = self.cfg.paths.action
         try:
             if os.path.lexists(dst):
@@ -1098,11 +1239,17 @@ class Organizer:
                 ssize, dsize = os.path.getsize(src), os.path.getsize(dst)
                 if ssize == dsize:
                     if not _same_content(src, dst):
+                        if upgrade:
+                            self._place(src, dst, replace=True)
+                            return "imported", "amélioration de qualité : remplace la version précédente", True
                         return ("skipped", "un fichier différent de même taille existe déjà, rien n'est modifié",
                                 False)
                     if action == "move":
                         os.remove(src)
                     return "imported", "déjà présent", True
+                if ssize < dsize and upgrade:
+                    self._place(src, dst, replace=True)
+                    return "imported", "amélioration de qualité : remplace la version précédente", True
                 if ssize < dsize:
                     return ("skipped", "la destination existante est plus grosse (%d > %d octets), conservée"
                             % (dsize, ssize), True)

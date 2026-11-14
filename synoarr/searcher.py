@@ -343,9 +343,14 @@ class Searcher:
     def _movie_in_library(self, title: str, year: Optional[int], alt_titles: Optional[List[str]] = None) -> bool:
         """True if movies_dir holds this movie: "Title (Year).mkv", "Title (Year)/..." or
         "<Collection>/Title (Year).mkv" (one level of collection folders)."""
+        return self._find_movie_file(title, year, alt_titles) is not None
+
+    def _find_movie_file(self, title: str, year: Optional[int],
+                         alt_titles: Optional[List[str]] = None) -> Optional[str]:
+        """Path of the video of this movie in movies_dir (biggest video of its folder), or None."""
         root = self.cfg.paths.movies_dir
         if not os.path.isdir(root):
-            return False
+            return None
         vexts = self._video_exts()
 
         def matches(name: str) -> bool:
@@ -354,16 +359,25 @@ class Searcher:
                 return False
             return not (year and p.year and abs(p.year - year) > 1)
 
-        def has_video(folder: str) -> bool:
-            for _dirpath, _dirs, files in os.walk(folder):
-                if any(_ext(f) in vexts for f in files):
-                    return True
-            return False
+        def biggest_video(folder: str) -> Optional[str]:
+            best, best_size = None, -1  # type: Optional[str], int
+            for dirpath, _dirs, files in os.walk(folder):
+                for f in files:
+                    if _ext(f) not in vexts:
+                        continue
+                    full = os.path.join(dirpath, f)
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError:
+                        size = 0
+                    if size > best_size:
+                        best, best_size = full, size
+            return best
 
         try:
             names = os.listdir(root)
         except OSError:
-            return False
+            return None
         for name in names:
             if name.startswith((".", "@", "#")):
                 continue
@@ -371,12 +385,14 @@ class Searcher:
             if os.path.isfile(path):
                 # a stray "Title.nfo" must not count
                 if _ext(name) in vexts and matches(name):
-                    return True
+                    return path
                 continue
             if not os.path.isdir(path):
                 continue
-            if matches(name) and has_video(path):
-                return True
+            if matches(name):
+                found = biggest_video(path)
+                if found:
+                    return found
             # collection folder: look one level down
             try:
                 children = os.listdir(path)
@@ -387,13 +403,20 @@ class Searcher:
                 if child.startswith((".", "@", "#")) or not matches(child):
                     continue
                 if os.path.isfile(cpath) and _ext(child) in vexts:
-                    return True
-                if os.path.isdir(cpath) and has_video(cpath):
-                    return True
-        return False
+                    return cpath
+                if os.path.isdir(cpath):
+                    found = biggest_video(cpath)
+                    if found:
+                        return found
+        return None
 
     def _episodes_in_library(self, show_title: str, alt_titles: Optional[List[str]] = None) -> set:
-        found = set()
+        return set(self._library_episode_files(show_title, alt_titles))
+
+    def _library_episode_files(self, show_title: str,
+                               alt_titles: Optional[List[str]] = None) -> Dict[Tuple[int, int], str]:
+        """{(season, episode): video path} of this show in series_dir."""
+        found = {}  # type: Dict[Tuple[int, int], str]
         root = self.cfg.paths.series_dir
         if not os.path.isdir(root):
             return found
@@ -408,14 +431,14 @@ class Searcher:
             if not titles_match(parse(name).title or name, show_title, alt_titles) and \
                     not titles_match(name, show_title, alt_titles):
                 continue
-            for _dirpath, _dirs, files in os.walk(os.path.join(root, name)):
-                for f in files:
+            for dirpath, _dirs, files in os.walk(os.path.join(root, name)):
+                for f in sorted(files):
                     if _ext(f) not in vexts:
                         continue
                     p = parse(f)
                     for s in p.seasons[:1]:
                         for e in p.episodes:
-                            found.add((s, e))
+                            found.setdefault((s, e), os.path.join(dirpath, f))
         return found
 
     # ================================================================ search cycle
@@ -447,8 +470,11 @@ class Searcher:
             try:
                 if media["type"] == "movie" and media["status"] == "wanted":
                     self._search_movie(media, indexers, force or bool(media_id), stats)
+                elif media["type"] == "movie" and media["status"] == "done":
+                    self._search_movie_upgrade(media, indexers, force or bool(media_id), stats)  # F3
                 elif media["type"] == "show" and media["status"] == "monitored":
                     self._search_show(media, indexers, force or bool(media_id), stats)
+                    self._search_show_upgrades(media, indexers, force or bool(media_id), stats)  # F3
             except Exception as exc:
                 log.exception("Recherche : erreur sur %s : %s", media.get("title"), exc)
                 self.db.add_event("search", "Erreur de recherche pour %s : %s" % (media.get("title"), exc), "ERROR")
@@ -596,8 +622,14 @@ class Searcher:
         base = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"),
                              alt_titles=self._alt_titles(media), title_fr=self._title_fr_if_wanted(media))
         stats["searched"] += 1
-        results = self._collect(SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], season=None,
-                                              alt_titles=base.alt_titles, title_fr=base.title_fr), indexers)
+        discovery = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], season=None,
+                                  alt_titles=base.alt_titles, title_fr=base.title_fr)
+        results = self._collect(discovery, indexers)
+        extra = self.fallback_queries(discovery)
+        if extra and not quality.rank_releases(results, discovery, self.cfg.quality, self._is_excluded,
+                                               priorities=indexer_priorities(indexers)):
+            log.info("%s (%s)", FRENCH_FALLBACK_MESSAGE, discovery.describe())
+            results = results + self._run_queries(extra, indexers)
         seasons = set()
         for r in results:
             pr = parse(r.title)
@@ -614,6 +646,102 @@ class Searcher:
                 stats["grabbed"] += 1
                 grabbed_seasons.update(parse(best.title).seasons)  # "S01-S03" pack covers 3 seasons
 
+    # ------------------------------------------------------------ quality upgrades (F3)
+    MAX_UPGRADE_SEARCHES = 25  # upgrade searches per cycle (oldest first), so a big library never floods indexers
+
+    def _upgrades_enabled(self) -> bool:
+        return bool(getattr(self.cfg.quality, "upgrade", False))
+
+    def _upgrade_budget(self, stats: Dict[str, int]) -> bool:
+        return stats.get("upgrade_searched", 0) < self.MAX_UPGRADE_SEARCHES
+
+    @staticmethod
+    def _quality_of_file(path: str) -> Tuple[Optional[str], Optional[str]]:
+        """(resolution, source) read from a library file name, then from its folder name."""
+        p = parse(os.path.basename(path))
+        res, src = p.resolution, p.source
+        if not res:
+            q = parse(os.path.basename(os.path.dirname(path)))
+            res, src = q.resolution, src or q.source
+        return res, src
+
+    def current_resolution(self, media: Dict[str, Any]) -> Optional[str]:
+        """Resolution of the movie file in the library: stored at import, else read once from the library file
+        name (cached, "" = unknown). None = unknown (never upgraded)."""
+        stored = media.get("quality_resolution")
+        if stored is not None:
+            return stored or None
+        path = self._find_movie_file(media["title"], media.get("year"), self._alt_titles(media))
+        res, src = self._quality_of_file(path) if path else (None, None)
+        if not self.cfg.general.dry_run:
+            self.db.set_media_quality(int(media["id"]), res or "", src, None, path)
+        return res
+
+    def episode_resolutions(self, media: Dict[str, Any], episodes: List[Dict[str, Any]]) -> Dict[int, Optional[str]]:
+        """{episode id: resolution of its library file} (stored at import, else read once from the library)."""
+        out = {}  # type: Dict[int, Optional[str]]
+        unknown = [e for e in episodes if e.get("quality_resolution") is None]
+        files = self._library_episode_files(media["title"], self._alt_titles(media)) if unknown else {}
+        for e in episodes:
+            stored = e.get("quality_resolution")
+            if stored is None:
+                path = files.get((e["season"], e["episode"]))
+                res, src = self._quality_of_file(path) if path else (None, None)
+                if not self.cfg.general.dry_run:
+                    self.db.set_episode_quality(int(media["id"]), e["season"], e["episode"], res or "", src, None,
+                                                path)
+                stored = res or ""
+            out[e["id"]] = stored or None
+        return out
+
+    def _search_movie_upgrade(self, media: Dict[str, Any], indexers: List["Indexer"], force: bool,
+                              stats: Dict[str, int]) -> None:
+        """Movie in the library below [quality] upgrade_until: search a strictly better resolution."""
+        if not self._upgrades_enabled() or not self._due(media.get("last_search_at"), force):
+            return
+        current = self.current_resolution(media)
+        if not quality.needs_upgrade(current, self.cfg.quality) or self.db.has_active_grab(media["id"]):
+            return
+        if not self._upgrade_budget(stats):
+            return
+        req = self.request_for(media)
+        self._touch_media(media["id"])
+        stats["searched"] += 1
+        stats["upgrade_searched"] = stats.get("upgrade_searched", 0) + 1
+        log.info("Amélioration possible de %s (actuellement %s, jusqu'à %s)", media["title"], current,
+                 self.cfg.quality.upgrade_until)
+        best = self._find_best(req, indexers, current_resolution=current)
+        if best and self.grab(best, media, None, None, upgrade=True):
+            stats["grabbed"] += 1
+            stats["upgrades"] = stats.get("upgrades", 0) + 1
+
+    def _search_show_upgrades(self, media: Dict[str, Any], indexers: List["Indexer"], force: bool,
+                              stats: Dict[str, int]) -> None:
+        """Episodes in the library below [quality] upgrade_until: search a better resolution, one by one."""
+        if not self._upgrades_enabled():
+            return
+        done = [e for e in self.db.list_episodes(media["id"], status="done")
+                if self._due(e.get("last_search_at"), force)]
+        if not done:
+            return
+        resolutions = self.episode_resolutions(media, done)
+        for e in done:
+            if self._stopping() or not self._upgrade_budget(stats):
+                return
+            current = resolutions.get(e["id"])
+            if not quality.needs_upgrade(current, self.cfg.quality):
+                continue
+            if self.db.has_active_grab(media["id"], e["season"], e["episode"]):
+                continue
+            req = self.request_for(media, e["season"], e["episode"])
+            self._touch_episode(e["id"])
+            stats["searched"] += 1
+            stats["upgrade_searched"] = stats.get("upgrade_searched", 0) + 1
+            best = self._find_best(req, indexers, current_resolution=current)
+            if best and self.grab(best, media, e["season"], e["episode"], upgrade=True):
+                stats["grabbed"] += 1
+                stats["upgrades"] = stats.get("upgrades", 0) + 1
+
     # ------------------------------------------------------------ indexer queries
     MAX_EXTRA_TITLES = 2  # other titles searched besides the main one (French title, original title)
 
@@ -626,10 +754,22 @@ class Searcher:
         langs = {x.lower() for x in (req.languages or [])}
         return bool(req.title_fr) and langs == {"fr"} and bool(getattr(self.cfg.quality, "french_title_only", False))
 
-    def queries_for(self, req: SearchRequest) -> List[SearchRequest]:
-        """The searches actually sent to the indexers for *req* (also shown in « Changer de source »)."""
+    def fallback_queries(self, req: SearchRequest) -> List[SearchRequest]:
+        """[quality] french_title_fallback: searches run when the French-title-only search found nothing
+        acceptable (original/main title, id search...), without the one already sent. [] if it does not apply."""
+        if not self.french_title_only_applies(req) or not getattr(self.cfg.quality, "french_title_fallback", True):
+            return []
+
+        def key(q: SearchRequest) -> Tuple[str, Any, Any, Any]:
+            return ((q.title or "").strip().lower(), q.imdb, q.tvdb, q.tmdb)
+        done = {key(q) for q in self.queries_for(req)}
+        return [q for q in self.queries_for(req, widen=True) if key(q) not in done]
+
+    def queries_for(self, req: SearchRequest, widen: bool = False) -> List[SearchRequest]:
+        """The searches actually sent to the indexers for *req* (also shown in « Changer de source »).
+        *widen*: the normal searches even when french_title_only applies (fallback)."""
         import dataclasses
-        if self.french_title_only_applies(req):
+        if not widen and self.french_title_only_applies(req):
             # [quality] french_title_only: one text search with the French title only
             return [dataclasses.replace(req, title=req.title_fr, imdb=None, tmdb=None, tvdb=None,
                                         alt_titles=[t for t in [req.title] + list(req.alt_titles or [])
@@ -672,14 +812,29 @@ class Searcher:
                     results.append(r)
         return results
 
-    def _find_best(self, req: SearchRequest, indexers: List["Indexer"]) -> Optional[Release]:
+    def _pick(self, results: List[Release], req: SearchRequest, indexers: List["Indexer"],
+              current_resolution: Optional[str] = None) -> Optional[Release]:
+        prios = indexer_priorities(indexers)
+        if current_resolution:  # upgrade: strictly better resolution than the library file
+            return quality.pick_upgrade(results, req, self.cfg.quality, current_resolution, self._is_excluded,
+                                        priorities=prios)
+        return quality.pick_best(results, req, self.cfg.quality, self._is_excluded, priorities=prios)
+
+    def _find_best(self, req: SearchRequest, indexers: List["Indexer"],
+                   current_resolution: Optional[str] = None) -> Optional[Release]:
         results = self._collect(req, indexers)
-        best = quality.pick_best(results, req, self.cfg.quality, self._is_excluded,
-                                 priorities=indexer_priorities(indexers))
+        best = self._pick(results, req, indexers, current_resolution)
         if best is None:
-            log.info("Rien de satisfaisant pour %s (%d résultat(s) examiné(s))", req.describe(), len(results))
+            extra = self.fallback_queries(req)
+            if extra:  # [quality] french_title_fallback
+                log.info("%s (%s)", FRENCH_FALLBACK_MESSAGE, req.describe())
+                results = results + self._run_queries(extra, indexers)
+                best = self._pick(results, req, indexers, current_resolution)
+        what = ("amélioration (mieux que %s) " % current_resolution) if current_resolution else ""
+        if best is None:
+            log.info("Rien de satisfaisant %spour %s (%d résultat(s) examiné(s))", what, req.describe(), len(results))
         else:
-            log.info("Meilleur résultat pour %s : %s [%s]", req.describe(), best.title, best.indexer)
+            log.info("Meilleur résultat %spour %s : %s [%s]", what, req.describe(), best.title, best.indexer)
         return best
 
     def _is_excluded(self, release_title: str) -> bool:
@@ -697,27 +852,49 @@ class Searcher:
         return self.db.query_one("SELECT 1 AS x FROM grabs WHERE lower(info_hash) = lower(?) AND status != 'failed'",
                                  (info_hash,)) is not None
 
-    def search_report(self, req: SearchRequest) -> List[Tuple[Release, Optional[int], str]]:
-        """Used by the CLI: every result with its score / rejection reason."""
+    def search_report(self, req: SearchRequest,
+                      info: Optional[Dict[str, Any]] = None) -> List[Tuple[Release, Optional[int], str]]:
+        """Used by the CLI / « Changer de source »: every result with its score / rejection reason.
+        *info* (optional dict) receives "fallback" (True when french_title_only found nothing acceptable and the
+        search was widened, see fallback_queries) and "queries" (the extra searches sent)."""
         indexers = self.indexers_provider()
         results = self._collect(req, indexers)
         priorities = indexer_priorities(indexers)
-        out = []
-        for r in results:
-            score, reason = quality.evaluate(r, req, self.cfg.quality, priorities)
-            if score is not None and self.db.is_blocked(r.title):
-                score, reason = None, "release bloquée (échec précédent)"
-            out.append((r, score, reason))
-        out.sort(key=lambda t: (t[1] is None, -(t[1] or 0)))
+
+        def report(found: List[Release]) -> List[Tuple[Release, Optional[int], str]]:
+            out = []
+            for r in found:
+                score, reason = quality.evaluate(r, req, self.cfg.quality, priorities)
+                if score is not None and self.db.is_blocked(r.title):
+                    score, reason = None, "release bloquée (échec précédent)"
+                out.append((r, score, reason))
+            out.sort(key=lambda t: (t[1] is None, -(t[1] or 0)))
+            return out
+        out = report(results)
+        if info is not None:
+            info.setdefault("fallback", False)
+        if not any(score is not None for _r, score, _x in out):
+            extra = self.fallback_queries(req)
+            if extra:
+                if info is not None:
+                    info["fallback"] = True
+                    info["queries"] = extra
+                seen = {(r.indexer, r.title, r.download_url or r.magnet or r.info_hash) for r in results}
+                more = [r for r in self._run_queries(extra, indexers)
+                        if (r.indexer, r.title, r.download_url or r.magnet or r.info_hash) not in seen]
+                out = report(results + more)
         return out
 
     # ================================================================ grab
     def grab(self, release: Release, media: Optional[Dict[str, Any]], season: Optional[int],
-             episode: Optional[int], error_out: Optional[List[str]] = None, resend: bool = False) -> bool:
+             episode: Optional[int], error_out: Optional[List[str]] = None, resend: bool = False,
+             upgrade: bool = False) -> bool:
         """Send *release* to Download Station and record it. Returns True on success.
         *error_out* (optional list) receives the French reason of a failure.
         *resend*: the user chose this release by hand -> sent again even if the same torrent was sent before
-        (its earlier, unfinished downloads are closed)."""
+        (its earlier, unfinished downloads are closed).
+        *upgrade*: better version of an item already in the library (F3): the grab is marked as an upgrade and
+        the item status is left unchanged."""
         if resend:
             self._resend = True
             try:
@@ -757,14 +934,20 @@ class Searcher:
             if broken and not _is_ds_error(exc) and release.indexer != MANUAL_INDEXER:
                 self.db.block_release(release.title, str(exc)[:200])
             return fail(str(exc) or type(exc).__name__)
-        self.db.add_grab(media["id"] if media else None, season, episode, release.title,
-                         torrent_name or release.title, release.indexer, info_hash or release.info_hash,
-                         release.size or None)
+        grab_id = self.db.add_grab(media["id"] if media else None, season, episode, release.title,
+                                   torrent_name or release.title, release.indexer, info_hash or release.info_hash,
+                                   release.size or None)
         what = label
         if season is not None and episode is not None:
             what += " S%02dE%02d" % (season, episode)
         elif season is not None:
             what += " saison %d" % season
+        if upgrade:
+            self.db.mark_grab_upgrade(grab_id)
+            self.db.add_event("upgrade", "Amélioration de qualité envoyée à Download Station : %s ← %s [%s]"
+                              % (what, release.title, release.indexer))
+            log.info("Amélioration de qualité envoyée à Download Station : %s (%s)", release.title, what)
+            return True
         self.db.add_event("grab", "Envoyé à Download Station : %s ← %s [%s]" % (what, release.title, release.indexer))
         log.info("Envoyé à Download Station : %s (%s)", release.title, what)
         return True
@@ -875,7 +1058,8 @@ class Searcher:
             if g.get("media_id"):
                 media = self.db.get_media(g["media_id"])
                 if media and media["type"] == "movie":
-                    self.db.set_media_status(media["id"], "wanted")
+                    if not g.get("upgrade"):  # a failed upgrade leaves the movie in the library ("done")
+                        self.db.set_media_status(media["id"], "wanted")
                     self.db.execute("UPDATE media SET last_search_at = NULL WHERE id = ?", (media["id"],))
                 elif media and g.get("season") is not None:
                     # back to wanted, except episodes another active download still covers
@@ -1024,8 +1208,158 @@ class Searcher:
         return True
 
 
+    # ================================================================ RSS sync (F4)
+    def rss_sync(self) -> Dict[str, int]:
+        """Sonarr-like RSS sync: the latest releases of every indexer are matched against the wanted items
+        (aired episodes, movies, quality upgrades) with the same filters as a search; the best one per item is
+        sent. Returns counters. Never raises for an indexer error."""
+        stats = {"indexers": 0, "releases": 0, "wanted": 0, "grabbed": 0}
+        lock = try_file_lock(_data_dir(self.cfg), "search.lock")
+        if lock is False:
+            log.info("Une recherche est en cours : synchronisation RSS reportée")
+            stats["skipped"] = 1
+            return stats
+        try:
+            return self._rss_sync(stats)
+        finally:
+            release_file_lock(lock)
+
+    def _rss_sync(self, stats: Dict[str, int]) -> Dict[str, int]:
+        indexers = self.indexers_provider()
+        if not indexers:
+            log.info("Synchronisation RSS : aucun indexer actif")
+            return stats
+        releases = []  # type: List[Release]
+        seen = set()
+        for idx in indexers:
+            if self._stopping():
+                return stats
+            recent = getattr(idx, "recent", None)
+            if recent is None:
+                continue
+            try:
+                found = recent() or []
+            except Exception as exc:  # indexers should not raise, be defensive anyway
+                log.warning("Indexer %s : flux RSS illisible (%s)", getattr(idx, "name", "?"), exc)
+                continue
+            if found:
+                stats["indexers"] += 1
+            for r in found:
+                key = (r.indexer, r.title, r.download_url or r.magnet or r.info_hash)
+                if key not in seen:
+                    seen.add(key)
+                    releases.append(r)
+        stats["releases"] = len(releases)
+        if releases:
+            prepared = [(normalize_title(r.title), parse(r.title), r) for r in releases]
+            priorities = indexer_priorities(indexers)
+            for media in self.db.list_media(on_watchlist_only=True):
+                if self._stopping():
+                    break
+                try:
+                    targets = self._rss_targets(media)
+                    if not targets:
+                        continue
+                    stats["wanted"] += len(targets)
+                    candidates = self._rss_candidates(targets[0][4], prepared)
+                    if candidates:
+                        self._rss_grab(media, targets, candidates, priorities, stats)
+                except Exception as exc:
+                    log.exception("Synchronisation RSS : erreur sur %s : %s", media.get("title"), exc)
+        log.info("Synchronisation RSS : %d release(s) récente(s) de %d indexer(s), %d élément(s) voulu(s), "
+                 "%d envoi(s) vers Download Station", stats["releases"], stats["indexers"], stats["wanted"],
+                 stats["grabbed"])
+        return stats
+
+    def _rss_targets(self, media: Dict[str, Any]) -> List[Tuple[str, Optional[int], Optional[int], Optional[str],
+                                                                 SearchRequest]]:
+        """What this item still needs: [(kind, season, episode, current resolution if upgrade, request)]."""
+        raw = []  # type: List[Tuple[str, Optional[int], Optional[int], Optional[str]]]
+        if media.get("hidden"):
+            return []
+        if media["type"] == "movie":
+            if media["status"] == "wanted":
+                raw.append(("movie", None, None, None))
+            elif media["status"] == "done" and self._upgrades_enabled():
+                current = self.current_resolution(media)
+                if quality.needs_upgrade(current, self.cfg.quality) and not self.db.has_active_grab(media["id"]):
+                    raw.append(("movie", None, None, current))
+        elif media["status"] == "monitored":
+            all_eps = self.db.list_episodes(media["id"])
+            wanted = [e for e in all_eps if e["status"] == "wanted" and _is_aired(e["air_date"])]
+            by_season = {}  # type: Dict[int, List[Dict[str, Any]]]
+            for e in wanted:
+                by_season.setdefault(e["season"], []).append(e)
+            for season, eps in sorted(by_season.items()):
+                complete = all(_is_aired(e["air_date"]) for e in all_eps if e["season"] == season)
+                if self.cfg.series.season_packs and complete and len(eps) >= 2:
+                    raw.append(("season", season, None, None))
+                for e in eps:
+                    raw.append(("episode", season, e["episode"], None))
+            if self._upgrades_enabled():
+                done = [e for e in all_eps if e["status"] == "done"]
+                resolutions = self.episode_resolutions(media, done) if done else {}
+                for e in done:
+                    current = resolutions.get(e["id"])
+                    if quality.needs_upgrade(current, self.cfg.quality) and \
+                            not self.db.has_active_grab(media["id"], e["season"], e["episode"]):
+                        raw.append(("episode", e["season"], e["episode"], current))
+        out = []
+        for kind, season, episode, current in raw:
+            req = self.request_for(media, season, episode)
+            out.append((kind, season, episode, current, req))
+        return out
+
+    @staticmethod
+    def _rss_candidates(req: SearchRequest, prepared: List[Tuple[str, Any, Release]]) -> List[Release]:
+        """Cheap pre-filter: releases named after one of the titles of the item (quality.evaluate decides)."""
+        titles = [normalize_title(t) for t in [req.title, req.title_fr] + list(req.alt_titles or []) if t]
+        titles = [t for t in titles if t]
+        out = []
+        for norm, parsed, rel in prepared:
+            if any(norm == t or norm.startswith(t + " ") for t in titles) or \
+                    titles_match(parsed.title, req.title, list(req.alt_titles or []) + ([req.title_fr] if req.title_fr else [])):
+                out.append(rel)
+        return out
+
+    def _rss_grab(self, media: Dict[str, Any], targets: List[Any], candidates: List[Release],
+                  priorities: Dict[str, int], stats: Dict[str, int]) -> None:
+        grabbed_seasons = set()  # type: set
+        covered = set()  # type: set
+        for kind, season, episode, current, req in targets:
+            if kind == "episode" and (season in grabbed_seasons or (season, episode) in covered):
+                continue
+            if current:
+                best = quality.pick_upgrade(candidates, req, self.cfg.quality, current, self._is_excluded,
+                                            priorities=priorities)
+            else:
+                best = quality.pick_best(candidates, req, self.cfg.quality, self._is_excluded, priorities=priorities)
+            if best is None:
+                continue
+            log.info("Flux RSS : %s correspond à %s%s", best.title, req.describe(),
+                     " (amélioration de %s)" % current if current else "")
+            if not self.grab(best, media, season, episode, upgrade=bool(current)):
+                continue
+            stats["grabbed"] += 1
+            if kind == "movie":
+                if not current:
+                    self.db.execute("UPDATE media SET status = 'grabbed', updated_at = ? WHERE id = ? "
+                                    "AND status = 'wanted'", (now_iso(), media["id"]))
+            elif kind == "season":
+                self.db.set_episode_status(media["id"], season, None, "grabbed", only_if=("wanted",))
+                grabbed_seasons.add(season)
+            else:
+                eps = {episode}
+                if not current:
+                    eps |= set(parse(best.title).episodes)
+                    for ep_num in eps:  # "S01E01E02": both episodes are coming
+                        self.db.set_episode_status(media["id"], season, ep_num, "grabbed", only_if=("wanted",))
+                covered.update((season, e) for e in eps)
+
+
 # ====================================================================== shared helpers
-MANUAL_INDEXER = "manuel"  # Release.indexer of a source chosen by hand (magnet, URL, .torrent file)
+MANUAL_INDEXER = "manuel"
+FRENCH_FALLBACK_MESSAGE = "Aucun résultat avec le titre français : recherche élargie au titre original"  # Release.indexer of a source chosen by hand (magnet, URL, .torrent file)
 
 
 def indexer_priorities(indexers: Optional[List[Any]]) -> Dict[str, int]:

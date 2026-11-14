@@ -231,6 +231,19 @@ class TmdbClient:
         names, anim = self._genres(data)
         return {"genres": names, "is_animation": anim}
 
+    def artwork(self, tmdb_id: str, kind: str) -> Optional[Dict[str, Any]]:
+        """{"poster": URL https (w185) or "", "release_date": "YYYY-MM-DD" (movie) or None} of a movie ("movie")
+        or a show ("show"/"tv"), or None when TMDb did not answer (disabled, unknown id, network error)."""
+        if not self.enabled or not tmdb_id:
+            return None
+        data = self._get("/%s/%s" % ("movie" if kind == "movie" else "tv", tmdb_id))
+        if not data:
+            return None
+        poster = str(data.get("poster_path") or "").strip()
+        release = str(data.get("release_date") or "").strip()[:10] if kind == "movie" else ""
+        return {"poster": self.POSTER_BASE + poster if poster.startswith("/") else "",
+                "release_date": release if re.match(r"^\d{4}-\d\d-\d\d$", release) else None}
+
     def find_by_imdb(self, imdb_id: str) -> Optional[Dict[str, str]]:
         """{"movie": tmdb_id} or {"tv": tmdb_id} for an IMDb id, or None."""
         if not self.enabled or not imdb_id:

@@ -635,3 +635,67 @@ class DetectAndFactoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecentReleasesTests(unittest.TestCase):
+    """F4: Indexer.recent() = latest releases for the RSS sync (never raises)."""
+
+    def test_torznab_recent_without_query(self):
+        items = [{"title": "Lupin.S03E01.MULTi.1080p.WEB.x264-GRP", "n": 1, "size": 1500000000, "seeders": 12,
+                  "peers": 15, "hash": HASH},
+                 {"title": "Some.Movie.2024.1080p.WEB.x264-GRP", "n": 2, "size": 2500000000, "seeders": 3,
+                  "peers": 3, "hash": "b" * 40}]
+        with TorznabServer(items=items) as srv:
+            idx = create_indexer({"id": 1, "name": "Jackett", "type": "torznab", "url": srv.url + "/api",
+                                  "api_key": API_KEY, "categories": ""}, http_client())
+            res = idx.recent()
+            self.assertEqual([r.title for r in res], [it["title"] for it in items])
+            self.assertEqual(res[0].seeders, 12)
+            feed_req = [r for r in srv.requests if r.query.get("t") == "search"][-1]
+            self.assertNotIn("q", feed_req.query)
+            self.assertEqual(feed_req.query["cat"], "5000,2000")
+            self.assertEqual(feed_req.query["limit"], "100")
+            self.assertEqual(feed_req.query["apikey"], API_KEY)
+
+    def test_torznab_recent_uses_configured_categories(self):
+        with TorznabServer(items=[]) as srv:
+            idx = create_indexer({"id": 1, "name": "J", "type": "torznab", "url": srv.url + "/api",
+                                  "api_key": API_KEY, "categories": "5040,2040,3000"}, http_client())
+            self.assertEqual(idx.recent(), [])
+            self.assertEqual(srv.requests[-1].query["cat"], "5040,2040")
+            self.assertEqual(idx.recent_categories(), [5040, 2040])
+            idx.categories = [100001]
+            self.assertEqual(idx.recent_categories(), [100001])
+
+    def test_torznab_recent_errors_return_empty(self):
+        with TorznabServer() as srv:
+            idx = create_indexer({"id": 1, "name": "J", "type": "torznab", "url": srv.url + "/api",
+                                  "api_key": "wrong-key-123", "categories": ""}, http_client())
+            with self.assertLogs("synoarr.indexers.base", level="WARNING") as cm:
+                self.assertEqual(idx.recent(), [])
+            self.assertNotIn("wrong-key-123", "\n".join(cm.output))  # never log the API key
+        idx = create_indexer({"id": 1, "name": "J", "type": "torznab", "url": free_port_url() + "/api",
+                              "api_key": API_KEY}, http_client())
+        with self.assertLogs("synoarr.indexers.base", level="WARNING"):
+            self.assertEqual(idx.recent(), [])
+
+    def test_rss_recent_is_the_feed(self):
+        holder = {}
+
+        def handler(req):
+            return 200, XML, RSS_EZRSS.format(base=holder["base"], hash=HASH, hash_upper=HASH.upper())
+        with FakeServer(handler) as srv:
+            holder["base"] = srv.url
+            idx = create_indexer({"id": 2, "name": "Flux", "type": "rss", "url": srv.url + "/feed"}, http_client())
+            res = idx.recent()
+            self.assertEqual(len(res), 2)  # every item, no title filter
+        with FakeServer(lambda req: (500, {}, b"down")) as srv:
+            idx = create_indexer({"id": 2, "name": "Flux", "type": "rss", "url": srv.url + "/feed"}, http_client())
+            with self.assertLogs("synoarr.indexers.base", level="WARNING"):
+                self.assertEqual(idx.recent(), [])
+
+    def test_internet_archive_has_no_recent_feed(self):
+        with FakeServer(lambda req: (200, {}, IA_JSON)) as srv:
+            idx = create_indexer({"name": "IA", "type": "internet_archive", "url": srv.url}, http_client())
+            self.assertEqual(idx.recent(), [])
+            self.assertEqual(srv.requests, [])
