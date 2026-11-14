@@ -1169,3 +1169,38 @@ class RssSyncTests(SearcherTestBase):
         self.assertEqual(self.searcher.rss_sync()["releases"], 0)
         self.searcher.indexers_provider = lambda: []
         self.assertEqual(self.searcher.rss_sync()["grabbed"], 0)
+
+
+class PerShowMonitorTests(SearcherTestBase):
+    def eps(self) -> List[EpisodeInfo]:
+        return [EpisodeInfo(1, 1, "a", day(-400)), EpisodeInfo(1, 2, "b", day(-390)),
+                EpisodeInfo(2, 1, "c", day(-10)), EpisodeInfo(2, 2, "d", day(20))]
+
+    def test_modes_and_custom(self) -> None:
+        self.show(episodes=self.eps())
+        self.searcher.sync_watchlist()
+        mid = self.media("s1")["id"]
+        self.assertEqual(set(self.statuses("s1").values()), {"wanted"})  # global default: all
+        self.searcher.set_monitor(mid, "future")
+        self.assertEqual(self.statuses("s1"), {(1, 1): "skipped", (1, 2): "skipped", (2, 1): "skipped",
+                                               (2, 2): "wanted"})
+        self.searcher.set_monitor(mid, "latest_season")
+        self.assertEqual(self.statuses("s1"), {(1, 1): "skipped", (1, 2): "skipped", (2, 1): "wanted",
+                                               (2, 2): "wanted"})
+        self.db.set_episode_status(mid, 2, 1, "done")
+        self.searcher.set_monitor(mid, "none")
+        self.assertEqual(self.statuses("s1")[(2, 1)], "done")  # downloaded episodes untouched
+        self.assertEqual(self.statuses("s1")[(2, 2)], "skipped")
+        self.searcher.set_episodes_followed(mid, 1, None, True)  # follow season 1 only
+        self.assertEqual(self.media("s1")["monitor"], "custom")
+        self.assertEqual(self.statuses("s1")[(1, 1)], "wanted")
+        # a new episode of an unfollowed season stays skipped, of a followed one is wanted
+        self.plex.episodes["s1"] = self.eps() + [EpisodeInfo(1, 3, "e", day(-380)), EpisodeInfo(2, 3, "f", day(-1))]
+        self.searcher.sync_watchlist()
+        st = self.statuses("s1")
+        self.assertEqual((st[(1, 3)], st[(2, 3)]), ("wanted", "skipped"))
+        self.searcher.set_monitor(mid, None)  # back to the global default (all)
+        self.assertEqual(self.media("s1")["monitor"], None)
+        self.assertEqual(self.statuses("s1")[(2, 3)], "wanted")
+        with self.assertRaises(ValueError):
+            self.searcher.set_monitor(mid, "bogus")

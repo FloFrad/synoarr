@@ -314,8 +314,14 @@ class Searcher:
                 log.info("Aucune liste d'épisodes pour %s : recherche par saisons complètes", media["title"])
             return
         self._episode_errors.discard(media["id"])
-        first_sync = not self.db.list_episodes(media["id"])
-        policy = self.cfg.series.monitor
+        existing_eps = self.db.list_episodes(media["id"])
+        first_sync = not existing_eps
+        policy = self.monitor_mode(media)
+        # custom mode: a season is "not followed" when it has skipped episodes and nothing wanted/in progress
+        followed_seasons = {e["season"] for e in existing_eps if e["status"] in ("wanted", "grabbed")} | {
+            e["season"] for e in existing_eps
+            if not any(x["season"] == e["season"] and x["status"] == "skipped" for x in existing_eps)}
+        known_seasons = {e["season"] for e in existing_eps}
         added_on = (media.get("added_at") or _today())[:10]
         aired_seasons = sorted({e.season for e in episodes if e.season > 0 and _is_aired(e.air_date)})
         latest = aired_seasons[-1] if aired_seasons else max([e.season for e in episodes] or [1])
@@ -335,9 +341,68 @@ class Searcher:
                 status = "skipped"
             elif policy == "latest_season" and ep.season < latest:
                 status = "skipped"
+            elif policy == "none":
+                status = "skipped"
+            elif policy == "custom" and ep.season in known_seasons and ep.season not in followed_seasons:
+                status = "skipped"  # a season the user stopped following
             self.db.upsert_episode(media["id"], ep.season, ep.episode, ep.title, ep.air_date, status)
             if status == "done":
                 self.db.set_episode_status(media["id"], ep.season, ep.episode, "done", only_if=("wanted",))
+
+    # ------------------------------------------------------------ per-show monitoring
+    MONITOR_MODES = ("all", "future", "latest_season", "none", "custom")
+
+    def monitor_mode(self, media: Dict[str, Any]) -> str:
+        mode = (media.get("monitor") or "").strip().lower()
+        return mode if mode in self.MONITOR_MODES else self.cfg.series.monitor
+
+    def set_monitor(self, media_id: int, mode: Optional[str]) -> Dict[str, int]:
+        """Choose which episodes of a show are followed: all | future (not aired yet) | latest_season | none,
+        or None = [series] monitor. Episodes already downloaded/in progress are never touched.
+        Returns {"wanted": n, "skipped": n} (episodes switched)."""
+        media = self.db.get_media(media_id)
+        if media is None or media.get("type") != "show":
+            raise ValueError("Série introuvable : %s" % media_id)
+        if mode not in (None, "") and mode not in ("all", "future", "latest_season", "none"):
+            raise ValueError("Suivi inconnu : %s (all, future, latest_season, none)" % mode)
+        self.db.execute("UPDATE media SET monitor = ? WHERE id = ?", (mode or None, media_id))
+        effective = mode or self.cfg.series.monitor
+        eps = self.db.list_episodes(media_id)
+        aired = sorted({e["season"] for e in eps if _is_aired(e["air_date"])})
+        latest = aired[-1] if aired else max([e["season"] for e in eps] or [1])
+        today = _today()
+        changed = {"wanted": 0, "skipped": 0}
+        for e in eps:
+            if e["status"] not in ("wanted", "skipped"):
+                continue
+            if effective == "none":
+                follow = False
+            elif effective == "future":
+                follow = not e["air_date"] or e["air_date"][:10] >= today
+            elif effective == "latest_season":
+                follow = e["season"] >= latest
+            else:
+                follow = True
+            new = "wanted" if follow else "skipped"
+            if new != e["status"]:
+                self.db.set_episode_status(media_id, e["season"], e["episode"], new)
+                changed[new] += 1
+        return changed
+
+    def set_episodes_followed(self, media_id: int, season: int, episode: Optional[int], follow: bool) -> int:
+        """Follow / stop following one episode, or a whole season (episode None). Switches the show to the
+        « custom » mode. Downloaded or in-progress episodes are not touched. Returns the number changed."""
+        media = self.db.get_media(media_id)
+        if media is None or media.get("type") != "show":
+            raise ValueError("Série introuvable : %s" % media_id)
+        new, old = ("wanted", "skipped") if follow else ("skipped", "wanted")
+        n = 0
+        for e in self.db.list_episodes(media_id):
+            if e["season"] == int(season) and (episode is None or e["episode"] == int(episode)) and e["status"] == old:
+                self.db.set_episode_status(media_id, e["season"], e["episode"], new)
+                n += 1
+        self.db.execute("UPDATE media SET monitor = 'custom' WHERE id = ?", (media_id,))
+        return n
 
     # ------------------------------------------------------------ library checks
     def _movie_in_library(self, title: str, year: Optional[int], alt_titles: Optional[List[str]] = None) -> bool:

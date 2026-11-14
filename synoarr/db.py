@@ -296,6 +296,7 @@ class Database:
         ("language_override", "TEXT"), # manual languages for this item, e.g. "fr" or "en,fr"
         ("hidden", "INTEGER"),         # 1 = removed by the user but still in the Plex Watchlist (kept hidden)
         ("title_fr", "TEXT"),          # French title (TMDb or typed by the user), "" = none / same as title
+        ("monitor", "TEXT"),           # show monitoring: NULL = [series] monitor, all|future|latest_season|none|custom
         ("poster", "TEXT"),            # web UI poster URL (https, TMDb w185), "" = none, NULL = not looked up
         ("release_date", "TEXT"),      # movie release date YYYY-MM-DD (TMDb), NULL = unknown
     )

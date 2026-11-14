@@ -422,6 +422,8 @@ class WebServer:
             ("POST", r"/api/run/process", self.api_run_process),
             ("POST", r"/api/media/(\d+)/language", self.api_media_language),
             ("POST", r"/api/media/(\d+)/title_fr", self.api_media_title_fr),
+            ("POST", r"/api/media/(\d+)/monitor", self.api_media_monitor),
+            ("POST", r"/api/media/(\d+)/episodes/monitor", self.api_media_episodes_monitor),
             ("GET", r"/api/jobs", self.api_jobs),
             ("POST", r"/api/jobs", self.api_job_start),
             ("GET", r"/api/jobs/(\d+)", self.api_job),
@@ -965,6 +967,41 @@ class WebServer:
             msg += " — un téléchargement est déjà en cours : utilisez « Changer de source » pour une version française"
         return {"ok": True, "languages": value, "title_fr": title_fr, "message": msg}
 
+    MONITOR_LABELS = {"": "par défaut", "all": "tous les épisodes", "future": "nouveaux épisodes seulement",
+                      "latest_season": "dernière saison", "none": "aucun épisode"}
+
+    def api_media_monitor(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        media = self._media_or_404(media_id)
+        mode = self._body_dict(body).get("mode")
+        if mode is None:
+            mode = ""
+        if not isinstance(mode, str) or mode not in self.MONITOR_LABELS:
+            raise HttpProblem(400, "Suivi invalide (valeurs : all, future, latest_season, none, ou vide = par défaut)")
+        changed = self.app.searcher.set_monitor(media_id, mode or None)
+        msg = "Suivi de « %s » : %s" % (media["title"], self.MONITOR_LABELS[mode])
+        if changed["wanted"] or changed["skipped"]:
+            msg += " (%d épisode(s) suivi(s) en plus, %d en moins)" % (changed["wanted"], changed["skipped"])
+        if changed["wanted"] and media.get("status") == "monitored" and hasattr(self.app, "search_now"):
+            self.app.search_now(media_id)
+            msg += " — recherche lancée"
+        return {"ok": True, "changed": changed, "message": msg}
+
+    def api_media_episodes_monitor(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        media = self._media_or_404(media_id)
+        data = self._body_dict(body)
+        season, episode, follow = data.get("season"), data.get("episode"), data.get("monitored")
+        if not isinstance(season, int) or isinstance(season, bool) or season < 0 or \
+                (episode is not None and (not isinstance(episode, int) or isinstance(episode, bool))) or \
+                not isinstance(follow, bool):
+            raise HttpProblem(400, "Paramètres attendus : season (nombre), episode (nombre ou null), monitored (booléen)")
+        n = self.app.searcher.set_episodes_followed(media_id, season, episode, follow)
+        what = "S%02dE%02d" % (season, episode) if episode is not None else "saison %d" % season
+        msg = "%s %s : %s" % (media["title"], what, "suivi" if follow else "non suivi")
+        if follow and n and media.get("status") == "monitored" and hasattr(self.app, "search_now"):
+            self.app.search_now(media_id)
+            msg += " — recherche lancée"
+        return {"ok": True, "changed": n, "message": msg}
+
     def api_media_title_fr(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         media = self._media_or_404(media_id)
         raw = self._body_dict(body).get("title_fr")
@@ -1467,6 +1504,9 @@ V.dash=async()=>{const [s,ev,dl,db]=await Promise.all([api('status'),api('events
   <div class="grid2">${impBlock(db&&db.imports)}<div class="card"><h3>Activité récente</h3>${evList(ev)}</div></div>`};
 const evList=ev=>ev.length?`<ul class="ev">${ev.map(e=>`<li class="lv-${esc(e.level)}"><time>${esc(fdate(e.ts))}</time> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</li>`).join('')}</ul>`:'<p class="mut">Aucun événement.</p>';
 const LANGS=[['','Auto'],['en','Anglais (en)'],['fr','Français (fr)'],['en,fr','Anglais + Français']];
+const MONS=[['','Suivi : par défaut'],['all','Suivi : tous les épisodes'],['future','Suivi : nouveaux seulement'],['latest_season','Suivi : dernière saison'],['none','Suivi : aucun']];
+const monSel=m=>{const v=m.monitor||'';const o=v==='custom'?MONS.concat([['custom','Suivi : personnalisé']]):MONS;
+  return `<select class="lsel" data-mon="${m.id}" title="Épisodes suivis" aria-label="Épisodes suivis">${o.map(x=>`<option value="${x[0]}"${x[0]===v?' selected':''}${x[0]==='custom'?' disabled':''}>${x[1]}</option>`).join('')}</select>`};
 const langSel=m=>{const v=m.language_override||'',o=LANGS.some(l=>l[0]===v)?LANGS:LANGS.concat([[v,v]]);
   return `<select class="lsel" data-lang="${m.id}" title="Langues recherchées" aria-label="Langues recherchées">${o.map(l=>`<option value="${esc(l[0])}"${l[0]===v?' selected':''}>${esc(l[1])}</option>`).join('')}</select>`};
 /* onglets de statut de la Watchlist */
@@ -1503,13 +1543,15 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
   ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
-  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div></div>
+  ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${m.type==='show'?monSel(m):''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div></div>
   ${dls.length?`<div class="dls">${dls.map(d=>dlRow(d,false)).join('')}</div>`:''}
   ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):(ms.length?'<p class="mut card">Aucun élément dans cet onglet.</p>':'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>')}`};
 function epTable(eps,m){if(!eps.length)return '<p class="mut">Aucun épisode connu.</p>';const by={};eps.forEach(e=>(by[e.season]=by[e.season]||[]).push(e));
-  return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}</summary>
+  const fol=e=>e.status!=='skipped',sw=(a)=>a.some(fol);
+  return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}${sw(by[s])?'':' <span class="mut small">(non suivie)</span>'}</summary>
+  <label class="chk efl" title="Suivre / ne plus suivre toute la saison"><input type="checkbox" data-efm="${m.id}" data-s="${esc(s)}" data-e=""${sw(by[s])?' checked':''}> Saison ${esc(s)} suivie</label>
   ${by[s].filter(e=>e.status==='wanted').length>1?`<div class="row spk">${srcBtn(m.id,+s,null,null,m.title+' saison '+s,'','Choisir un pack pour la saison '+esc(s))}</div>`:''}
-  <table class="eps">${by[s].map(e=>`<tr><td>E${pad(e.episode)}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}${e.status==='wanted'?' '+srcBtn(m.id,e.season,e.episode,null,m.title+` S${pad(e.season)}E${pad(e.episode)}`,'','Source…'):''}</td></tr>`).join('')}</table></details>`).join('')}
+  <table class="eps">${by[s].map(e=>`<tr><td class="nw"><input type="checkbox" title="Épisode suivi" aria-label="Suivre E${pad(e.episode)}" data-efm="${m.id}" data-s="${e.season}" data-e="${e.episode}"${fol(e)?' checked':''}${e.status==='done'||e.status==='grabbed'?' disabled':''}> E${pad(e.episode)}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}${e.status==='wanted'?' '+srcBtn(m.id,e.season,e.episode,null,m.title+` S${pad(e.season)}E${pad(e.episode)}`,'','Source…'):''}</td></tr>`).join('')}</table></details>`).join('')}
 /* ------------------------------------------------------------------ À venir */
 let CALD='30';try{CALD=localStorage.getItem('synoarr.cald')||'30'}catch(e){}
 const pday=s=>{const a=String(s).split('-');return new Date(+a[0],+a[1]-1,+a[2])};
@@ -1803,6 +1845,8 @@ app.addEventListener('input',e=>{const id=e.target.id;if(id==='wq'||id==='wf')re
   else if(e.target.dataset.cs||e.target.dataset.cclr)cfUpdate(e.target)});
 app.addEventListener('change',e=>{const t=e.target,id=t.id;
   if(t.dataset.lang)act(()=>api('media/'+t.dataset.lang+'/language','POST',{languages:t.value}));
+  else if(t.dataset.mon)act(()=>api('media/'+t.dataset.mon+'/monitor','POST',{mode:t.value}));
+  else if(t.dataset.efm)act(()=>api('media/'+t.dataset.efm+'/episodes/monitor','POST',{season:+t.dataset.s,episode:t.dataset.e===''?null:+t.dataset.e,monitored:t.checked}));
   else if(t.dataset.sel)selToggle(+t.dataset.sel,t.checked);
   else if(t.dataset.cs||t.dataset.cclr)cfUpdate(t);
   else if(id==='hp'){HP.p=t.value;if(HP.p==='custom'&&!HP.from){HP.from=isoD(new Date(Date.now()-29*864e5));HP.to=HP.to||isoD(new Date())}saveHP();refresh()}
@@ -2129,7 +2173,7 @@ button.xs{font-size:12px;padding:3px 8px}h4{margin:14px 0 6px;font-size:14px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow-y:auto}
 .mbox{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:12px;width:100%;max-width:920px;padding:14px 16px 18px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .mhd{display:flex;justify-content:space-between;align-items:center;gap:10px}.mhd h3{margin:0}.opts{margin:4px 0 6px;gap:6px 16px}
-#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.wtabs{gap:6px;margin:8px 0;align-items:center}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
+#slink{flex:1;min-width:200px}#sfile{flex:1;min-width:0;max-width:100%}.srt{max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:8px}.efl{margin:6px 0}table.eps td:first-child{white-space:nowrap;padding-right:10px}table.eps td:first-child input{margin-right:4px;vertical-align:middle}.wtabs{gap:6px;margin:8px 0;align-items:center}.sfil{gap:6px;align-items:center;margin:6px 0}.sfil input[type=search]{flex:1;min-width:160px}.sfil input[type=number]{width:64px}.mini{font-size:12px;color:var(--mut);white-space:nowrap}.sortb{white-space:nowrap;background:none;border:0;padding:0;color:inherit;font:inherit;font-weight:600;cursor:pointer}.sortb.on{color:var(--ac)}.srt table td,.srt table th{padding:5px 6px}
 body.noscroll{overflow:hidden}#gm .mbox{max-width:760px}.b-local{background:var(--pub);color:var(--puf)}
 .cands{display:flex;flex-direction:column;gap:8px;margin-top:10px}.cand{display:flex;gap:12px;border:1px solid var(--bd);border-radius:8px;padding:8px}
 .cand img,.noimg{width:62px;height:93px;object-fit:cover;border-radius:6px;flex:0 0 62px;background:var(--neb)}.noimg{display:flex;align-items:center;justify-content:center;color:var(--mut)}

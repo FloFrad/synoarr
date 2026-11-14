@@ -2264,3 +2264,27 @@ class CommandCategoriesTest(WebTestBase):
         for w in ("Watchlist & recherche", "Téléchargements", "Connexions & notifications", "Maintenance", "'Autres'"):
             self.assertIn(w, INDEX_JS)
         self.assertIn('id="msearch"', INDEX_HTML)  # manual search moved to the dashboard
+
+
+class MonitorEndpointsTest(RealAppWebBase):
+    def test_monitor_endpoints(self) -> None:
+        self.app.job_watchlist()  # fake Plex: "Test Show" with 5 episodes (one in the future)
+        show = self.app.db.get_media_by_key("s1")
+        searched = []
+        self.app.search_now = lambda mid: searched.append(mid)
+        status, data, _ = self.req("/api/media/%d/monitor" % show["id"], "POST", {"mode": "latest_season"})
+        self.assertEqual(status, 200, data)
+        eps = {(e["season"], e["episode"]): e["status"] for e in self.app.db.list_episodes(show["id"])}
+        self.assertEqual(eps[(1, 1)] in ("skipped", "grabbed", "done"), True)
+        status, data, _ = self.req("/api/media/%d/episodes/monitor" % show["id"], "POST",
+                                   {"season": 2, "episode": None, "monitored": False})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.app.db.get_media(show["id"])["monitor"], "custom")
+        self.assertEqual(self.req("/api/media/%d/monitor" % show["id"], "POST", {"mode": "x"})[0], 400)
+        self.assertEqual(self.req("/api/media/%d/episodes/monitor" % show["id"], "POST",
+                                  {"season": "2", "monitored": True})[0], 400)
+        movie = self.app.db.get_media_by_key("m1")
+        self.assertEqual(self.req("/api/media/%d/monitor" % movie["id"], "POST", {"mode": "all"})[0], 400)
+        from synoarr.web import INDEX_JS
+        self.assertIn("data-mon", INDEX_JS)
+        self.assertIn("data-efm", INDEX_JS)
