@@ -16,13 +16,17 @@ Deux méthodes :
 
 1. **Installer Download Station** : Centre de paquets → rechercher « Download Station » → Installer.
 2. **Activer SSH** : Panneau de configuration → Terminal & SNMP → cocher « Activer le service SSH » → Appliquer.
-3. **Créer un utilisateur dédié** (conseillé : la validation en 2 étapes bloque l'accès par programme) :
-   Panneau de configuration → Utilisateur et groupe → Créer :
-   - Nom : `synoarr`, un mot de passe solide.
-   - Groupe : `users` suffit.
-   - Permissions des dossiers partagés : **Lecture/Écriture** sur `Download` et `video`.
-   - Applications : **Autoriser** Download Station.
-   - Ne pas activer la validation en 2 étapes pour ce compte.
+3. **Choisir le compte DSM utilisé par synoarr pour Download Station.**
+   **Le plus simple et le plus fiable : le même compte que celui avec lequel vous utilisez Download Station** (ou
+   que Prowlarr utilise), à condition qu'il n'ait **pas** la validation en 2 étapes.
+   > Important : Download Station lance chaque tâche avec les droits du compte qui l'a créée. Avec un compte trop
+   > limité, les tâches sont bien créées mais restent « En attente » indéfiniment, sans aucun message d'erreur.
+   > En cas de doute, lancez le « Test d'envoi Download Station » (étape 6).
+
+   Si vous tenez à un compte dédié `synoarr` (Panneau de configuration → Utilisateur et groupe → Créer), donnez-lui
+   au minimum : **Lecture/Écriture** sur `Download` et `video`, l'application **Download Station autorisée**, aucune
+   limite de vitesse (onglet « Limite de vitesse »), pas de validation en 2 étapes — puis vérifiez avec le test
+   d'envoi. Si les tâches restent en attente, ajoutez-le au groupe `administrators` ou utilisez votre compte.
 4. **Noter les chemins exacts de vos dossiers** : File Station → clic droit sur le dossier `Download` →
    Propriétés → « Emplacement » (ex. `/volume1/Download`). Faites de même pour `video`. Attention aux accents
    et aux majuscules : `video`, `Video` et `Vidéos` sont trois dossiers différents.
@@ -351,7 +355,7 @@ Journal : `data/synoarr.log` (consultable dans File Station).
 | Message | Solution |
 |---|---|
 | `Identifiants DSM refusés pour l'utilisateur ...` | vérifiez `username` / `password` dans `[downloadstation]` |
-| `... validation en 2 étapes (2FA) activée ...` | utilisez un compte sans 2FA (utilisateur dédié, étape 1.3) |
+| `... validation en 2 étapes (2FA) activée ...` | utilisez un compte sans 2FA ayant les mêmes droits Download Station que le vôtre (étape 1.3), puis le test d'envoi |
 | `API Download Station absente sur le NAS ...` | Download Station n'est pas installé ou pas démarré |
 | `... Vérifiez [downloadstation] destination ...` | `destination` doit être un dossier partagé existant, sans `/` au début |
 | `Dossier partagé ... introuvable` | corrigez le chemin dans `[paths]` (File Station → Propriétés → Emplacement) |
@@ -359,6 +363,7 @@ Journal : `data/synoarr.log` (consultable dans File Station).
 | `Plex : aucun jeton` | `sudo python3 synoarr.py plex-login` |
 | Rien n'est trouvé | `sudo python3 synoarr.py search "Titre Année"` montre pourquoi chaque résultat est rejeté |
 | L'interface web ne s'ouvre pas | port 8778 bloqué par le pare-feu (étape 1.6), ou port déjà utilisé : changez `[web] port` |
+| Tâches créées par synoarr « En attente » alors qu'un ajout manuel ou via Prowlarr démarre | Le compte DSM de synoarr n'a pas assez de droits dans Download Station : mettez dans `[downloadstation]` le même compte que Prowlarr / que vous (sans 2FA), puis relancez le test d'envoi. Supprimez les anciennes tâches bloquées et utilisez « Changer de source » |
 | Un téléchargement ne démarre pas : synoarr ou Download Station ? | Commandes → « Test d'envoi Download Station » (ou `sudo python3 synoarr.py ds-test`) : synoarr envoie le torrent officiel d'Ubuntu (libre, très partagé) de 3 façons (fichier, lien, magnet), observe chacune 90 s, la supprime et dit lesquelles démarrent sur votre NAS |
 | Téléchargements « En attente » sans fin dans Download Station | Commandes → « Diagnostic Download Station » (ou `sudo python3 synoarr.py ds-diag`). Le plus souvent : Download Station > Paramètres > BitTorrent → cocher « Activer le réseau DHT », et autoriser le port BT (16881 par défaut, TCP+UDP) dans le pare-feu DSM / la box. synoarr ajoute des trackers publics aux liens magnet et remplace un téléchargement sans source après 6 h (`[downloadstation] stalled_hours`) |
 | synoarr ne démarre pas | lisez `data/console.log` et `data/synoarr.log` |

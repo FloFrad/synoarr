@@ -151,9 +151,13 @@ def run(ds: "DownloadStation", http: HttpClient, emit: Emit, torrent_url: str = 
         emit("ok", "Tout fonctionne : synoarr envoie correctement les fichiers .torrent, les liens et les magnets. "
                    "Un téléchargement qui reste « En attente » n'a simplement pas de source disponible.")
     elif not ok:
-        emit("err", "Aucune méthode ne démarre, même avec un torrent très partagé : Download Station n'arrive "
-                    "pas à joindre le réseau BitTorrent (port BT bloqué par le pare-feu DSM ou la box, VPN, "
-                    "limite de bande passante à 0, planification). Ajoutez le même torrent à la main pour comparer.")
+        emit("err", "Aucune méthode ne démarre, même avec un torrent très partagé.")
+        emit("info", "Ajoutez le même torrent à la main dans Download Station (ou envoyez une release via Prowlarr) :")
+        emit("info", "• s'il démarre : c'est le COMPTE DSM de synoarr qui n'a pas assez de droits (cause la plus "
+                     "fréquente). Mettez dans [downloadstation] username/password le même compte que vous ou que "
+                     "Prowlarr (sans validation en 2 étapes), puis relancez ce test.")
+        emit("info", "• s'il reste aussi en attente : Download Station n'arrive pas à joindre le réseau BitTorrent "
+                     "(port BT bloqué par le pare-feu DSM ou la box, VPN, limite de vitesse à 0, planification).")
     else:
         bad = [LABELS[m] for m in methods if m not in ok]
         emit("warn", "Fonctionne : %s. Ne fonctionne pas : %s." % (", ".join(LABELS[m] for m in ok), ", ".join(bad)))

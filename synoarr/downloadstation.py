@@ -353,8 +353,9 @@ class DownloadStation:
                     "(Panneau de configuration > Privilèges d'application)." % user)
         if code in (403, 404, 406):
             return ("Le compte DSM « %s » a la validation en 2 étapes (2FA) activée%s : synoarr ne peut pas saisir "
-                    "de code. Créez un utilisateur DSM dédié sans 2FA, avec accès à Download Station et au dossier "
-                    "de destination, et utilisez-le dans [downloadstation]."
+                    "de code. Utilisez un compte sans 2FA disposant des mêmes droits Download Station que le vôtre "
+                    "(un compte trop limité laisse les tâches « En attente »), puis vérifiez avec Commandes > « Test "
+                    "d'envoi Download Station »."
                     % (user, " (imposée par l'administrateur)" if code == 406 else ""))
         if code == 407:
             return ("L'adresse IP de synoarr est bloquée par DSM (blocage automatique après trop d'échecs) : "
