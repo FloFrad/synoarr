@@ -788,3 +788,67 @@ class VanishedTaskTests(SearcherTestBase):
         self.assertEqual((g["status"], g["message"]), ("failed", "tâche absente de Download Station"))
         self.assertFalse(self.db.is_blocked(rel.title))  # not the release's fault
         self.assertEqual(self.media("m1")["status"], "wanted")
+
+
+class FrenchSearchEndToEndTests(SearcherTestBase):
+    """Reproduces the user's case: an indexer answering id searches with English-named releases only."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.quality.languages = ["en"]
+
+        class Tmdb:
+            enabled = True
+
+            def localized_title(self, tmdb_id: str, kind: str, language: str = "fr-FR") -> Optional[str]:
+                return "Les Évadés"
+
+            def find_by_imdb(self, imdb: str) -> Dict[str, str]:
+                return {"movie": "278"}
+
+            def movie_details(self, tmdb_id: str) -> Dict[str, Any]:
+                return {"collection": None, "genres": ["Drama"], "is_animation": False}
+        self.searcher.tmdb = Tmdb()
+        self.calls = []
+
+        class IdFirstIndexer:
+            name = "Torznab"
+            priority = 25
+
+            def __init__(self, outer: Any) -> None:
+                self.outer = outer
+
+            def rel(self, title: str, seeders: int) -> Release:
+                url = "http://idx/%s.torrent" % title
+                return Release(title=title, indexer=self.name, download_url=url, size=int(2e9), seeders=seeders)
+
+            def search(self, req: Any) -> List[Release]:
+                self.outer.calls.append((req.title, req.imdb))
+                if req.imdb:  # id search: English-named results only
+                    return [self.rel("The.Shawshank.Redemption.1994.1080p.BluRay.x264-EN", 900)]
+                if "vad" in req.title.lower():  # text search with the French title
+                    return [self.rel("Les.Evades.1994.1080p.BluRay.x264-NOTAG", 300),
+                            self.rel("Les.Evades.1994.TRUEFRENCH.1080p.WEB-DL.x264-VF", 100)]
+                return []
+        self.searcher.indexers_provider = lambda: [IdFirstIndexer(self)]
+
+    def test_french_selected_gets_a_french_release(self) -> None:
+        item = WatchItem(rating_key="m9", type="movie", title="The Shawshank Redemption", year=1994,
+                         guids={"imdb": "tt0111161", "tmdb": "278"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        mid = self.media("m9")["id"]
+        self.db.set_language_override(mid, "fr")
+        self.searcher.run_once(media_id=mid, force=True)
+        self.assertIn(("Les Évadés", None), self.calls)  # French title searched as text, without the id
+        grabs = [g["release_title"] for g in self.db.list_grabs()]
+        self.assertEqual(grabs, ["Les.Evades.1994.TRUEFRENCH.1080p.WEB-DL.x264-VF"])  # French title + VF preferred
+
+    def test_english_default_keeps_the_english_release(self) -> None:
+        item = WatchItem(rating_key="m10", type="movie", title="The Shawshank Redemption", year=1994,
+                         guids={"imdb": "tt0111161", "tmdb": "278"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        self.searcher.run_once(media_id=self.media("m10")["id"], force=True)
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
+                         ["The.Shawshank.Redemption.1994.1080p.BluRay.x264-EN"])

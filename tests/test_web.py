@@ -1747,3 +1747,16 @@ class OffWatchlistDashboardTest(RealAppWebBase):
         self.assertFalse(any(d["grab_id"] == gid for d in self.req("/api/downloads")[1]["failed"]))
         from synoarr.web import INDEX_JS
         self.assertIn("data-wst", INDEX_JS)
+
+
+class AddWithLanguageTest(RealAppWebBase):
+    def test_manual_add_with_french_sets_language_before_search(self) -> None:
+        searched = []
+        self.app.search_now = lambda mid: searched.append((mid, self.app.db.get_media(mid)["language_override"]))
+        status, data, _ = self.req("/api/watchlist/manual", "POST",
+                                   {"type": "movie", "title": "Le Fabuleux Destin", "year": 2001, "languages": "fr"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(searched[0][1], "fr")  # language applied before the first search
+        status, data, _ = self.req("/api/watchlist/manual", "POST",
+                                   {"type": "movie", "title": "X", "languages": "fr!"})
+        self.assertEqual(status, 400)

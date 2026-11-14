@@ -627,17 +627,36 @@ class WebServer:
         cand = data.get("candidate")
         if not isinstance(cand, dict):
             raise HttpProblem(400, "Le champ « candidate » (résultat de la recherche) est obligatoire")
+        langs = self._parse_add_languages(data.get("languages"))  # validated before anything is added
         row = self._app_func("add_to_watchlist")(cand, data.get("add_to_plex", True) is not False)
+        self._apply_add_languages(row, langs)
         return self._added(row, data.get("search_now", True) is not False)
+
+    def _apply_add_languages(self, row: Dict[str, Any], value: Optional[str]) -> None:
+        """Languages chosen in the « Ajouter » window, applied BEFORE the first search."""
+        if value and row.get("id"):
+            self.app.db.set_language_override(int(row["id"]), value)
+
+    def _parse_add_languages(self, raw: Any) -> Optional[str]:
+        if raw in (None, ""):
+            return None
+        if not isinstance(raw, str):
+            raise HttpProblem(400, "Le champ « languages » doit être une chaîne (ex. \"fr\")")
+        value = ",".join(x.strip().lower() for x in raw.replace(";", ",").split(",") if x.strip())
+        if value and not _LANG_LIST.match(value):
+            raise HttpProblem(400, "Langues invalides : codes de 2 à 6 lettres séparés par des virgules (ex. en,fr)")
+        return value or None
 
     def api_watchlist_manual(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         data = self._body_dict(body)
         for k in ("type", "title", "imdb", "tmdb"):
             if data.get(k) is not None and not isinstance(data.get(k), str):
                 raise HttpProblem(400, "Champ « %s » invalide" % k)
+        langs = self._parse_add_languages(data.get("languages"))
         row = self._app_func("add_manual")(data.get("type") or "", data.get("title") or "", data.get("year"),
                                            (data.get("imdb") or "").strip() or None,
                                            (data.get("tmdb") or "").strip() or None)
+        self._apply_add_languages(row, langs)
         return self._added(row, data.get("search_now", True) is not False)
 
     def api_media_remove(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
@@ -699,6 +718,13 @@ class WebServer:
         msg = "Langues de « %s » : %s" % (media["title"], label)
         if title_fr:
             msg += " — recherche aussi sous le titre français « %s »" % title_fr
+        fresh = self.app.db.get_media(media_id) or media
+        if fresh.get("on_watchlist", 1) and fresh.get("status") in ("wanted", "monitored") and \
+                hasattr(self.app, "search_now"):
+            self.app.search_now(media_id)
+            msg += " — nouvelle recherche lancée"
+        elif fresh.get("status") == "grabbed":
+            msg += " — un téléchargement est déjà en cours : utilisez « Changer de source » pour une version française"
         return {"ok": True, "languages": value, "title_fr": title_fr, "message": msg}
 
     def api_media_title_fr(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
@@ -1379,7 +1405,8 @@ function openGM(kind,title,html){GM={kind,res:[]};$('#gmh').textContent=title;$(
 function closeGM(){GM=null;gm.hidden=true;if(!SRC)document.body.classList.remove('noscroll')}
 function openAdd(){openGM('add','Ajouter à la Watchlist',`<form id="wsf" class="row" autocomplete="off"><input id="wsq" type="search" placeholder="Titre du film ou de la série" required maxlength="200" aria-label="Titre">
   <select id="wsk" aria-label="Type"><option value="">Tous</option><option value="movie">Film</option><option value="show">Série</option></select><input id="wsy" class="yr" type="number" min="1870" max="2100" placeholder="Année" aria-label="Année (facultatif)"><button type="submit">Rechercher</button></form>
-  <div class="row opts"><label class="chk"><input type="checkbox" id="wsp" checked> Ajouter aussi à la Watchlist Plex</label><label class="chk"><input type="checkbox" id="wsn" checked> Rechercher un téléchargement tout de suite</label></div>
+  <div class="row opts"><label class="chk"><input type="checkbox" id="wsp" checked> Ajouter aussi à la Watchlist Plex</label><label class="chk"><input type="checkbox" id="wsn" checked> Rechercher un téléchargement tout de suite</label>
+  <label class="chk">Langue <select id="wsl" aria-label="Langue du téléchargement"><option value="">Auto</option><option value="en">Anglais (en)</option><option value="fr">Français (fr)</option><option value="en,fr">Anglais + Français</option></select></label></div>
   <div id="wsm"></div><div id="wsr"><p class="mut small">Recherche dans Plex (Découvrir) et TMDb si une clé est configurée.</p></div>
   <details><summary>Ajout manuel (sans recherche)</summary><form id="wmf" class="add" autocomplete="off"><select id="wmt" aria-label="Type"><option value="movie">Film</option><option value="show">Série</option></select>
   <input id="wmn" placeholder="Titre" required maxlength="200" aria-label="Titre"><input id="wmy" type="number" min="1870" max="2100" placeholder="Année (facultatif)" aria-label="Année"><input id="wmi" placeholder="IMDb, ex. tt0133093 (facultatif)" aria-label="Identifiant IMDb">
@@ -1395,10 +1422,10 @@ async function wSearch(){const q=$('#wsq').value.trim();if(!q)return;const r0=$(
 function wDone(r){const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ok">✔ ${esc(r.message)}</div>${r.warning?`<div class="msg wa">${esc(r.warning)}</div>`:''}`;
   toast(r.message+(r.warning?' — '+r.warning:''));refresh()}
 async function wAdd(i,b){const c=GM&&GM.res[i];if(!c)return;b.disabled=true;b.textContent='Ajout…';
-  try{const r=await api('watchlist/add','POST',{candidate:c,add_to_plex:$('#wsp').checked,search_now:$('#wsn').checked});b.textContent='Ajouté ✔';wDone(r)}
+  try{const r=await api('watchlist/add','POST',{candidate:c,add_to_plex:$('#wsp').checked,search_now:$('#wsn').checked,languages:$('#wsl').value});b.textContent='Ajouté ✔';wDone(r)}
   catch(e){b.disabled=false;b.textContent='Ajouter';toast(e.message,true);const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ko">✖ ${esc(e.message)}</div>`}}
 async function wManual(){const b=$('#wmf button');b.disabled=true;
-  try{const r=await api('watchlist/manual','POST',{type:$('#wmt').value,title:$('#wmn').value.trim(),year:$('#wmy').value||null,imdb:$('#wmi').value.trim(),search_now:$('#wsn').checked});$('#wmf').reset();wDone(r)}
+  try{const r=await api('watchlist/manual','POST',{type:$('#wmt').value,title:$('#wmn').value.trim(),year:$('#wmy').value||null,imdb:$('#wmi').value.trim(),search_now:$('#wsn').checked,languages:$('#wsl').value});$('#wmf').reset();wDone(r)}
   catch(e){toast(e.message,true);const m=$('#wsm');if(m)m.innerHTML=`<div class="msg ko">✖ ${esc(e.message)}</div>`}b.disabled=false}
 async function openIdxEdit(id){let i;try{i=await api('indexers/'+id)}catch(e){toast(e.message,true);return}
   const opt=(v,l)=>`<option value="${v}"${i.type===v?' selected':''}>${l}</option>`;

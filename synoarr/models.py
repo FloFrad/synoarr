@@ -43,6 +43,8 @@ class SearchRequest:
     alt_titles: List[str] = field(default_factory=list)
     # accepted audio languages for this request (empty = [quality] languages)
     languages: List[str] = field(default_factory=list)
+    # French title of the work when French is wanted (French releases are named after it)
+    title_fr: Optional[str] = None
 
     def query_string(self) -> str:
         """Free-text query used by indexers that do not support id search."""

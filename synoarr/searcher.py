@@ -477,6 +477,12 @@ class Searcher:
                 alts.insert(0, fr)
         return alts
 
+    def _title_fr_if_wanted(self, media: Dict[str, Any]) -> Optional[str]:
+        if "fr" not in self.languages_for(media):
+            return None
+        fr = self.french_title(media)
+        return fr if fr and fr.strip().lower() != (media.get("title") or "").strip().lower() else None
+
     def french_title(self, media: Dict[str, Any]) -> Optional[str]:
         """French title: typed by the user or fetched once from TMDb (cached in the database)."""
         cached = media.get("title_fr")
@@ -507,7 +513,7 @@ class Searcher:
         if not self._due(media.get("last_search_at"), force):
             return
         req = SearchRequest(languages=self.languages_for(media), kind="movie", title=media["title"], year=media.get("year"), imdb=media.get("imdb"),
-                            tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media))
+                            tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media), title_fr=self._title_fr_if_wanted(media))
         self._touch_media(media["id"])
         stats["searched"] += 1
         best = self._find_best(req, indexers)
@@ -545,7 +551,7 @@ class Searcher:
             if self.cfg.series.season_packs and season_complete and len(eps) >= 2:
                 req = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"), season=season,
                                     imdb=media.get("imdb"), tvdb=media.get("tvdb"), tmdb=media.get("tmdb"),
-                                    alt_titles=self._alt_titles(media))
+                                    alt_titles=self._alt_titles(media), title_fr=self._title_fr_if_wanted(media))
                 stats["searched"] += 1
                 best = self._find_best(req, indexers)
                 if best and self.grab(best, media, season, None):
@@ -563,7 +569,7 @@ class Searcher:
                     continue  # covered by a multi-episode release grabbed just before
                 req = SearchRequest(languages=self.languages_for(media), kind="episode", title=media["title"], year=media.get("year"), season=season,
                                     episode=e["episode"], imdb=media.get("imdb"), tvdb=media.get("tvdb"),
-                                    tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media))
+                                    tmdb=media.get("tmdb"), alt_titles=self._alt_titles(media), title_fr=self._title_fr_if_wanted(media))
                 self._touch_episode(e["id"])
                 stats["searched"] += 1
                 best = self._find_best(req, indexers)
@@ -587,10 +593,10 @@ class Searcher:
             if pr.is_season_pack:
                 grabbed_seasons.update(pr.seasons)  # "S01-S03" pack covers 3 seasons
         base = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"),
-                             alt_titles=self._alt_titles(media))
+                             alt_titles=self._alt_titles(media), title_fr=self._title_fr_if_wanted(media))
         stats["searched"] += 1
         results = self._collect(SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], season=None,
-                                              alt_titles=base.alt_titles), indexers)
+                                              alt_titles=base.alt_titles, title_fr=base.title_fr), indexers)
         seasons = set()
         for r in results:
             pr = parse(r.title)
@@ -600,7 +606,7 @@ class Searcher:
             if season in grabbed_seasons:
                 continue
             req = SearchRequest(languages=self.languages_for(media), kind="season", title=media["title"], year=media.get("year"), season=season,
-                                alt_titles=base.alt_titles)
+                                alt_titles=base.alt_titles, title_fr=base.title_fr)
             best = quality.pick_best(results, req, self.cfg.quality, self._is_excluded,
                                      priorities=indexer_priorities(indexers))
             if best and self.grab(best, media, season, None):
@@ -620,8 +626,9 @@ class Searcher:
             key = (alt or "").strip().lower()
             if key and key not in seen_titles and len(queries) <= self.MAX_EXTRA_TITLES:
                 seen_titles.add(key)
-                queries.append(dataclasses.replace(req, title=alt, alt_titles=[req.title] + [
-                    a for a in req.alt_titles if a != alt]))
+                # text search only: an id search (imdbid/tvdbid) would return the same English-named results
+                queries.append(dataclasses.replace(req, title=alt, imdb=None, tmdb=None, tvdb=None,
+                                                   alt_titles=[req.title] + [a for a in req.alt_titles if a != alt]))
         results: List[Release] = []
         seen = set()
         for q in queries:
@@ -871,7 +878,8 @@ class Searcher:
                     episode: Optional[int] = None) -> SearchRequest:
         """SearchRequest for exactly this movie / season pack / episode (languages of the item)."""
         common = dict(title=media["title"], year=media.get("year"), imdb=media.get("imdb"), tmdb=media.get("tmdb"),
-                      alt_titles=self._alt_titles(media), languages=self.languages_for(media))  # type: Dict[str, Any]
+                      alt_titles=self._alt_titles(media), languages=self.languages_for(media),
+                      title_fr=self._title_fr_if_wanted(media))  # type: Dict[str, Any]
         if media.get("type") == "movie":
             return SearchRequest(kind="movie", **common)
         common["tvdb"] = media.get("tvdb")

@@ -40,6 +40,10 @@ MB = 1024 * 1024
 GB = 1024 * MB
 
 RESOLUTION_WEIGHT = 1000000
+# French wanted: a release named after the French title, and an explicit French-audio tag, are preferred
+FRENCH_TITLE_BONUS = 20000
+VF_BONUS = 15000
+VF_WORDS = ("vff", "vf", "vf2", "vfi", "truefrench", "french")
 LANGUAGE_MAX = 400000
 MULTI_BONUS = 80000
 SOURCE_WEIGHT = 11000  # > 49 x PRIORITY_STEP + SEEDERS_MAX + 200 (size): priority never beats a source step
@@ -269,6 +273,7 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig,
     if p.source in _BAD_SOURCES:
         return None, "source %s refusée" % _SOURCE_LABELS.get(p.source, p.source)
     tail = _tail_after_title(title, p.title)
+    tail_words = tail
     wanted_norm = " %s " % normalize_title(request.title)
     for word in cfg.reject_words:
         nw = normalize_title(word)
@@ -289,10 +294,23 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig,
     # unknown resolution: accepted, no resolution points (low score)
 
     # --- language
-    lang_points, reason = _language_points(p.languages, request.languages or cfg.languages)
+    wanted_langs = [w.lower() for w in (request.languages or cfg.languages)]
+    langs = list(p.languages)
+    fr_title = bool(request.title_fr) and titles_match(p.title, request.title_fr) and \
+        not titles_match(p.title, request.title)
+    if not langs and fr_title:
+        langs = ["fr"]  # named after the French title without a language tag: a French release
+    lang_points, reason = _language_points(langs, wanted_langs)
     if lang_points is None:
         return None, reason
     score += lang_points
+    vf = False
+    if "fr" in wanted_langs:
+        if fr_title:
+            score += FRENCH_TITLE_BONUS
+        vf = any(_has_word(tail_words, w) for w in VF_WORDS)
+        if vf:
+            score += VF_BONUS
 
     # --- seeders
     if release.seeders is not None and release.seeders < cfg.min_seeders:
@@ -321,7 +339,11 @@ def evaluate(release: Release, request: SearchRequest, cfg: QualityConfig,
     parts = [p.resolution or "résolution inconnue"]
     if p.source:
         parts.append(p.source)
-    parts.append("/".join(p.languages) if p.languages else "VO")
+    parts.append("/".join(langs) if langs else "VO")
+    if fr_title and "fr" in wanted_langs:
+        parts.append("titre français")
+    if vf:
+        parts.append("VF")
     if release.seeders is not None:
         parts.append("%d seeders" % release.seeders)
     return score, "acceptée (%s)" % ", ".join(parts)
