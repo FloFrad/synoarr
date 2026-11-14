@@ -257,6 +257,7 @@ class WebServer:
             ("POST", r"/api/run/watchlist", self.api_run_watchlist),
             ("POST", r"/api/run/process", self.api_run_process),
             ("POST", r"/api/media/(\d+)/language", self.api_media_language),
+            ("POST", r"/api/media/(\d+)/title_fr", self.api_media_title_fr),
             ("GET", r"/api/jobs", self.api_jobs),
             ("POST", r"/api/jobs", self.api_job_start),
             ("GET", r"/api/jobs/(\d+)", self.api_job),
@@ -687,7 +688,32 @@ class WebServer:
             raise HttpProblem(400, "Langues invalides : codes de 2 à 6 lettres séparés par des virgules (ex. en,fr)")
         self.app.db.set_language_override(media_id, value or None)
         label = value or "automatique"
-        return {"ok": True, "languages": value, "message": "Langues de « %s » : %s" % (media["title"], label)}
+        title_fr = None
+        searcher = getattr(self.app, "searcher", None)
+        if searcher is not None and hasattr(searcher, "french_title") and "fr" in searcher.languages_for(
+                self.app.db.get_media(media_id) or media):
+            try:  # one TMDb call: the French title is shown at once and searched on the indexers
+                title_fr = searcher.french_title(self.app.db.get_media(media_id) or media)
+            except Exception:  # pragma: no cover - TMDb down: fetched again at the next search
+                title_fr = None
+        msg = "Langues de « %s » : %s" % (media["title"], label)
+        if title_fr:
+            msg += " — recherche aussi sous le titre français « %s »" % title_fr
+        return {"ok": True, "languages": value, "title_fr": title_fr, "message": msg}
+
+    def api_media_title_fr(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        media = self._media_or_404(media_id)
+        raw = self._body_dict(body).get("title_fr")
+        if raw is not None and not isinstance(raw, str):
+            raise HttpProblem(400, "Le champ « title_fr » doit être une chaîne")
+        value = (raw or "").strip()[:300]
+        if value:
+            self.app.db.set_title_fr(media_id, value)
+            msg = "Titre français de « %s » : %s" % (media["title"], value)
+        else:  # empty: forget it, looked up again on TMDb at the next search
+            self.app.db.execute("UPDATE media SET title_fr = NULL WHERE id = ?", (media_id,))
+            msg = "Titre français de « %s » effacé (recherché à nouveau sur TMDb)" % media["title"]
+        return {"ok": True, "title_fr": value, "message": msg}
 
     # ------------------------------------------------------------- commandes
     @staticmethod
@@ -1005,7 +1031,7 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${m.collection?`<span class="mut">Collection : ${esc(m.collection)}</span>`:''}
   ${e?`<span class="mut">${e.done}/${e.total} épisodes · ${e.wanted} recherchés${e.grabbed?' · '+e.grabbed+' en cours':''}</span>`:''}
   ${m.last_search_at?`<span class="mut">dernière recherche ${esc(fdate(m.last_search_at))}</span>`:''}
-  <span class="mut">langues : ${esc((m.languages||[]).join(', ')||'—')} (${m.language_override?'manuel':'auto'})</span></div>
+  <span class="mut">langues : ${esc((m.languages||[]).join(', ')||'—')} (${m.language_override?'manuel':'auto'})</span>${(m.languages||[]).includes('fr')?` <span class="mut">· titre FR : ${m.title_fr?esc(m.title_fr):'<i>inconnu</i>'}</span> <button class="xs sec" data-tfr="${m.id}" data-v="${esc(m.title_fr||'')}" title="Titre utilisé en plus pour chercher les releases françaises">modifier</button>`:''}</div>
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
   ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
@@ -1223,6 +1249,8 @@ app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return
   else if(d.wadd)openAdd();
   else if(d.wdel)openDel(d);
   else if(d.ltf&&d.lts==='srch'){LTF.srch=d.ltf;if(srch&&jobs[srch])drawSearch(jobs[srch])}
+  else if(d.tfr){const v=prompt('Titre français utilisé pour chercher les releases françaises (vide = recherche automatique sur TMDb) :',d.v||'');
+    if(v!==null)act(()=>api('media/'+d.tfr+'/title_fr','POST',{title_fr:v}))}
   else if(d.iedit)openIdxEdit(d.iedit);
   else if(d.pd)setPrio(d.pd,d.v);
   else if(d.prws)prwSync();

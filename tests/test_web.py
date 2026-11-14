@@ -1709,3 +1709,18 @@ class DefaultSendModeTest(RealAppWebBase):
         self.assertEqual(self.world.url_adds, [])  # no indexer link handed to Download Station
         from synoarr.web import INDEX_JS
         self.assertIn("data-ltf", INDEX_JS)  # .torrent / magnet filters
+
+
+class FrenchTitleWebTest(RealAppWebBase):
+    def test_title_fr_endpoint(self) -> None:
+        mid = self.app.db.upsert_media("m42", "movie", "The Shawshank Redemption", 1994, None, None, None)
+        status, data, _ = self.req("/api/media/%d/title_fr" % mid, "POST", {"title_fr": "Les Évadés"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self.app.db.get_media(mid)["title_fr"], "Les Évadés")
+        self.req("/api/media/%d/language" % mid, "POST", {"languages": "fr"})
+        m = [x for x in self.req("/api/media")[1] if x["id"] == mid][0]
+        self.assertEqual((m["title_fr"], m["languages"]), ("Les Évadés", ["fr"]))
+        self.assertIn("Les Évadés", self.app.searcher.request_for(self.app.db.get_media(mid)).alt_titles)
+        self.req("/api/media/%d/title_fr" % mid, "POST", {"title_fr": ""})
+        self.assertIsNone(self.app.db.get_media(mid)["title_fr"])
+        self.assertEqual(self.req("/api/media/%d/title_fr" % mid, "POST", {"title_fr": 5})[0], 400)

@@ -466,10 +466,41 @@ class Searcher:
         return (_dt.datetime.now() - last).total_seconds() >= self.cfg.general.research_interval_hours * 3600
 
     def _alt_titles(self, media: Dict[str, Any]) -> List[str]:
+        """Other titles of the work, also searched on the indexers: original title, and the French title when
+        French is one of the item's languages (French releases are named after the French title)."""
         alts = []
         if media.get("original_title") and media["original_title"] != media["title"]:
             alts.append(media["original_title"])
+        if "fr" in self.languages_for(media):
+            fr = self.french_title(media)
+            if fr and fr.strip().lower() != (media.get("title") or "").strip().lower() and fr not in alts:
+                alts.insert(0, fr)
         return alts
+
+    def french_title(self, media: Dict[str, Any]) -> Optional[str]:
+        """French title: typed by the user or fetched once from TMDb (cached in the database)."""
+        cached = media.get("title_fr")
+        if cached is not None:
+            return cached or None
+        if self.tmdb is None or not getattr(self.tmdb, "enabled", False) or not media.get("id"):
+            return None
+        kind = "movie" if media.get("type") == "movie" else "show"
+        title = None
+        try:
+            tmdb_id = media.get("tmdb")
+            if not tmdb_id and media.get("imdb") and hasattr(self.tmdb, "find_by_imdb"):
+                found = self.tmdb.find_by_imdb(media["imdb"]) or {}
+                tmdb_id = found.get("movie" if kind == "movie" else "tv")
+            if tmdb_id and hasattr(self.tmdb, "localized_title"):
+                title = self.tmdb.localized_title(str(tmdb_id), kind, "fr-FR")
+        except Exception as exc:
+            log.debug("Titre français indisponible pour %s : %s", media.get("title"), exc)
+            return None
+        self.db.set_title_fr(int(media["id"]), title or "")
+        media["title_fr"] = title or ""
+        if title and title != media.get("title"):
+            log.info("Titre français de %s : %s", media.get("title"), title)
+        return title or None
 
     def _search_movie(self, media: Dict[str, Any], indexers: List["Indexer"], force: bool,
                       stats: Dict[str, int]) -> None:
@@ -577,16 +608,36 @@ class Searcher:
                 grabbed_seasons.update(parse(best.title).seasons)  # "S01-S03" pack covers 3 seasons
 
     # ------------------------------------------------------------ indexer queries
+    MAX_EXTRA_TITLES = 2  # other titles searched besides the main one (French title, original title)
+
     def _collect(self, req: SearchRequest, indexers: List["Indexer"]) -> List[Release]:
+        """Results of every indexer for the main title, then for the other titles (French / original title):
+        a French release is named after the French title and is not found with the English one."""
+        import dataclasses
+        queries = [req]
+        seen_titles = {(req.title or "").strip().lower()}
+        for alt in req.alt_titles or []:
+            key = (alt or "").strip().lower()
+            if key and key not in seen_titles and len(queries) <= self.MAX_EXTRA_TITLES:
+                seen_titles.add(key)
+                queries.append(dataclasses.replace(req, title=alt, alt_titles=[req.title] + [
+                    a for a in req.alt_titles if a != alt]))
         results: List[Release] = []
-        for idx in indexers:
-            try:
-                found = idx.search(req)
-            except Exception as exc:  # indexers should not raise, be defensive anyway
-                log.warning("Indexer %s : erreur %s", getattr(idx, "name", "?"), exc)
-                continue
-            log.debug("Indexer %s : %d résultat(s) pour %s", idx.name, len(found), req.describe())
-            results.extend(found)
+        seen = set()
+        for q in queries:
+            for idx in indexers:
+                try:
+                    found = idx.search(q)
+                except Exception as exc:  # indexers should not raise, be defensive anyway
+                    log.warning("Indexer %s : erreur %s", getattr(idx, "name", "?"), exc)
+                    continue
+                log.debug("Indexer %s : %d résultat(s) pour %s", idx.name, len(found), q.describe())
+                for r in found:
+                    key = (r.indexer, r.title, r.download_url or r.magnet or r.info_hash)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(r)
         return results
 
     def _find_best(self, req: SearchRequest, indexers: List["Indexer"]) -> Optional[Release]:

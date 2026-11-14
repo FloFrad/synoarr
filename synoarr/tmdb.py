@@ -242,6 +242,16 @@ class TmdbClient:
                 return {kind: str(res[0]["id"])}
         return None
 
+    def localized_title(self, tmdb_id: str, kind: str, language: str = "fr-FR") -> Optional[str]:
+        """Title of a movie ("movie") or show ("show"/"tv") in *language* (e.g. the French release title)."""
+        if not self.enabled or not tmdb_id:
+            return None
+        data = self._get("/%s/%s" % ("movie" if kind == "movie" else "tv", tmdb_id), language=language)
+        if not data:
+            return None
+        title = str(data.get("title") or data.get("name") or "").strip()
+        return title or None
+
     def episode_title(self, tmdb_id: str, season: int, episode: int) -> Optional[str]:
         if not self.enabled or not tmdb_id:
             return None

@@ -276,6 +276,7 @@ class Database:
         ("is_animation", "INTEGER"),   # 1 = animated (languages_animation applies), NULL = unknown
         ("language_override", "TEXT"), # manual languages for this item, e.g. "fr" or "en,fr"
         ("hidden", "INTEGER"),         # 1 = removed by the user but still in the Plex Watchlist (kept hidden)
+        ("title_fr", "TEXT"),          # French title (TMDb or typed by the user), "" = none / same as title
     )
 
     def _migrate(self) -> None:
@@ -301,8 +302,13 @@ class Database:
         if sets:
             self.execute("UPDATE media SET %s WHERE id = ?" % ", ".join(sets), params + [media_id])
 
+    def set_title_fr(self, media_id: int, title: Optional[str]) -> None:
+        self.execute("UPDATE media SET title_fr = ? WHERE id = ?", ((title or "").strip(), media_id))
+
     def set_language_override(self, media_id: int, languages: Optional[str]) -> None:
         self.execute("UPDATE media SET language_override = ? WHERE id = ?", (languages or None, media_id))
+        # French chosen: look the French title up again if it was not known
+        self.execute("UPDATE media SET title_fr = NULL WHERE id = ? AND title_fr = ''", (media_id,))
 
     def upsert_media(self, plex_key: str, type_: str, title: str, year: Optional[int], imdb: Optional[str],
                      tmdb: Optional[str], tvdb: Optional[str], original_title: Optional[str] = None) -> int:
