@@ -636,9 +636,13 @@ class WebCommandsTest(RealAppWebBase):
         movie = self.app.db.get_media_by_key("m1")
         self.assertEqual(movie["status"], "grabbed")
         self.assertEqual(self.app.db.list_grabs()[0]["media_id"], movie["id"])
+        # chosen again by hand: sent again (e.g. task deleted in Download Station), the older grab is closed
         status, data, _ = self.req("/api/jobs/%d/grab" % jid, "POST", {"index": by_title[MOVIE]["index"]})
-        self.assertEqual((status, data["ok"]), (200, False))  # déjà envoyé
-        self.assertEqual(len(self.world.uploads), 1)
+        self.assertEqual((status, data["ok"]), (200, True))
+        self.assertEqual(len(self.world.uploads), 2)
+        grabs = self.app.db.list_grabs()
+        self.assertEqual([g["status"] for g in grabs], ["sent", "failed"])
+        self.assertEqual(grabs[1]["message"], "renvoyé manuellement")
         self.assertEqual(self.req("/api/jobs/%d/grab" % jid, "POST", {"index": 999})[0], 400)
         self.assertEqual(self.req("/api/jobs/%d/grab" % jid, "POST", {})[0], 400)
         other = self.run_cmd("test_indexers")

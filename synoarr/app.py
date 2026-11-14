@@ -1328,7 +1328,7 @@ class App:
             raise ValueError("Download Station n'est pas configuré ([downloadstation] username/password)")
         media, season, episodes = self._match_media(rel.title)
         episode = episodes[0] if episodes else None
-        if not self.searcher.grab(rel, media, season, episode):
+        if not self.searcher.grab(rel, media, season, episode, resend=True):
             return {"ok": False, "message": "Envoi impossible : release déjà envoyée ou erreur (voir le journal)"}
         if media is not None:
             if media["type"] == "movie":
@@ -1556,6 +1556,12 @@ class App:
 
     def _cmd_sources(self, job: Job, target: Tuple[int, Optional[int], Optional[int]], req: Any) -> Dict[str, Any]:
         job.emit("info", "Recherche : %s (langues : %s)" % (req.describe(), ", ".join(req.languages) or "—"))
+        titles = []  # type: List[str]
+        for t in [req.title, req.title_fr] + list(req.alt_titles or []):
+            if t and t.strip().lower() not in [x.lower() for x in titles]:
+                titles.append(t.strip())
+        if len(titles) > 1:
+            job.emit("info", "Titres cherchés : %s" % " · ".join(titles[:4]))
         if not self.db.list_indexers(enabled_only=True):
             job.emit("warn", "Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
         report = self.searcher.search_report(req)[:300]
@@ -1572,6 +1578,7 @@ class App:
         accepted = sum(1 for r in results if r["score"] is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(results), accepted))
         return {"media_id": target[0], "season": target[1], "episode": target[2], "request": req.describe(),
+                "titles": titles[:4],
                 "kind": req.kind, "languages": list(req.languages), "total": len(results), "results": results}
 
     LINK_PROBE_MAX = 40  # results whose link is checked (best first)
@@ -1693,9 +1700,10 @@ class App:
         last_id = (self.db.query_one("SELECT MAX(id) AS m FROM grabs") or {}).get("m") or 0
         try:
             if release is not None:
-                ok = self.searcher.grab(release, media, season, episode, error_out=errors)
+                ok = self.searcher.grab(release, media, season, episode, error_out=errors, resend=True)
             else:
-                ok = self.searcher.grab_torrent_bytes(torrent or b"", media, season, episode, error_out=errors)
+                ok = self.searcher.grab_torrent_bytes(torrent or b"", media, season, episode, error_out=errors,
+                                                      resend=True)
         except BaseException:
             if retire_old:
                 self.db.set_grab_status(old["id"], "sent", old.get("message"))

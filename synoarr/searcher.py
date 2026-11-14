@@ -673,8 +673,10 @@ class Searcher:
         return self.db.query_one("SELECT 1 AS x FROM grabs WHERE lower(release_title) = lower(?) "
                                  "AND status != 'failed'", (release_title,)) is not None
 
+    _resend = False  # set during a manual (re)send chosen by the user: duplicates allowed
+
     def _hash_already_grabbed(self, info_hash: Optional[str]) -> bool:
-        if not info_hash:
+        if not info_hash or self._resend:
             return False
         return self.db.query_one("SELECT 1 AS x FROM grabs WHERE lower(info_hash) = lower(?) AND status != 'failed'",
                                  (info_hash,)) is not None
@@ -695,9 +697,20 @@ class Searcher:
 
     # ================================================================ grab
     def grab(self, release: Release, media: Optional[Dict[str, Any]], season: Optional[int],
-             episode: Optional[int], error_out: Optional[List[str]] = None) -> bool:
+             episode: Optional[int], error_out: Optional[List[str]] = None, resend: bool = False) -> bool:
         """Send *release* to Download Station and record it. Returns True on success.
-        *error_out* (optional list) receives the French reason of a failure."""
+        *error_out* (optional list) receives the French reason of a failure.
+        *resend*: the user chose this release by hand -> sent again even if the same torrent was sent before
+        (its earlier, unfinished downloads are closed)."""
+        if resend:
+            self._resend = True
+            try:
+                ok = self.grab(release, media, season, episode, error_out)
+            finally:
+                self._resend = False
+            if ok:
+                self._close_duplicates()
+            return ok
         def fail(msg: str) -> bool:
             if error_out is not None:
                 error_out.append(msg)
@@ -739,6 +752,15 @@ class Searcher:
         self.db.add_event("grab", "Envoyé à Download Station : %s ← %s [%s]" % (what, release.title, release.indexer))
         log.info("Envoyé à Download Station : %s (%s)", release.title, what)
         return True
+
+    def _close_duplicates(self) -> None:
+        """After a manual resend: older « sent » grabs of the same torrent are closed (the newest one stays)."""
+        last = self.db.query_one("SELECT * FROM grabs ORDER BY id DESC LIMIT 1")
+        if not last or not last.get("info_hash"):
+            return
+        for g in self.db.query("SELECT id FROM grabs WHERE lower(info_hash) = lower(?) AND status = 'sent' AND id != ?",
+                               (last["info_hash"], last["id"])):
+            self.db.set_grab_status(g["id"], "failed", "renvoyé manuellement")
 
     def _send(self, release: Release) -> Tuple[Optional[str], Optional[str]]:
         """Send *release* to Download Station WITHOUT modifying what the indexer (Prowlarr...) provides:
@@ -930,7 +952,21 @@ class Searcher:
                          "fichier .torrent")
 
     def grab_torrent_bytes(self, data: bytes, media: Optional[Dict[str, Any]], season: Optional[int],
-                           episode: Optional[int], error_out: Optional[List[str]] = None) -> bool:
+                           episode: Optional[int], error_out: Optional[List[str]] = None,
+                           resend: bool = False) -> bool:
+        if resend:
+            self._resend = True
+            try:
+                ok = self.grab_torrent_bytes(data, media, season, episode, error_out)
+            finally:
+                self._resend = False
+            if ok:
+                self._close_duplicates()
+            return ok
+        return self._grab_torrent_bytes(data, media, season, episode, error_out)
+
+    def _grab_torrent_bytes(self, data: bytes, media: Optional[Dict[str, Any]], season: Optional[int],
+                            episode: Optional[int], error_out: Optional[List[str]] = None) -> bool:
         """Send an uploaded .torrent file to Download Station and record it like grab().
         Raises ValueError when *data* is not a valid torrent; returns False (reason in *error_out*) when
         it cannot be sent (dry_run, already sent, Download Station error)."""
