@@ -99,12 +99,9 @@ class QualityConfig:
     languages: List[str] = field(default_factory=lambda: ["en"])
     # languages for animated movies/shows (genre "Animation" on Plex or TMDb)
     languages_animation: List[str] = field(default_factory=lambda: ["fr"])
-    # French only (item languages = fr) and a French title known: search ONLY the French title
-    # (fewer requests, but MULTi releases named after the original title are missed)
-    french_title_only: bool = False
-    # ---- upgrades / French-title fallback (F1/F3)
-    # french_title_only found nothing acceptable: search the original title / ids too (same filters)
-    french_title_fallback: bool = True
+    # (French-only items -languages exactly "fr"- with a known French title are searched with the French title
+    # first, then with the original title when nothing acceptable is found: no option, see searcher.py)
+    # ---- quality upgrades (F3)
     # keep searching a better resolution for items already in the library, until upgrade_until is reached
     upgrade: bool = True
     upgrade_until: str = "1080p"
@@ -260,6 +257,9 @@ _SECTIONS = {
     "subtitles": SubtitlesConfig,  # F5
 }
 
+# options of older versions, still present in users' config.ini: ignored without the "unknown option" warning
+_REMOVED_OPTIONS = {("quality", "french_title_only"), ("quality", "french_title_fallback")}
+
 _TRUE = ("1", "true", "yes", "on", "oui", "vrai")
 _FALSE = ("0", "false", "no", "off", "non", "faux", "")
 
@@ -342,6 +342,8 @@ def load_config(path: Optional[str]) -> Config:
                     " : les noms de section s'écrivent en minuscules" if section.lower() in _SECTIONS else ""))
                 continue
             for key in parser.options(section):
+                if (section, key) in _REMOVED_OPTIONS:
+                    continue  # option of an older version: silently ignored
                 if key not in klass.__dataclass_fields__ and key not in parser.defaults():  # type: ignore
                     cfg.warnings.append("Option inconnue « %s » dans [%s] (ignorée, faute de frappe ?)"
                                         % (key, section))

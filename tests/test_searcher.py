@@ -893,7 +893,6 @@ class FrenchPlexAccountTests(FrenchSearchEndToEndTests):
 
 class FrenchTitleOnlyTests(FrenchSearchEndToEndTests):
     def test_only_the_french_title_is_searched(self) -> None:  # type: ignore[override]
-        self.cfg.quality.french_title_only = True
         item = WatchItem(rating_key="m11", type="movie", title="The Shawshank Redemption", year=1994,
                          guids={"imdb": "tt0111161", "tmdb": "278"})
         self.plex.items.append(item)
@@ -906,7 +905,6 @@ class FrenchTitleOnlyTests(FrenchSearchEndToEndTests):
                          ["Les.Evades.1994.TRUEFRENCH.1080p.WEB-DL.x264-VF"])
 
     def test_english_plus_french_still_searches_both(self) -> None:
-        self.cfg.quality.french_title_only = True
         item = WatchItem(rating_key="m12", type="movie", title="The Shawshank Redemption", year=1994,
                          guids={"imdb": "tt0111161", "tmdb": "278"})
         self.plex.items.append(item)
@@ -915,3 +913,259 @@ class FrenchTitleOnlyTests(FrenchSearchEndToEndTests):
         self.db.set_language_override(mid, "en,fr")
         self.searcher.run_once(media_id=mid, force=True)
         self.assertGreater(len(self.calls), 1)
+
+
+class FrenchFallbackTests(SearcherTestBase):
+    """F1: French-only item -> French title first, widened to the original title when nothing is acceptable."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.quality.languages = ["en"]
+
+        class Tmdb:
+            enabled = True
+
+            def localized_title(self, tmdb_id: str, kind: str, language: str = "fr-FR") -> Optional[str]:
+                return "Les 3 Ninjas contre-attaquent"
+
+            def find_by_imdb(self, imdb: str) -> Dict[str, str]:
+                return {"movie": "1"}
+
+            def movie_details(self, tmdb_id: str) -> Dict[str, Any]:
+                return {"collection": None, "genres": [], "is_animation": False}
+        self.searcher.tmdb = Tmdb()
+        self.calls = []  # type: List[Any]
+        self.french_named = []  # type: List[str]
+
+        class OriginalTitleIndexer:
+            name = "Torznab"
+            priority = 25
+
+            def __init__(self, outer: Any) -> None:
+                self.outer = outer
+
+            def search(self, req: Any) -> List[Release]:
+                self.outer.calls.append((req.title, req.imdb))
+                if "ninjas contre" in req.title.lower():
+                    return [Release(title=t, indexer=self.name, download_url="http://idx/%s.torrent" % t,
+                                    size=int(2e9), seeders=50) for t in self.outer.french_named]
+                return [Release(title=t, indexer=self.name, download_url="http://idx/%s.torrent" % t,
+                                size=int(2e9), seeders=50)
+                        for t in ("3.Ninjas.Kick.Back.1994.1080p.BluRay.x264-EN",
+                                  "3.Ninjas.Kick.Back.1994.MULTi.1080p.WEB-DL.x264-FR")]
+        self.searcher.indexers_provider = lambda: [OriginalTitleIndexer(self)]
+        item = WatchItem(rating_key="n1", type="movie", title="3 Ninjas Kick Back", year=1994,
+                         guids={"imdb": "tt0109015"})
+        self.plex.items.append(item)
+        self.searcher.sync_watchlist()
+        self.mid = self.media("n1")["id"]
+        self.db.set_language_override(self.mid, "fr")
+
+    def test_widened_to_the_original_title(self) -> None:
+        with self.assertLogs("synoarr.searcher", level="INFO") as cm:
+            self.searcher.run_once(media_id=self.mid, force=True)
+        self.assertEqual(self.calls[0], ("Les 3 Ninjas contre-attaquent", None))
+        self.assertGreater(len(self.calls), 1)
+        self.assertTrue(any("recherche élargie au titre original" in line for line in cm.output))
+        # the language filter still rejects the English-only release
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()],
+                         ["3.Ninjas.Kick.Back.1994.MULTi.1080p.WEB-DL.x264-FR"])
+
+    def test_no_widening_when_the_french_title_finds_something(self) -> None:
+        self.french_named.append("Les.3.Ninjas.contre-attaquent.1994.TRUEFRENCH.720p.WEB.x264-VF")
+        self.searcher.run_once(media_id=self.mid, force=True)
+        self.assertEqual(self.calls, [("Les 3 Ninjas contre-attaquent", None)])
+        self.assertEqual(len(self.db.list_grabs()), 1)
+
+    def test_search_report_choice(self) -> None:
+        req = self.searcher.request_for(self.media("n1"))
+        self.assertTrue(self.searcher.french_only_default(req))
+        info = {}  # type: Dict[str, Any]
+        report = self.searcher.search_report(req, info=info)
+        self.assertTrue(info["fallback"])
+        self.assertTrue(info["queries"])
+        self.assertTrue(any(score is not None for _r, score, _x in report))
+        self.calls[:] = []
+        info = {}
+        report = self.searcher.search_report(req, info=info, french_only=True)  # chosen by the user: not widened
+        self.assertFalse(info["fallback"])
+        self.assertEqual(report, [])
+        self.assertEqual(self.calls, [("Les 3 Ninjas contre-attaquent", None)])
+        self.calls[:] = []
+        self.searcher.search_report(req, french_only=False)
+        self.assertIn(("3 Ninjas Kick Back", "tt0109015"), self.calls)
+        self.assertIn(("Les 3 Ninjas contre-attaquent", None), self.calls)
+        self.assertEqual(len(self.searcher.queries_for(req, french_only=True)), 1)
+        self.assertEqual(self.searcher.fallback_queries(req, french_only=False), [])
+
+
+class UpgradeSearchTests(SearcherTestBase):
+    """F3: items already in the library are upgraded to a strictly better resolution until upgrade_until."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.quality.languages = ["en"]
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        self.m = self.media("m1")
+        self.db.set_media_status(self.m["id"], "done")
+
+    def test_movie_720p_is_upgraded_to_1080p(self) -> None:
+        self.db.set_media_quality(self.m["id"], "720p", "webdl", "Heat.1995.720p.WEB-DL.x264-OLD", None)
+        self.idx.add("Heat.1995.720p.BluRay.x264-SAME", seeders=900)
+        self.idx.add("Heat.1995.1080p.BluRay.x264-BETTER", seeders=10)
+        stats = self.searcher.run_once()
+        self.assertEqual((stats["grabbed"], stats.get("upgrades")), (1, 1))
+        g = self.db.list_grabs()[0]
+        self.assertEqual((g["release_title"], g["upgrade"]), ("Heat.1995.1080p.BluRay.x264-BETTER", 1))
+        self.assertEqual(self.media("m1")["status"], "done")  # still in the library
+        self.assertIn("upgrade", [e["kind"] for e in self.db.recent_events()])
+        # a download in progress: no second upgrade search
+        self.db.execute("UPDATE media SET last_search_at = NULL")
+        self.assertEqual(self.searcher.run_once()["searched"], 0)
+
+    def test_failed_upgrade_keeps_the_movie_done(self) -> None:
+        self.db.set_media_quality(self.m["id"], "720p")
+        self.idx.add("Heat.1995.1080p.BluRay.x264-BETTER")
+        self.searcher.run_once()
+        self.ds.tasks[0].status = "error"
+        self.searcher.check_failed_downloads()
+        self.assertEqual(self.db.list_grabs()[0]["status"], "failed")
+        self.assertEqual(self.media("m1")["status"], "done")
+
+    def test_no_upgrade_at_cutoff_unknown_quality_or_disabled(self) -> None:
+        self.idx.add("Heat.1995.1080p.BluRay.x264-BETTER")
+        self.db.set_media_quality(self.m["id"], "1080p")  # cutoff reached
+        self.assertEqual(self.searcher.run_once(force=True)["searched"], 0)
+        self.db.set_media_quality(self.m["id"], "")  # unknown quality: never replaced
+        self.assertEqual(self.searcher.run_once(force=True)["searched"], 0)
+        self.db.set_media_quality(self.m["id"], "720p")
+        self.cfg.quality.upgrade = False
+        self.assertEqual(self.searcher.run_once(force=True)["searched"], 0)
+        self.cfg.quality.upgrade = True
+        self.idx.releases = []
+        self.idx.add("Heat.1995.720p.BluRay.x264-SAME")  # not better: nothing sent
+        stats = self.searcher.run_once(force=True)
+        self.assertEqual((stats["searched"], stats["grabbed"]), (1, 0))
+
+    def test_quality_read_from_the_library_file_name(self) -> None:
+        self.touch("Films/Heat (1995) [720p]/Heat (1995).mkv")
+        self.assertEqual(self.searcher.current_resolution(self.media("m1")), "720p")
+        m = self.media("m1")
+        self.assertEqual(m["quality_resolution"], "720p")  # cached
+        self.assertTrue(m["library_file"].endswith("Heat (1995).mkv"))
+        other = self.movie(key="m2", title="Ronin", year=1998)
+        self.searcher.sync_watchlist()
+        self.assertIsNone(self.searcher.current_resolution(self.media(other.rating_key)))  # not found
+        self.assertEqual(self.media(other.rating_key)["quality_resolution"], "")
+
+    def test_episode_upgrade(self) -> None:
+        self.show(episodes=[EpisodeInfo(1, 1, "Ep1", day(-30)), EpisodeInfo(1, 2, "Ep2", day(-23))])
+        self.searcher.sync_watchlist()
+        sid = self.media("s1")["id"]
+        self.db.set_episode_status(sid, 1, None, "done")
+        self.db.set_episode_quality(sid, 1, 1, "720p")
+        self.db.set_episode_quality(sid, 1, 2, "1080p")
+        self.idx.add("Lupin.S01E01.1080p.WEB-DL.x264-GRP")
+        self.idx.add("Lupin.S01E02.1080p.BluRay.x264-GRP")
+        stats = self.searcher.run_once()
+        self.assertEqual(stats.get("upgrades"), 1)
+        g = self.db.list_grabs()[0]
+        self.assertEqual((g["season"], g["episode"], g["upgrade"]), (1, 1, 1))
+        self.assertEqual(self.statuses("s1"), {(1, 1): "done", (1, 2): "done"})
+
+    def test_upgrade_searches_are_capped_per_cycle(self) -> None:
+        self.searcher.MAX_UPGRADE_SEARCHES = 1
+        self.db.set_media_quality(self.m["id"], "720p")
+        self.movie(key="m2", title="Ronin", year=1998)
+        self.searcher.sync_watchlist()
+        m2 = self.media("m2")
+        self.db.set_media_status(m2["id"], "done")
+        self.db.set_media_quality(m2["id"], "720p")
+        self.assertEqual(self.searcher.run_once()["searched"], 1)
+        self.assertEqual(self.searcher.run_once()["searched"], 1)  # the other one, next cycle
+        self.assertEqual(self.searcher.run_once()["searched"], 0)
+
+
+class RssSyncTests(SearcherTestBase):
+    """F4: latest releases of the indexers matched against the wanted items."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.quality.languages = ["en"]
+        self.recent = []  # type: List[Release]
+        self.idx.recent = lambda: list(self.recent)  # type: ignore[attr-defined]
+
+    def rel(self, title: str, seeders: int = 20) -> Release:
+        r = Release(title=title, indexer="fake", download_url="http://idx/dl/%s.torrent" % title,
+                    size=int(1.5 * GiB), seeders=seeders)
+        self.recent.append(r)
+        return r
+
+    def test_new_episode_and_wanted_movie_grabbed(self) -> None:
+        self.show(episodes=[EpisodeInfo(2, 1, "a", day(-10)), EpisodeInfo(2, 2, "b", day(-1)),
+                            EpisodeInfo(2, 3, "c", day(6))])
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        sid = self.media("s1")["id"]
+        self.db.set_episode_status(sid, 2, 1, "done")
+        self.rel("Lupin.S02E02.1080p.WEB.x264-GRP")
+        self.rel("Lupin.S02E02.720p.WEB.x264-GRP", seeders=500)
+        self.rel("Lupin.S02E03.1080p.WEB.x264-GRP")  # not aired yet: not wanted
+        self.rel("Heat.1995.1080p.BluRay.x264-GRP")
+        self.rel("Other.Show.S01E01.1080p.WEB.x264-GRP")
+        self.rel("Lupin.S02E02.iTALiAN.1080p.WEB.x264-GRP")
+        with self.assertLogs("synoarr.searcher", level="INFO") as cm:
+            stats = self.searcher.rss_sync()
+        self.assertEqual(stats["grabbed"], 2)
+        self.assertEqual(stats["releases"], 6)
+        self.assertTrue(any("Synchronisation RSS" in line for line in cm.output))
+        self.assertEqual(sorted(g["release_title"] for g in self.db.list_grabs()),
+                         ["Heat.1995.1080p.BluRay.x264-GRP", "Lupin.S02E02.1080p.WEB.x264-GRP"])
+        self.assertEqual(self.statuses("s1")[(2, 2)], "grabbed")
+        self.assertEqual(self.media("m1")["status"], "grabbed")
+        self.assertEqual(self.idx.requests, [])  # no search sent: only the feed
+        # nothing wanted anymore: second sync sends nothing
+        self.assertEqual(self.searcher.rss_sync()["grabbed"], 0)
+
+    def test_blocklisted_and_upgrade(self) -> None:
+        self.movie(title="Heat", year=1995)
+        self.searcher.sync_watchlist()
+        m = self.media("m1")
+        self.db.set_media_status(m["id"], "done")
+        self.db.set_media_quality(m["id"], "720p")
+        self.rel("Heat.1995.720p.BluRay.x264-SAME", seeders=900)
+        self.rel("Heat.1995.1080p.BluRay.x264-BAD")
+        self.db.block_release("Heat.1995.1080p.BluRay.x264-BAD", "échec")
+        self.assertEqual(self.searcher.rss_sync()["grabbed"], 0)
+        self.rel("Heat.1995.1080p.WEB-DL.x264-GOOD")
+        self.assertEqual(self.searcher.rss_sync()["grabbed"], 1)
+        g = self.db.list_grabs()[0]
+        self.assertEqual((g["release_title"], g["upgrade"]), ("Heat.1995.1080p.WEB-DL.x264-GOOD", 1))
+        self.assertEqual(self.media("m1")["status"], "done")
+        self.assertEqual(self.searcher.rss_sync()["grabbed"], 0)  # download in progress
+
+    def test_season_pack_and_lock(self) -> None:
+        self.show(episodes=[EpisodeInfo(1, 1, "a", day(-30)), EpisodeInfo(1, 2, "b", day(-23))])
+        self.searcher.sync_watchlist()
+        self.rel("Lupin.S01.1080p.WEB.x264-GRP")
+        self.rel("Lupin.S01E01.1080p.WEB.x264-GRP")
+        self.cfg.general.data_dir = self.tmp
+        from synoarr.db import release_file_lock, try_file_lock
+        lock = try_file_lock(self.tmp, "search.lock")
+        try:
+            if lock is not None:  # fcntl available: a running search postpones the sync
+                self.assertEqual(self.searcher.rss_sync().get("skipped"), 1)
+        finally:
+            release_file_lock(lock)
+        self.assertEqual(self.searcher.rss_sync()["grabbed"], 1)
+        self.assertEqual([g["release_title"] for g in self.db.list_grabs()], ["Lupin.S01.1080p.WEB.x264-GRP"])
+        self.assertEqual(self.statuses("s1"), {(1, 1): "grabbed", (1, 2): "grabbed"})
+
+    def test_indexer_errors_and_no_indexer(self) -> None:
+        def boom() -> List[Release]:
+            raise RuntimeError("x")
+        self.idx.recent = boom  # type: ignore[attr-defined]
+        self.assertEqual(self.searcher.rss_sync()["releases"], 0)
+        self.searcher.indexers_provider = lambda: []
+        self.assertEqual(self.searcher.rss_sync()["grabbed"], 0)

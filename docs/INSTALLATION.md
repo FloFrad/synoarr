@@ -241,13 +241,20 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 
 | Onglet | Contenu |
 |---|---|
-| Tableau de bord | état général, téléchargements en cours (progression, vitesses, sources), derniers envois |
-| Watchlist | films et séries suivis, épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » |
+| Tableau de bord | état général, espace disque libre de la vidéothèque (dossier partagé de `movies_dir` / `series_dir`, en orange sous 10 % libres), téléchargements en cours (progression, vitesses, sources), échecs récents, derniers imports, activité récente |
+| Watchlist | films et séries suivis avec leur affiche (TMDb, si une clé `[tmdb] api_key` est configurée), épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » (option « Titre français seulement »), mode « Sélection » : cases à cocher et barre d'actions groupées (Rechercher, Langue, Ignorer, Reprendre, Supprimer) |
+| À venir | épisodes des séries suivies diffusés dans les 7 à 90 prochains jours, groupés par jour (« Aujourd'hui », « Demain », …), films recherchés dont la date de sortie est connue (TMDb), et sorties des 7 derniers jours avec leur statut |
 | Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), modifier (nom, URL, clé API, catégories, type), priorité (1 = le plus prioritaire), tester, activer, supprimer |
 | Historique | envois vers Download Station et événements |
 | Commandes | synchroniser la Watchlist, rechercher, traiter les téléchargements, simulation, vérifier la configuration, tester les indexers, recherche manuelle avec envoi, connexion Plex, redémarrer, mettre à jour synoarr (et revenir en arrière) |
 | Journal | dernières lignes du journal, filtres, téléchargement |
 | Configuration | éditeur de `config.ini` : vérifié avant d'être enregistré, sauvegarde automatique (5 versions), appliqué sans redémarrer |
+
+**Sur le téléphone** : ouvrez l'interface dans Safari (iPhone) ou Chrome (Android), puis **Partager → Sur l'écran
+d'accueil** (iPhone) ou **⋮ → Ajouter à l'écran d'accueil** (Android) : synoarr s'ouvre ensuite comme une
+application, en plein écran, avec sa propre icône. Cela fonctionne en HTTP sur le réseau local (pas de mode hors
+connexion : il exigerait HTTPS). Le manifeste et les icônes sont servis sans mot de passe (ils ne contiennent rien
+de privé) ; tout le reste demande toujours les identifiants de `[web]`.
 
 **Changer de source** : si un téléchargement ne démarre pas (pas de sources, erreur, lien mort), cliquez sur
 « Changer de source » sous ce téléchargement dans la Watchlist (ou « Choisir une source » / « Source… » pour un
@@ -331,6 +338,25 @@ Les vidéos que vous déposez vous-même dans `Download` sont aussi renommées e
 (désactivable : `[paths] only_known_downloads = true`). Les autres fichiers (documents, photos…) ne sont jamais
 supprimés.
 
+**Titre français.** Pour un film ou une série en français seulement (langues = `fr`) dont le titre français est
+connu, synoarr cherche d'abord ce titre français (les releases françaises portent ce nom) ; s'il ne trouve rien
+d'acceptable, la recherche est automatiquement élargie au titre original (les releases non françaises restent
+refusées par le filtre de langue). Dans **Changer de source**, la case « titre français seul » permet de choisir.
+L'ancienne option `[quality] french_title_only` n'existe plus (ignorée si elle reste dans `config.ini`).
+
+**Améliorations de qualité** (`[quality] upgrade = true`, `upgrade_until = 1080p`). La qualité de chaque fichier
+importé est mémorisée. Tant qu'un film ou un épisode de la bibliothèque est sous `upgrade_until` (ex. 720p),
+synoarr continue à chercher (au rythme de `research_interval_hours`, 25 recherches d'amélioration au plus par
+cycle) une release de **meilleure résolution** qui respecte tous les filtres. Une fois importée, elle remplace
+l'ancien fichier (même s'il avait un autre nom ou une autre extension) ; rien d'autre n'est supprimé. Un fichier
+dont la résolution est inconnue (absente de la base et de son nom) n'est jamais remplacé.
+
+**Synchronisation RSS** (`[general] rss_interval_minutes = 15`, `0` = désactivée). Comme Sonarr, synoarr lit
+régulièrement les dernières releases de chaque indexer (Torznab, flux RSS ; pas Internet Archive) et envoie
+aussitôt celles qui correspondent à un épisode diffusé manquant, un film voulu ou une amélioration, avec les mêmes
+filtres qu'une recherche. Les nouveaux épisodes arrivent ainsi en quelques minutes, sans multiplier les
+recherches. À la main : commande **Synchroniser les flux RSS** ou `sudo python3 synoarr.py rss`.
+
 ## Notifications Telegram
 
 Facultatif : synoarr peut vous prévenir sur Telegram (envoi à Download Station, import, échec…).
@@ -388,6 +414,7 @@ les plus anciennes d'abord, `scan_limit` par passage toutes les `scan_interval_h
 | `sudo python3 synoarr.py search` | lance une recherche maintenant |
 | `sudo python3 synoarr.py search "Titre 1968"` | teste une recherche et affiche les scores (n'envoie rien) |
 | `sudo python3 synoarr.py process` | traite le dossier Download maintenant |
+| `sudo python3 synoarr.py rss` | synchronise les flux RSS des indexers maintenant (nouveaux épisodes, améliorations) |
 | `sudo python3 synoarr.py status` | derniers envois et événements |
 | `sudo python3 synoarr.py subtitles` | télécharge les sous-titres manquants (`--file VIDEO` pour une seule vidéo) |
 | `sudo python3 synoarr.py telegram-test` | teste les notifications Telegram (ou affiche votre `chat_id`) |

@@ -861,3 +861,117 @@ class FinalQaFixTests(NewNamingTests):
         pick = TmdbClient._pick([{"title": "Night of the Living Dead", "release_date": "1968-10-01"}],
                                 "My Holiday", 2019, "title", "original_title", "release_date")
         self.assertIsNone(pick)
+
+
+class UpgradeImportTests(OrganizerTestBase):
+    """F3: quality of imported files recorded; an upgrade replaces the old library file (other name/extension
+    included) once the new one is in place, and never deletes anything else."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mid = self.db.upsert_media("plex://movie/1", "movie", "Heat", 1995, None, None, None)
+        self.db.set_media_status(self.mid, "done")
+        self.folder = self.movie_path("Heat (1995)")
+
+    def upgrade_grab(self, name: str, media_id: Optional[int] = None, season: Optional[int] = None,
+                     episode: Optional[int] = None) -> int:
+        gid = self.db.add_grab(media_id or self.mid, season, episode, name, name, "idx", None, 1000)
+        self.db.mark_grab_upgrade(gid)
+        return gid
+
+    def test_quality_recorded_on_import(self) -> None:
+        self.db.set_media_status(self.mid, "grabbed")
+        name = "Heat.1995.1080p.BluRay.x264-GRP"
+        self.grab(name, self.mid)
+        self.make(name + "/" + name + ".mkv", 2000)
+        self.org().run_once()
+        m = self.db.get_media(self.mid)
+        self.assertEqual((m["quality_resolution"], m["quality_source"], m["imported_release"]),
+                         ("1080p", "bluray", name))
+        self.assertEqual(m["library_file"], os.path.join(self.folder, "Heat (1995).mkv"))
+
+    def test_upgrade_replaces_old_file_with_other_extension(self) -> None:
+        old = self.make(os.path.join(self.folder, "Heat (1995).avi"), 5000, b"o", base="/")
+        other = self.make(os.path.join(self.folder, "Heat (1995) - bonus.mkv"), 5000, b"b", base="/")
+        poster = self.make(os.path.join(self.folder, "poster.jpg"), 10, b"p", base="/")
+        self.db.set_media_quality(self.mid, "720p", "dvdrip", "Heat.720p", old)
+        name = "Heat.1995.1080p.BluRay.x264-GRP"
+        self.upgrade_grab(name)
+        self.make(name + "/" + name + ".mkv", 2000, b"n")  # smaller than the old file: replaced anyway
+        actions = self.org().run_once()
+        self.assertEqual(self.by_status(actions, "imported")[0]["dst"], os.path.join(self.folder, "Heat (1995).mkv"))
+        self.assertEqual(self.read(os.path.join(self.folder, "Heat (1995).mkv")), b"n" * 2000)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(other) and os.path.exists(poster))  # nothing else is deleted
+        m = self.db.get_media(self.mid)
+        self.assertEqual((m["quality_resolution"], m["status"]), ("1080p", "done"))
+        self.assertIn("upgrade", [e["kind"] for e in self.db.recent_events()])
+
+    def test_upgrade_same_name_bigger_old_file_is_replaced(self) -> None:
+        dst = self.make(os.path.join(self.folder, "Heat (1995).mkv"), 5000, b"o", base="/")
+        self.db.set_media_quality(self.mid, "720p")
+        name = "Heat.1995.1080p.WEB-DL.x264-GRP"
+        self.upgrade_grab(name)
+        self.make(name + ".mkv", 2000, b"n")
+        actions = self.org().run_once()
+        self.assertEqual(actions[0]["status"], "imported", actions)
+        self.assertEqual(self.read(dst), b"n" * 2000)
+        self.assertEqual(sorted(os.listdir(self.folder)), ["Heat (1995).mkv"])
+
+    def test_not_better_or_not_upgrade_keeps_old_files(self) -> None:
+        old = self.make(os.path.join(self.folder, "Heat (1995).avi"), 5000, b"o", base="/")
+        self.db.set_media_quality(self.mid, "1080p", None, None, old)
+        name = "Heat.1995.720p.BluRay.x264-GRP"  # marked upgrade but not better than the library file
+        self.upgrade_grab(name)
+        self.make(name + ".mkv", 2000, b"n")
+        self.org().run_once()
+        self.assertTrue(os.path.exists(old))
+        # a normal (non upgrade) import never deletes another file either
+        self.db.set_media_quality(self.mid, "720p", None, None, old)
+        name2 = "Heat.1995.1080p.BluRay.x264-OTHER"
+        self.grab(name2, self.mid)
+        self.make(name2 + ".mkv", 3000, b"m")
+        self.org().run_once()
+        self.assertTrue(os.path.exists(old))
+
+    def test_unknown_library_quality_is_not_force_replaced(self) -> None:
+        dst = self.make(os.path.join(self.folder, "Heat (1995).mkv"), 5000, b"o", base="/")
+        name = "Heat.1995.1080p.BluRay.x264-GRP"
+        self.upgrade_grab(name)
+        self.make(name + ".mkv", 2000, b"n")
+        actions = self.org().run_once()
+        self.assertEqual(actions[0]["status"], "skipped")  # usual rule: the bigger file is kept
+        self.assertEqual(self.read(dst), b"o" * 5000)
+
+    def test_episode_upgrade_with_other_extension_and_multi_episode_file_kept(self) -> None:
+        sid = self.db.upsert_media("plex://show/9", "show", "Dark", 2017, None, None, None)
+        for ep in (1, 2, 3):
+            self.db.upsert_episode(sid, 1, ep, None, None, status="done")
+            self.db.set_episode_quality(sid, 1, ep, "720p")
+        season = self.series_path("Dark", "Season 01")
+        old1 = self.make(os.path.join(season, "Dark - S01E01.avi"), 5000, b"o", base="/")
+        multi = self.make(os.path.join(season, "Dark - S01E02-E03.avi"), 5000, b"o", base="/")
+        self.db.set_episode_quality(sid, 1, 2, "720p", None, None, multi)
+        name = "Dark.S01E01.1080p.WEB-DL.x264-GRP"
+        self.upgrade_grab(name, sid, 1, 1)
+        self.make(name + ".mkv", 2000, b"n")
+        name2 = "Dark.S01E02.1080p.WEB-DL.x264-GRP"
+        self.upgrade_grab(name2, sid, 1, 2)
+        self.make(name2 + ".mkv", 2000, b"n")
+        self.org().run_once()
+        self.assertTrue(os.path.isfile(os.path.join(season, "Dark - S01E01.mkv")))
+        self.assertFalse(os.path.exists(old1))
+        self.assertTrue(os.path.isfile(os.path.join(season, "Dark - S01E02.mkv")))
+        self.assertTrue(os.path.exists(multi))  # also holds E03: never deleted
+        self.assertEqual(self.db.get_episode(sid, 1, 1)["quality_resolution"], "1080p")
+        self.assertEqual(self.db.get_episode(sid, 1, 3)["quality_resolution"], "720p")
+
+    def test_dry_run_plans_the_upgrade_without_touching(self) -> None:
+        old = self.make(os.path.join(self.folder, "Heat (1995).avi"), 5000, b"o", base="/")
+        self.db.set_media_quality(self.mid, "720p", None, None, old)
+        name = "Heat.1995.1080p.BluRay.x264-GRP"
+        self.upgrade_grab(name)
+        src = self.make(name + ".mkv", 2000, b"n")
+        actions = self.org().run_once(dry_run=True)
+        self.assertEqual(actions[0]["status"], "planned")
+        self.assertTrue(os.path.exists(old) and os.path.exists(src))

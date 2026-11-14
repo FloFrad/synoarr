@@ -1774,32 +1774,47 @@ class FrenchTitleOnlyDisplayTest(RealAppWebBase):
         self.app.db.set_language_override(mid, "fr")
         self.app.db.set_title_fr(mid, "Les 3 Ninjas contre-attaquent")
 
-        def titles() -> Dict[str, Any]:
-            status, data, _ = self.req("/api/media/%d/sources" % mid, "POST", {})
+        def titles(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            status, data, _ = self.req("/api/media/%d/sources" % mid, "POST", body or {})
             self.assertEqual(status, 200, data)
             deadline = time.time() + 20
             while time.time() < deadline:
                 job = self.req("/api/jobs/%d" % data["job"]["id"])[1]
                 if job["status"] != "running":
-                    return job["result"]
+                    return job
                 time.sleep(0.05)
             self.fail("recherche trop longue")
-        r = titles()
-        self.assertFalse(r["french_title_only"])
-        self.assertIn("Les 3 Ninjas contre-attaquent", r["titles"])
-        self.assertTrue(any(t.startswith("3 Ninjas Kick Back") for t in r["titles"]))
-        self.app.cfg.quality.french_title_only = True
-        self.app.cfg.quality.french_title_fallback = False
-        r = titles()
+        # default for a French-only item: French title first, nothing acceptable -> widened (F1)
+        job = titles()
+        r = job["result"]
+        self.assertTrue(r["french_only"])
+        self.assertTrue(r["french_only_default"])
         self.assertTrue(r["french_title_only"])
-        self.assertEqual(r["titles"], ["Les 3 Ninjas contre-attaquent"])
-        self.assertFalse(r["french_title_fallback"])
-        # F1: nothing acceptable with the French title -> widened to the original title (shown in the job)
-        self.app.cfg.quality.french_title_fallback = True
-        r = titles()
-        self.assertTrue(r["french_title_fallback"])
+        self.assertTrue(r["fallback"])
         self.assertEqual(r["titles"][0], "Les 3 Ninjas contre-attaquent")
         self.assertTrue(any(t.startswith("3 Ninjas Kick Back") for t in r["titles"][1:]))
+        self.assertIn("recherche élargie au titre original", " ".join(o["text"] for o in job["output"]))
+        # « titre français seul » checked by the user: never widened
+        job = titles({"french_only": True})
+        r = job["result"]
+        self.assertTrue(r["french_only"])
+        self.assertFalse(r["fallback"])
+        self.assertEqual(r["titles"], ["Les 3 Ninjas contre-attaquent"])
+        self.assertIn("Aucun résultat avec le titre français seul", " ".join(o["text"] for o in job["output"]))
+        # unchecked: every title at once
+        r = titles({"french_only": False})["result"]
+        self.assertFalse(r["french_only"])
+        self.assertTrue(r["french_only_default"])
+        self.assertFalse(r["fallback"])
+        self.assertIn("Les 3 Ninjas contre-attaquent", r["titles"])
+        self.assertTrue(any(t.startswith("3 Ninjas Kick Back") for t in r["titles"]))
+        # English + French item: every title by default
+        self.app.db.set_language_override(mid, "en,fr")
+        r = titles()["result"]
+        self.assertFalse(r["french_only"])
+        self.assertFalse(r["french_only_default"])
+        status, data, _ = self.req("/api/media/%d/sources" % mid, "POST", {"french_only": "oui"})
+        self.assertEqual(status, 400, data)
 
 
 # ---------------------------------------------------------------- affiches, actions groupées, À venir, PWA
@@ -2103,3 +2118,30 @@ class PwaHostCheckTest(WebTestBase):
         for word in ("media/bulk", "upcoming?days=", "api('dashboard')", "data-selmode", "Derniers imports",
                      "Espace disque de la vidéothèque", "Aujourd", "Demain", 'loading="lazy"'):
             self.assertIn(word, INDEX_JS)
+
+
+class FrenchOnlySourcesParamTest(RealAppWebBase):
+    def test_french_only_passed_when_supported(self) -> None:
+        mid = self.app.db.upsert_media("fo", "movie", "Amélie", 2001, None, None, None)
+        calls = []
+        orig = self.app.start_source_search
+
+        def with_param(media_id: Any, season: Any = None, episode: Any = None, french_only: Any = None) -> Any:
+            calls.append(french_only)
+            return orig(media_id, season, episode)
+        self.app.start_source_search = with_param  # type: ignore[assignment]
+        for body, expected in (({"french_only": True}, True), ({"french_only": False}, False), ({}, None)):
+            status, data, _ = self.req("/api/media/%d/sources" % mid, "POST", body)
+            self.assertEqual(status, 200, data)
+            self.assertEqual(calls[-1], expected)
+            self.wait(data["job"]["id"])
+        self.assertEqual(self.req("/api/media/%d/sources" % mid, "POST", {"french_only": "oui"})[0], 400)
+        # an App without the parameter still works (the flag is simply not forwarded)
+        self.app.start_source_search = lambda m, s=None, e=None: orig(m, s, e)  # type: ignore[assignment]
+        status, data, _ = self.req("/api/media/%d/sources" % mid, "POST", {"french_only": True})
+        self.assertEqual(status, 200, data)
+        self.wait(data["job"]["id"])
+        from synoarr.web import INDEX_JS
+        self.assertIn("Titre français seulement", INDEX_JS)
+        self.assertIn("french_only_default", INDEX_JS)
+        self.assertIn("recherche élargie au titre original", INDEX_JS)

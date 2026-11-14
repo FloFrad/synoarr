@@ -82,6 +82,7 @@ class Indexer:
     name: str
     def search(self, request: SearchRequest) -> List[Release]   # ne lève pas : log + [] sur erreur
     def test(self) -> Tuple[bool, str]                           # message français
+    def recent(self) -> List[Release]   # dernières releases (synchro RSS) ; ne lève pas ; IA -> []
 def create_indexer(row, http) -> Indexer
 def detect_type(url: str, api_key: str, http: HttpClient) -> str   # "torznab" | "rss" | "internet_archive"
 CATALOG: List[Dict]  # {"id","name","type","url","description","categories"} – UNIQUEMENT des sources légales
@@ -91,6 +92,16 @@ CATALOG: List[Dict]  # {"id","name","type","url","description","categories"} –
   ou 2000 films / 5000 séries). L'URL saisie peut se terminer par `/api` ou non : si elle ne se termine pas par
   `/api`, essayer telle quelle puis avec `/api` ajouté. Parse XML RSS : `title`, `enclosure@url` / `link`,
   `size`, `torznab:attr` (seeders, peers, infohash, magneturl, size). Namespace `http://torznab.com/schemas/2015/feed`.
+- **recent()** (synchro RSS, `Searcher.rss_sync()`, `[general] rss_interval_minutes`) : torznab `t=search` sans `q`,
+  `cat` = catégories 5xxx/2xxx de la ligne sinon `5000,2000`, `limit=100` ; rss = le flux lui-même ; internet_archive
+  = rien. Les releases sont confrontées aux éléments voulus (épisodes diffusés, films, améliorations) avec
+  `quality.evaluate` et la `SearchRequest` de chaque élément.
+- **Améliorations** (`[quality] upgrade`, `upgrade_until`) : qualité du fichier importé en base
+  (`media`/`episodes` : `quality_resolution`, `quality_source`, `imported_release`, `library_file` ;
+  `grabs.upgrade`). `quality.needs_upgrade()` / `pick_upgrade()` (résolution strictement meilleure) ; l'organiseur
+  remplace l'ancien fichier (même autre nom/extension) une fois le nouveau en place.
+- **Titre français** : éléments en `fr` seul avec titre français connu → `Searcher.queries_for()` cherche le titre
+  français seul, puis `fallback_queries()` (titre original…) si rien d'acceptable.
 - **rss** : flux RSS/Atom générique ; filtre les items dont le titre parsé `titles_match` la demande ; lien
   `enclosure`/`link` (magnet ou .torrent), taille si présente.
 - **internet_archive** : API `https://archive.org/advancedsearch.php` (`q=title:(...) AND mediatype:(movies)`,

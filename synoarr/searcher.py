@@ -750,27 +750,39 @@ class Searcher:
         a French release is named after the French title and is not found with the English one."""
         return self._run_queries(self.queries_for(req), indexers)
 
-    def french_title_only_applies(self, req: SearchRequest) -> bool:
+    @staticmethod
+    def french_only_default(req: SearchRequest) -> bool:
+        """French title only by default: the item's languages are exactly ["fr"] and its French title is known
+        (French releases are named after it). Nothing acceptable -> widened to the other titles (F1)."""
         langs = {x.lower() for x in (req.languages or [])}
-        return bool(req.title_fr) and langs == {"fr"} and bool(getattr(self.cfg.quality, "french_title_only", False))
+        return bool(req.title_fr) and langs == {"fr"}
 
-    def fallback_queries(self, req: SearchRequest) -> List[SearchRequest]:
-        """[quality] french_title_fallback: searches run when the French-title-only search found nothing
-        acceptable (original/main title, id search...), without the one already sent. [] if it does not apply."""
-        if not self.french_title_only_applies(req) or not getattr(self.cfg.quality, "french_title_fallback", True):
+    def french_title_only_applies(self, req: SearchRequest, french_only: Optional[bool] = None) -> bool:
+        """Effective « French title only » for *req*: *french_only* chosen by the user (« Changer de source »),
+        None = french_only_default(). Never without a known French title."""
+        if not req.title_fr:
+            return False
+        return self.french_only_default(req) if french_only is None else bool(french_only)
+
+    def fallback_queries(self, req: SearchRequest, french_only: Optional[bool] = None) -> List[SearchRequest]:
+        """F1: searches run when the French-title-only search found nothing acceptable (original/main title, id
+        search...), without the one already sent. [] when the French-title-only search does not apply."""
+        if not self.french_title_only_applies(req, french_only):
             return []
 
         def key(q: SearchRequest) -> Tuple[str, Any, Any, Any]:
             return ((q.title or "").strip().lower(), q.imdb, q.tvdb, q.tmdb)
-        done = {key(q) for q in self.queries_for(req)}
-        return [q for q in self.queries_for(req, widen=True) if key(q) not in done]
+        done = {key(q) for q in self.queries_for(req, french_only)}
+        return [q for q in self.queries_for(req, False) if key(q) not in done]
 
-    def queries_for(self, req: SearchRequest, widen: bool = False) -> List[SearchRequest]:
+    def queries_for(self, req: SearchRequest, french_only: Optional[bool] = None,
+                    widen: bool = False) -> List[SearchRequest]:
         """The searches actually sent to the indexers for *req* (also shown in « Changer de source »).
-        *widen*: the normal searches even when french_title_only applies (fallback)."""
+        *french_only*: True = the French title only, False = every title, None = french_only_default().
+        *widen*: every title (same as french_only=False)."""
         import dataclasses
-        if not widen and self.french_title_only_applies(req):
-            # [quality] french_title_only: one text search with the French title only
+        if not widen and self.french_title_only_applies(req, french_only):
+            # one text search with the French title only
             return [dataclasses.replace(req, title=req.title_fr, imdb=None, tmdb=None, tvdb=None,
                                         alt_titles=[t for t in [req.title] + list(req.alt_titles or [])
                                                     if t and t != req.title_fr])]
@@ -826,7 +838,7 @@ class Searcher:
         best = self._pick(results, req, indexers, current_resolution)
         if best is None:
             extra = self.fallback_queries(req)
-            if extra:  # [quality] french_title_fallback
+            if extra:  # F1: French title only found nothing acceptable
                 log.info("%s (%s)", FRENCH_FALLBACK_MESSAGE, req.describe())
                 results = results + self._run_queries(extra, indexers)
                 best = self._pick(results, req, indexers, current_resolution)
@@ -852,13 +864,15 @@ class Searcher:
         return self.db.query_one("SELECT 1 AS x FROM grabs WHERE lower(info_hash) = lower(?) AND status != 'failed'",
                                  (info_hash,)) is not None
 
-    def search_report(self, req: SearchRequest,
-                      info: Optional[Dict[str, Any]] = None) -> List[Tuple[Release, Optional[int], str]]:
+    def search_report(self, req: SearchRequest, info: Optional[Dict[str, Any]] = None,
+                      french_only: Optional[bool] = None) -> List[Tuple[Release, Optional[int], str]]:
         """Used by the CLI / « Changer de source »: every result with its score / rejection reason.
-        *info* (optional dict) receives "fallback" (True when french_title_only found nothing acceptable and the
-        search was widened, see fallback_queries) and "queries" (the extra searches sent)."""
+        *french_only*: True = French title only (chosen by the user: never widened), False = every title,
+        None = french_only_default() widened to the other titles when nothing is acceptable (F1).
+        *info* (optional dict) receives "fallback" (True when the search was widened) and "queries" (the extra
+        searches sent)."""
         indexers = self.indexers_provider()
-        results = self._collect(req, indexers)
+        results = self._run_queries(self.queries_for(req, french_only), indexers)
         priorities = indexer_priorities(indexers)
 
         def report(found: List[Release]) -> List[Tuple[Release, Optional[int], str]]:
@@ -873,7 +887,7 @@ class Searcher:
         out = report(results)
         if info is not None:
             info.setdefault("fallback", False)
-        if not any(score is not None for _r, score, _x in out):
+        if french_only is None and not any(score is not None for _r, score, _x in out):
             extra = self.fallback_queries(req)
             if extra:
                 if info is not None:
@@ -1315,10 +1329,10 @@ class Searcher:
         """Cheap pre-filter: releases named after one of the titles of the item (quality.evaluate decides)."""
         titles = [normalize_title(t) for t in [req.title, req.title_fr] + list(req.alt_titles or []) if t]
         titles = [t for t in titles if t]
+        alts = list(req.alt_titles or []) + ([req.title_fr] if req.title_fr else [])
         out = []
         for norm, parsed, rel in prepared:
-            if any(norm == t or norm.startswith(t + " ") for t in titles) or \
-                    titles_match(parsed.title, req.title, list(req.alt_titles or []) + ([req.title_fr] if req.title_fr else [])):
+            if any(norm == t or norm.startswith(t + " ") for t in titles) or titles_match(parsed.title, req.title, alts):
                 out.append(rel)
         return out
 

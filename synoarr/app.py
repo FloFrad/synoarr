@@ -1648,43 +1648,54 @@ class App:
             raise ValueError("Précisez la saison (et l'épisode) de la série")
         return media, values[0], values[1]
 
-    def start_source_search(self, media_id: Any, season: Any = None, episode: Any = None) -> Tuple[Job, bool]:
+    def start_source_search(self, media_id: Any, season: Any = None, episode: Any = None,
+                            french_only: Optional[bool] = None) -> Tuple[Job, bool]:
         """Recherche de toutes les sources (acceptées ET rejetées) pour exactement ce film / cette saison / cet
-        épisode, dans une tâche (GET /api/jobs/<id>). Lève ValueError."""
+        épisode, dans une tâche (GET /api/jobs/<id>). *french_only* : True = titre français seul (jamais élargi),
+        False = tous les titres, None = par défaut (titre français seul si les langues de l'élément sont
+        exactement « fr » et son titre français connu, élargi au titre original si rien n'est acceptable).
+        Lève ValueError."""
+        if french_only is not None and not isinstance(french_only, bool):
+            raise ValueError("french_only doit valoir true ou false")
         media, season, episode = self._source_target(media_id, season, episode)
         req = self.searcher.request_for(media, season, episode)
         target = (media["id"], season, episode)
 
         def prepare(job: Job) -> None:
             job.private["target"] = target
+        key = "sources:%s:%s:%s" % target + ("" if french_only is None else ":fr=%d" % int(french_only))
         return self._start_job("sources", "Sources : %s" % self._target_label(media, season, episode),
-                               "sources:%s:%s:%s" % target, self._cmd_sources, (target, req), True, prepare)
+                               key, self._cmd_sources, (target, req, french_only), True, prepare)
 
-    def _cmd_sources(self, job: Job, target: Tuple[int, Optional[int], Optional[int]], req: Any) -> Dict[str, Any]:
-        job.emit("info", "Recherche : %s (langues : %s)" % (req.describe(), ", ".join(req.languages) or "—"))
-        titles = []  # type: List[str]
-        for q in self.searcher.queries_for(req):  # exactly what is sent to the indexers
+    @staticmethod
+    def _query_labels(queries: List[Any], titles: List[str]) -> List[str]:
+        for q in queries:
             label = q.title.strip() + (" (identifiant IMDb/TVDB)" if (q.imdb or q.tvdb) else "")
             if label.lower() not in [x.lower() for x in titles]:
                 titles.append(label)
-        only = self.searcher.french_title_only_applies(req)
-        job.emit("info", "Titres cherchés : %s%s" % (" · ".join(titles), " (réglage french_title_only actif)"
-                                                    if only else ""))
-        if "fr" in [x.lower() for x in req.languages or []] and not only and req.title_fr \
-                and not getattr(self.cfg.quality, "french_title_only", False):
-            job.emit("info", "Réglage [quality] french_title_only : inactif (titre français ET titre original)")
+        return titles
+
+    def _cmd_sources(self, job: Job, target: Tuple[int, Optional[int], Optional[int]], req: Any,
+                     french_only: Optional[bool] = None) -> Dict[str, Any]:
+        from .searcher import FRENCH_FALLBACK_MESSAGE
+        job.emit("info", "Recherche : %s (langues : %s)" % (req.describe(), ", ".join(req.languages) or "—"))
+        default = self.searcher.french_only_default(req)
+        only = self.searcher.french_title_only_applies(req, french_only)
+        # exactly what is sent to the indexers (Searcher.queries_for)
+        titles = self._query_labels(self.searcher.queries_for(req, french_only), [])
+        job.emit("info", "Titres cherchés : %s%s" % (" · ".join(titles), " (titre français seulement)" if only else ""))
         if not self.db.list_indexers(enabled_only=True):
             job.emit("warn", "Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
         info = {}  # type: Dict[str, Any]
-        report = self.searcher.search_report(req, info=info)[:300]
-        if info.get("fallback"):  # F1: [quality] french_title_fallback
-            from .searcher import FRENCH_FALLBACK_MESSAGE
+        report = self.searcher.search_report(req, info=info, french_only=french_only)[:300]
+        fallback = bool(info.get("fallback"))
+        if fallback:  # F1: nothing acceptable with the French title -> widened to the other titles
             job.emit("warn", FRENCH_FALLBACK_MESSAGE)
-            for q in info.get("queries") or []:
-                label = q.title.strip() + (" (identifiant IMDb/TVDB)" if (q.imdb or q.tvdb) else "")
-                if label.lower() not in [x.lower() for x in titles]:
-                    titles.append(label)
+            self._query_labels(info.get("queries") or [], titles)
             job.emit("info", "Titres cherchés : %s" % " · ".join(titles))
+        elif only and french_only and not any(score is not None for _r, score, _x in report):
+            job.emit("warn", "Aucun résultat avec le titre français seul : décochez « titre français seul » pour "
+                             "chercher aussi le titre original")
         prios = self.indexer_manager.priorities()
         job.private["releases"] = [rel for rel, _s, _r in report]
         job.private["verdicts"] = [(score, reason) for _rel, score, reason in report]
@@ -1698,7 +1709,8 @@ class App:
         accepted = sum(1 for r in results if r["score"] is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(results), accepted))
         return {"media_id": target[0], "season": target[1], "episode": target[2], "request": req.describe(),
-                "titles": titles, "french_title_only": only, "french_title_fallback": bool(info.get("fallback")),
+                "titles": titles, "french_only": only, "french_only_default": default,
+                "french_title_only": only, "fallback": fallback,
                 "kind": req.kind, "languages": list(req.languages), "total": len(results), "results": results}
 
     LINK_PROBE_MAX = 40  # results whose link is checked (best first)

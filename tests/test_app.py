@@ -130,6 +130,27 @@ class AppJobsTest(unittest.TestCase):
         self.assertEqual((media["id"], season, eps), (s1, 2, [1, 2]))
         self.assertIsNone(self.app._match_media("Other.Show.S01E01")[0])
 
+    def test_rss_sync_command_and_daemon_thread(self) -> None:  # F4
+        self.assertEqual(app_mod.COMMANDS["rss_sync"], "Synchroniser les flux RSS")
+        job = self.wait(self.app.start_command("rss_sync")[0])
+        self.assertEqual(job.status, "error")  # no indexer
+        self.assertIn("Aucun indexer actif", job.error)
+        calls = []
+        self.app.searcher.rss_sync = lambda: calls.append(1) or {"indexers": 1, "releases": 3, "wanted": 2,
+                                                                  "grabbed": 1}
+        self.app.db.add_indexer("Fake", "torznab", "http://127.0.0.1:1/api")
+        job = self.wait(self.app.start_command("rss_sync")[0])
+        self.assertEqual(job.status, "done")
+        self.assertIn("3 release(s) récente(s) de 1 indexer(s)", job.output[-1][1])
+        self.assertTrue(self.app._start_rss_thread())
+        self.app._rss_thread.join(5)
+        self.assertEqual(len(calls), 2)
+
+    def test_old_french_title_only_option_is_silently_ignored(self) -> None:
+        with open(self.cfg_path, "a", encoding="utf-8") as fh:
+            fh.write("[quality]\nfrench_title_only = true\n")
+        self.assertEqual(load_config(self.cfg_path).warnings, [])
+
 
 if __name__ == "__main__":
     unittest.main()

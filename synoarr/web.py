@@ -2,7 +2,7 @@
 
 Une seule page HTML embarquée (vanilla JS, CSS inline, aucun CDN) et une API JSON sous ``/api``.
 
-Onglets : Tableau de bord, Watchlist, Indexers, Historique, Commandes (toutes les commandes de la CLI, en
+Onglets : Tableau de bord, Watchlist, À venir, Indexers, Historique, Commandes (toutes les commandes de la CLI, en
 tâches d'arrière-plan suivies par ``GET /api/jobs/<id>``), Journal (``data/synoarr.log``) et Configuration
 (éditeur de ``config.ini`` brut, validé avant remplacement). Tout passe par l'auth Basic et la protection CSRF.
 
@@ -74,6 +74,19 @@ Watchlist (API App en tête de app.py) : ``GET /api/watchlist/search?q=&kind=&ye
 (``{"type", "title", "year", "imdb", "tmdb", "search_now"}``), ``DELETE /api/media/<id>`` ou
 ``POST /api/media/<id>/remove`` (``{"remove_from_plex", "delete_downloads"}``). Les entrées masquées (hidden)
 n'apparaissent ni dans /api/media ni dans les compteurs du tableau de bord.
+Affiches, actions groupées, À venir (méthodes App facultatives) ::
+
+        def request_posters(self, media_ids) -> bool   # cherche en arrière-plan (TMDb, limité) les affiches manquantes
+                                                        # (media.poster NULL ; "" = aucune) + media.release_date des films
+        def search_many(self, media_ids) -> None       # recherche plusieurs éléments dans UN fil d'arrière-plan
+        def start_source_search(..., french_only=None)  # transmis seulement si la méthode accepte ce paramètre
+
+``POST /api/media/bulk`` (``{"ids": [...], "action": "search"|"language"|"ignore"|"unignore"|"delete",
+"languages", "remove_from_plex", "delete_downloads"}`` -> ``{"ok", "done", "skipped", "errors", "message", ...}``),
+``GET /api/upcoming?days=30&past=7`` (``{"today", "upcoming", "recent"}`` : épisodes des séries suivies et films
+recherchés datés), ``GET /api/dashboard`` (``{"storage": espace disque de la vidéothèque, "imports": 10 derniers}``).
+Fichiers publics, sans authentification ni contrôle Host (aucun secret) : ``/manifest.webmanifest``, ``/icon.svg``,
+``/icon-192.png``, ``/icon-512.png``, ``/apple-touch-icon.png`` (icônes PNG dessinées en Python pur, zlib).
 
 Les clés d'API ne sortent jamais de l'API indexers/catalogue : elles sont remplacées par "••••". Seul l'onglet
 Configuration montre le vrai fichier (c'est la configuration de l'utilisateur, derrière l'authentification).
@@ -195,6 +208,16 @@ def mask_secrets(row: Any) -> Any:
         elif k.lower() in ("url", "link"):
             out[k] = _redact_url(out[k])
     return out
+
+
+def _accepts(func: Any, name: str) -> bool:
+    """True when *func* takes a keyword argument *name* (optional App features)."""
+    import inspect
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def _nearest_existing(path: str) -> Optional[str]:
@@ -405,6 +428,8 @@ class WebServer:
             ("GET", r"/api/config", self.api_config),
             ("POST", r"/api/config", self.api_config_save),
             ("POST", r"/api/config/restore", self.api_config_restore),
+            ("GET", r"/api/config/form", self.api_config_form),
+            ("POST", r"/api/config/form", self.api_config_form_save),
             ("POST", r"/api/media/bulk", self.api_media_bulk),
             ("GET", r"/api/upcoming", self.api_upcoming),
             ("GET", r"/api/dashboard", self.api_dashboard),
@@ -708,7 +733,14 @@ class WebServer:
     def api_media_sources(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         self._media_or_404(media_id)
         data = self._body_dict(body)
-        job, created = self.app.start_source_search(media_id, data.get("season"), data.get("episode"))
+        french_only = data.get("french_only")
+        if french_only is not None and not isinstance(french_only, bool):
+            raise HttpProblem(400, "Le champ « french_only » doit valoir true ou false")
+        func = self.app.start_source_search
+        if french_only is not None and _accepts(func, "french_only"):
+            job, created = func(media_id, data.get("season"), data.get("episode"), french_only=french_only)
+        else:
+            job, created = func(media_id, data.get("season"), data.get("episode"))
         msg = ("« %s » lancé" % job.label) if created else ("« %s » est déjà en cours" % job.label)
         return {"ok": True, "created": created, "message": msg, "job": job.to_dict()}
 
@@ -1150,6 +1182,35 @@ class WebServer:
     def api_config_restore(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         return self._config_result(self.app.restore_config_backup())
 
+    def api_config_form(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        """Formulaire de l'onglet Configuration : options des dataclasses, valeurs du fichier, aide de
+        config.example.ini ; les secrets ne sont jamais renvoyés (seulement « has_value »)."""
+        from . import configform
+        data = self.app.read_config_text()
+        out = configform.form_schema(data["text"])
+        out.update({"path": data["path"], "auth_enabled": self.auth_enabled,
+                    "restart_reasons": data.get("restart_reasons") or []})
+        return out
+
+    def api_config_form_save(self, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        """{section: {clé: valeur}} : seules les clés modifiées sont réécrites dans config.ini (commentaires et ordre
+        conservés), puis enregistrement habituel (validation, sauvegardes, rechargement). Secret : "" = effacer."""
+        from . import configform
+        data = self._body_dict(body)
+        changes = data.get("changes", data)
+        text = self.app.read_config_text()["text"]
+        values, problems = configform.normalize_changes(text, changes)
+        if problems:
+            raise HttpProblem(400, "config.ini n'a pas été modifié : valeurs invalides", {"problems": problems})
+        if not values:
+            return {"ok": True, "changed": [], "message": "Aucune modification à enregistrer"}
+        out = self._config_result(self.app.save_config_text(configform.apply_changes(text, values)))
+        out["changed"] = ["%s.%s" % (sec, key) for sec, keys in values.items() for key in keys]
+        out["message"] = "%s (%d option%s modifiée%s)" % (out.get("message") or "Configuration enregistrée",
+                                                          len(out["changed"]), "s" if len(out["changed"]) > 1 else "",
+                                                          "s" if len(out["changed"]) > 1 else "")
+        return out
+
 
 def _make_handler(server: WebServer) -> type:
     class Handler(BaseHTTPRequestHandler):
@@ -1480,6 +1541,7 @@ const CMDS=[['sync','Synchroniser la Watchlist','Importe votre Watchlist Plex (f
   ['dry_run','Simulation du traitement','Montre ce qui serait rangé, sans rien déplacer.'],
   ['check','Vérifier la configuration','Dossiers, Download Station, Plex, TMDb et indexers.'],
   ['test_indexers','Tester tous les indexers','Vérifie que chaque indexer répond.'],
+  ['rss_sync','Synchroniser les flux RSS','Lit les dernières releases de chaque indexer et envoie celles qui correspondent à un épisode, un film ou une amélioration attendus.'],
   ['ds_test','Test d\'envoi Download Station','Envoie un torrent libre très partagé (Ubuntu) des 3 façons possibles (fichier, lien, magnet) et indique lesquelles démarrent (≈ 5 min).'],
   ['ds_diag','Diagnostic Download Station','Explique pourquoi des téléchargements restent « En attente » ou en erreur.'],
   ['subtitles_scan','Rechercher les sous-titres manquants','Télécharge depuis OpenSubtitles les sous-titres manquants ([subtitles] languages) des films et séries de la bibliothèque.'],
@@ -1668,20 +1730,29 @@ function setPrio(id,v){const n=Number(v);if(!Number.isInteger(n)||n<1||n>50){toa
 /* ---------------------------------------------------- Changer de source */
 let SRC=null;const srcm=$('#srcm');
 function openSrc(d){const num=v=>v===''||v==null?null:+v;
-  SRC={mid:+d.src,s:num(d.s),e:num(d.e),g:d.g?+d.g:null,label:d.t||'',rt:d.rt||'',job:null,res:[]};srcJob=null;
+  SRC={mid:+d.src,s:num(d.s),e:num(d.e),g:d.g?+d.g:null,label:d.t||'',rt:d.rt||'',job:null,res:[],fo:null,run:0};srcJob=null;
   $('#srch').textContent=SRC.g?'Changer de source':'Choisir une source';
   $('#srcb').innerHTML=`<p class="small"><b>${esc(SRC.label)}</b>${SRC.rt?`<br><span class="mut brk">Source actuelle : ${esc(SRC.rt)}</span>`:''}</p>
   ${SRC.g?`<div class="row opts"><label class="chk"><input type="checkbox" id="sdel" checked> Supprimer l'ancien téléchargement</label><label class="chk"><input type="checkbox" id="sblk"> Bloquer l'ancienne release</label></div>`:''}
   <div id="smsg"></div>
-  <h4>Résultats des indexers</h4><div id="sres2"><p class="mut">Recherche en cours sur les indexers…</p></div>
+  <h4>Résultats des indexers</h4><div id="sfo"></div><div id="sres2"><p class="mut">Recherche en cours sur les indexers…</p></div>
   <h4>Lien magnet ou URL d'un .torrent</h4><form id="slf" class="row" autocomplete="off"><input id="slink" type="text" spellcheck="false" placeholder="magnet:?xt=urn:btih:… ou https://…/fichier.torrent" aria-label="Lien magnet ou URL d'un fichier .torrent"><button type="submit">Envoyer le lien</button></form>
   <h4>Fichier .torrent</h4><form id="sff" class="row"><input id="sfile" type="file" accept=".torrent,application/x-bittorrent" aria-label="Fichier .torrent"><button type="submit">Envoyer le fichier</button></form>`;
   srcm.hidden=false;document.body.classList.add('noscroll');$('#srcx').focus();srcSearch()}
 function closeSrc(){SRC=null;srcm.hidden=true;if(!GM)document.body.classList.remove('noscroll')}
-async function srcSearch(){const S0=SRC;try{const r=await api('media/'+S0.mid+'/sources','POST',{season:S0.s,episode:S0.e});S0.job=r.job.id;let j=r.job,fails=0;
-    while(SRC===S0&&j.status==='running'){await sleep(800);try{j=await api('jobs/'+j.id);fails=0}catch(e){if(e.status===404||++fails>20)throw e}}
-    if(SRC===S0)drawSrcRes(j)}
-  catch(e){if(SRC===S0)$('#sres2').innerHTML=`<div class="msg ko">${esc(e.message)}</div>`}}
+async function srcSearch(){const S0=SRC,run=++S0.run,live=()=>SRC===S0&&S0.run===run;const body={season:S0.s,episode:S0.e};if(S0.fo!==null)body.french_only=S0.fo;
+  const k=$('#sfoc');if(k)k.disabled=true;
+  try{const r=await api('media/'+S0.mid+'/sources','POST',body);S0.job=r.job.id;let j=r.job,fails=0;
+    while(live()&&j.status==='running'){await sleep(800);try{j=await api('jobs/'+j.id);fails=0}catch(e){if(e.status===404||++fails>20)throw e}}
+    if(live())drawSrcRes(j)}
+  catch(e){if(live()){$('#sres2').innerHTML=`<div class="msg ko">${esc(e.message)}</div>`;const c=$('#sfoc');if(c)c.disabled=false}}}
+/* « Titre français seulement » : relance la recherche des sources (filtres et tri conservés) */
+const fbNote=r=>r&&r.french_only_default==null&&r.french_only==null&&(r.fallback||r.french_title_fallback)?' <span class="b b-grabbed">recherche élargie au titre original</span>':'';
+function drawFo(r){const el=$('#sfo');if(!el)return;const dflt=r?(r.french_only_default!=null?r.french_only_default:null):null;
+  if(!r||(dflt==null&&r.french_only==null)){el.innerHTML='';return}
+  const on=r.french_only!=null?!!r.french_only:!!dflt;
+  el.innerHTML=`<div class="row opts"><label class="chk"><input type="checkbox" id="sfoc"${on?' checked':''}> Titre français seulement</label>${on&&(r.fallback||r.french_title_fallback)?'<span class="mut small">(recherche élargie au titre original)</span>':''}${dflt!=null&&on!==!!dflt?`<span class="mut small">(par défaut : ${dflt?'oui':'non'})</span>`:''}</div>`}
+function srcFoToggle(on){if(!SRC)return;SRC.fo=on;srcJob=null;$('#sres2').innerHTML='<p class="mut">Nouvelle recherche sur les indexers…</p>';srcSearch()}
 let srcJob=null;
 /* tri + filtres de la liste des sources */
 const SF={key:'score',dir:-1,q:'',smin:'',smax:'',seed:'',idx:'',ok:false};
@@ -1701,14 +1772,14 @@ function drawSrcTable(){const r=srcJob&&srcJob.result,el=$('#srctbl');if(!r||!el
   ${vis.map(x=>`<tr${x.score==null?' class="rej"':''}><td class="nw">${x.score==null?'rejeté':esc(x.score)}</td><td class="brk"><b>${esc(x.title)}</b>${lt(x)}<div class="mut small">${esc(x.reason)}</div><div class="mut small sm">${size(x.size)} · ${nv(x.seeders)} seeders · ${esc(x.indexer)}${pr(x)}</div></td>
   <td class="hm nw">${size(x.size)}</td><td class="hm">${nv(x.seeders)}</td><td class="hm">${esc(x.indexer)}${pr(x)}</td><td><button class="xs${x.score==null?' sec':''}" data-pick="${x.index}">${x.score==null?'Choisir<span class="hm"> quand même</span>':'Choisir'}</button></td></tr>`).join('')}</table></div>`
   :'<p class="mut">Aucun résultat ne correspond aux filtres.</p>'}
-function drawSrcRes(j){const first=srcJob!==j||!$('#srctbl');srcJob=j;const r=j.result,el=$('#sres2');if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
+function drawSrcRes(j){const first=srcJob!==j||!$('#srctbl');srcJob=j;const r=j.result,el=$('#sres2');drawFo(j.status==='error'?null:r);if(j.status==='error'||!r){el.innerHTML=`<div class="msg ko">${esc(j.error||'Recherche impossible')}</div>`;return}
   SRC.res=r.results;const langs=esc((r.languages||[]).join(', ')||'—');
   if(!r.results.length){const ts=(r.titles||[]).length?(r.titles||[]).map(esc).join(' · '):esc(r.request);
-    el.innerHTML=`<p class="mut">Aucun résultat. Titres cherchés : <b>${ts}</b>${r.french_title_only?' (titre français seulement)':''} · langues : ${langs}. Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
+    el.innerHTML=`<p class="mut">Aucun résultat. Titres cherchés : <b>${ts}</b>${r.french_title_only?' (titre français seulement)':''}${fbNote(r)} · langues : ${langs}. Collez un lien ou envoyez un fichier .torrent ci-dessous.</p>`;return}
   if(first){const ok=r.results.filter(x=>x.score!=null).length,idxs=[...new Set(r.results.map(x=>x.indexer))].sort();
     if(SF.idx&&!idxs.includes(SF.idx))SF.idx='';
     const opt=(v,l)=>`<option value="${esc(v)}"${SF.key===v?' selected':''}>${l}</option>`;
-    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)}${(r.titles||[]).length?` · titres cherchés : <b>${(r.titles||[]).map(esc).join(' · ')}</b>${r.french_title_only?' (titre français seulement)':''}`:''} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
+    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)}${(r.titles||[]).length?` · titres cherchés : <b>${(r.titles||[]).map(esc).join(' · ')}</b>${r.french_title_only?' (titre français seulement)':''}`:''}${fbNote(r)} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
     <div id="srcchips"></div>
     <div class="row sfil" role="group" aria-label="Filtrer les sources">
       <input id="sfq" type="search" placeholder="Filtrer le titre (ex. 1080p, MULTi…)" value="${esc(SF.q)}" aria-label="Filtrer le titre">
@@ -1745,7 +1816,7 @@ srcm.addEventListener('click',e=>{if(e.target===srcm||e.target.closest('[data-mc
     if(srcJob){const j0=srcJob;srcJob=null;drawSrcRes(j0)}return}
   const b=e.target.closest('button[data-pick]');if(b)pick(+b.dataset.pick)});
 srcm.addEventListener('input',e=>{if(e.target.closest('.sfil'))srcFilterInput()});
-srcm.addEventListener('change',e=>{if(e.target.closest('.sfil'))srcFilterInput()});
+srcm.addEventListener('change',e=>{if(e.target.id==='sfoc'){srcFoToggle(e.target.checked);return}if(e.target.closest('.sfil'))srcFilterInput()});
 srcm.addEventListener('submit',e=>{e.preventDefault();if(e.target.id==='slf'){const v=$('#slink').value.trim();if(!v){toast('Collez un lien magnet ou une URL .torrent',true);return}srcSend({link:v})}
   else if(e.target.id==='sff')srcFile()});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if(SRC)closeSrc();else if(GM)closeGM()});

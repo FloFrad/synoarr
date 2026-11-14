@@ -421,7 +421,7 @@ class UpgradeTests(unittest.TestCase):
         cfg = QualityConfig()
         self.assertTrue(cfg.upgrade)
         self.assertEqual(cfg.upgrade_until, "1080p")
-        self.assertTrue(cfg.french_title_fallback)
+        self.assertFalse(hasattr(cfg, "french_title_only"))  # replaced by a per-search choice
 
     def test_pick_upgrade_only_strictly_better(self):
         releases = [rel("Dune.2021.720p.BluRay.x264-A", seeders=900),
