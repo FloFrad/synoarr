@@ -1764,3 +1764,31 @@ class AddWithLanguageTest(RealAppWebBase):
         status, data, _ = self.req("/api/watchlist/manual", "POST",
                                    {"type": "movie", "title": "X", "languages": "fr!"})
         self.assertEqual(status, 400)
+
+
+class FrenchTitleOnlyDisplayTest(RealAppWebBase):
+    def test_sources_show_exact_queries(self) -> None:
+        self.app.indexer_manager.add_url("Fake", self.srv.url + "/torznab", type_="torznab")
+        mid = self.app.db.upsert_media("ninja", "movie", "3 Ninjas Kick Back", 1994, "tt0109015", None, None)
+        self.app.db.set_title_fr(mid, "Les 3 Ninjas contre-attaquent")
+        self.app.db.set_language_override(mid, "fr")
+        self.app.db.set_title_fr(mid, "Les 3 Ninjas contre-attaquent")
+
+        def titles() -> Dict[str, Any]:
+            status, data, _ = self.req("/api/media/%d/sources" % mid, "POST", {})
+            self.assertEqual(status, 200, data)
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                job = self.req("/api/jobs/%d" % data["job"]["id"])[1]
+                if job["status"] != "running":
+                    return job["result"]
+                time.sleep(0.05)
+            self.fail("recherche trop longue")
+        r = titles()
+        self.assertFalse(r["french_title_only"])
+        self.assertIn("Les 3 Ninjas contre-attaquent", r["titles"])
+        self.assertTrue(any(t.startswith("3 Ninjas Kick Back") for t in r["titles"]))
+        self.app.cfg.quality.french_title_only = True
+        r = titles()
+        self.assertTrue(r["french_title_only"])
+        self.assertEqual(r["titles"], ["Les 3 Ninjas contre-attaquent"])

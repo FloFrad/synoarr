@@ -1557,11 +1557,16 @@ class App:
     def _cmd_sources(self, job: Job, target: Tuple[int, Optional[int], Optional[int]], req: Any) -> Dict[str, Any]:
         job.emit("info", "Recherche : %s (langues : %s)" % (req.describe(), ", ".join(req.languages) or "—"))
         titles = []  # type: List[str]
-        for t in [req.title, req.title_fr] + list(req.alt_titles or []):
-            if t and t.strip().lower() not in [x.lower() for x in titles]:
-                titles.append(t.strip())
-        if len(titles) > 1:
-            job.emit("info", "Titres cherchés : %s" % " · ".join(titles[:4]))
+        for q in self.searcher.queries_for(req):  # exactly what is sent to the indexers
+            label = q.title.strip() + (" (identifiant IMDb/TVDB)" if (q.imdb or q.tvdb) else "")
+            if label.lower() not in [x.lower() for x in titles]:
+                titles.append(label)
+        only = self.searcher.french_title_only_applies(req)
+        job.emit("info", "Titres cherchés : %s%s" % (" · ".join(titles), " (réglage french_title_only actif)"
+                                                    if only else ""))
+        if "fr" in [x.lower() for x in req.languages or []] and not only and req.title_fr \
+                and not getattr(self.cfg.quality, "french_title_only", False):
+            job.emit("info", "Réglage [quality] french_title_only : inactif (titre français ET titre original)")
         if not self.db.list_indexers(enabled_only=True):
             job.emit("warn", "Aucun indexer actif : ajoutez-en un depuis l'onglet Indexers")
         report = self.searcher.search_report(req)[:300]
@@ -1578,7 +1583,7 @@ class App:
         accepted = sum(1 for r in results if r["score"] is not None)
         job.emit("ok" if accepted else "warn", "%d résultat(s), dont %d acceptable(s)" % (len(results), accepted))
         return {"media_id": target[0], "season": target[1], "episode": target[2], "request": req.describe(),
-                "titles": titles[:4],
+                "titles": titles, "french_title_only": only,
                 "kind": req.kind, "languages": list(req.languages), "total": len(results), "results": results}
 
     LINK_PROBE_MAX = 40  # results whose link is checked (best first)

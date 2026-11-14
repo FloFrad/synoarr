@@ -1358,7 +1358,7 @@ function drawSrcRes(j){const first=srcJob!==j||!$('#srctbl');srcJob=j;const r=j.
   if(first){const ok=r.results.filter(x=>x.score!=null).length,idxs=[...new Set(r.results.map(x=>x.indexer))].sort();
     if(SF.idx&&!idxs.includes(SF.idx))SF.idx='';
     const opt=(v,l)=>`<option value="${esc(v)}"${SF.key===v?' selected':''}>${l}</option>`;
-    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)}${(r.titles||[]).length>1?` · titres cherchés : <b>${(r.titles||[]).map(esc).join(' · ')}</b>`:''} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
+    el.innerHTML=`<p class="mut small">Requête : ${esc(r.request)}${(r.titles||[]).length?` · titres cherchés : <b>${(r.titles||[]).map(esc).join(' · ')}</b>${r.french_title_only?' (titre français seulement)':''}`:''} · langues : ${langs} · ${r.total} résultat(s), ${ok} acceptable(s). Les résultats rejetés peuvent aussi être choisis. <span class="b b-done">.torrent</span> = fichier téléchargé directement ; <span class="b b-grabbed">magnet</span> = Download Station doit d'abord trouver des sources.</p>
     <div id="srcchips"></div>
     <div class="row sfil" role="group" aria-label="Filtrer les sources">
       <input id="sfq" type="search" placeholder="Filtrer le titre (ex. 1080p, MULTi…)" value="${esc(SF.q)}" aria-label="Filtrer le titre">

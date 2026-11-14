@@ -620,14 +620,20 @@ class Searcher:
     def _collect(self, req: SearchRequest, indexers: List["Indexer"]) -> List[Release]:
         """Results of every indexer for the main title, then for the other titles (French / original title):
         a French release is named after the French title and is not found with the English one."""
-        import dataclasses
+        return self._run_queries(self.queries_for(req), indexers)
+
+    def french_title_only_applies(self, req: SearchRequest) -> bool:
         langs = {x.lower() for x in (req.languages or [])}
-        if req.title_fr and langs == {"fr"} and getattr(self.cfg.quality, "french_title_only", False):
+        return bool(req.title_fr) and langs == {"fr"} and bool(getattr(self.cfg.quality, "french_title_only", False))
+
+    def queries_for(self, req: SearchRequest) -> List[SearchRequest]:
+        """The searches actually sent to the indexers for *req* (also shown in « Changer de source »)."""
+        import dataclasses
+        if self.french_title_only_applies(req):
             # [quality] french_title_only: one text search with the French title only
-            only = dataclasses.replace(req, title=req.title_fr, imdb=None, tmdb=None, tvdb=None,
-                                       alt_titles=[t for t in [req.title] + list(req.alt_titles or [])
-                                                   if t and t != req.title_fr])
-            return self._run_queries([only], indexers)
+            return [dataclasses.replace(req, title=req.title_fr, imdb=None, tmdb=None, tvdb=None,
+                                        alt_titles=[t for t in [req.title] + list(req.alt_titles or [])
+                                                    if t and t != req.title_fr])]
         queries = [req]
         seen_titles = {(req.title or "").strip().lower()}
         if "fr" in [x.lower() for x in (req.languages or [])] and (req.imdb or req.tvdb or req.tmdb):
@@ -645,7 +651,7 @@ class Searcher:
                 # text search only: an id search (imdbid/tvdbid) would return the same English-named results
                 queries.append(dataclasses.replace(req, title=alt, imdb=None, tmdb=None, tvdb=None,
                                                    alt_titles=[req.title] + [a for a in req.alt_titles if a != alt]))
-        return self._run_queries(queries, indexers)
+        return queries
 
     def _run_queries(self, queries: List[SearchRequest], indexers: List["Indexer"]) -> List[Release]:
         results: List[Release] = []
