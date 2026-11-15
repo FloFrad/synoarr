@@ -383,10 +383,15 @@ en échec, bloqué ou abandonné), `watchlist` (élément ajouté), `upgrade` (a
 ### Piloter synoarr depuis Telegram
 
 Dès que `bot_token` et `chat_id` sont remplis, le bot répond aussi aux commandes (`commands = true` par défaut).
-Tapez `/help` dans la conversation du bot :
+Tapez `/menu` dans la conversation du bot : un menu à boutons s'affiche (Statut, Téléchargements, Watchlist,
+À venir, Rechercher, Ajouter, Synchroniser, Ranger, Flux RSS, Espace, Mises à jour, Aide). Un appui sur un bouton
+fait la même chose que la commande. **Rechercher** et **Ajouter** demandent le titre : répondez simplement par le
+titre. Les résultats arrivent avec des boutons numérotés (📥 1, ➕ 1…) pour envoyer ou ajouter en un appui.
+Le bouton **Menu** de Telegram (à gauche du champ de saisie) liste aussi toutes les commandes.
 
 | Commande | Effet |
 |---|---|
+| `/menu` | menu à boutons |
 | `/statut` | état de synoarr (Plex, Download Station, indexers, éléments recherchés) |
 | `/telechargements` | téléchargements en cours avec progression et vitesse |
 | `/watchlist` | résumé de la Watchlist et films encore recherchés |

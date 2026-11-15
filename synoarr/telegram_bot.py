@@ -22,8 +22,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-ANNOUNCE_ID = "telegram-commands-2"  # bump to announce a new batch of commands once
+ANNOUNCE_ID = "telegram-commands-3"  # bump to announce a new batch of commands once
 HELP_TEXT = """<b>Commandes synoarr</b>
+/menu — menu à boutons
 /statut — état de synoarr
 /telechargements — téléchargements en cours
 /watchlist — résumé de la Watchlist
@@ -47,6 +48,44 @@ ALIASES = {"start": "help", "aide": "help", "status": "statut", "dl": "telecharg
 YES = ("oui", "o", "yes", "y", "ok", "go")
 LEVEL_ICON = {"ok": "✅", "err": "❌", "warn": "⚠️", "info": "•"}
 
+# Telegram's own "Menu" button (next to the text field) lists these commands (setMyCommands)
+BOT_COMMANDS = [("menu", "Menu à boutons"), ("statut", "État de synoarr"),
+                ("telechargements", "Téléchargements en cours"), ("watchlist", "Résumé de la Watchlist"),
+                ("avenir", "Les 7 prochains jours"), ("recherche", "Chercher une release : /recherche titre"),
+                ("ajouter", "Ajouter un film ou une série : /ajouter titre"),
+                ("sync", "Synchroniser la Watchlist"), ("traiter", "Ranger les téléchargements terminés"),
+                ("rss", "Lire les flux RSS"), ("espace", "Espace libre"), ("maj", "Mises à jour de synoarr"),
+                ("help", "Aide")]
+# buttons of /menu: (label, callback data). "cmd:x" runs /x, "ask:x" asks for the argument of /x first
+MENU_BUTTONS = [[("📊 Statut", "cmd:statut"), ("📥 Téléchargements", "cmd:telechargements")],
+                [("👀 Watchlist", "cmd:watchlist"), ("📅 À venir", "cmd:avenir")],
+                [("🔎 Rechercher", "ask:recherche"), ("➕ Ajouter", "ask:ajouter")],
+                [("🔄 Synchroniser", "cmd:sync"), ("📦 Ranger", "cmd:traiter")],
+                [("📡 Flux RSS", "cmd:rss"), ("💾 Espace", "cmd:espace")],
+                [("🆕 Mises à jour", "cmd:maj"), ("❓ Aide", "cmd:help")]]
+ASK_TEXT = {"recherche": "🔎 Quel titre rechercher ? (ex. Night of the Living Dead 1968)",
+            "ajouter": "➕ Quel film ou quelle série ajouter ? (ex. Dune)"}
+MENU_ROW = [("📋 Menu", "cmd:menu")]
+
+
+def keyboard(rows: List[List[Any]]) -> Dict[str, Any]:
+    return {"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in row] for row in rows]}
+
+
+def numbered_buttons(prefix: str, icon: str, count: int, per_row: int = 4) -> List[List[Any]]:
+    btns = [("%s %d" % (icon, i), "cmd:%s %d" % (prefix, i)) for i in range(1, count + 1)]
+    return [btns[i:i + per_row] for i in range(0, len(btns), per_row)]
+
+
+class Answer(str):
+    """A reply text (behaves as str) that may carry buttons (Telegram reply_markup)."""
+    markup = None  # type: Optional[Dict[str, Any]]
+
+    def __new__(cls, text: str, markup: Optional[Dict[str, Any]] = None) -> "Answer":
+        obj = str.__new__(cls, text)
+        obj.markup = markup
+        return obj
+
 
 def esc(value: Any) -> str:
     return html.escape(str(value), quote=False)
@@ -66,6 +105,7 @@ def human(n: Any) -> str:
 
 class TelegramBot(object):
     poll_timeout = 25  # seconds of long polling per getUpdates call
+    allowed_updates = ["message", "callback_query"]  # callback_query: taps on buttons
 
     def __init__(self, app: "App", bot_token: str, chat_id: str, api_url: str = "https://api.telegram.org",
                  http: Optional[HttpClient] = None):
@@ -79,8 +119,9 @@ class TelegramBot(object):
         self._results = []  # type: List[Any]   # last /recherche results (Release objects)
         self._candidates = []  # type: List[Dict[str, Any]]  # last /ajouter candidates
         self._warned = set()  # type: set
+        self._pending = None  # type: Optional[str]  # command waiting for its argument (menu Rechercher/Ajouter)
         self.handlers = {
-            "help": self.cmd_help, "statut": self.cmd_status, "telechargements": self.cmd_downloads,
+            "menu": self.cmd_menu, "help": self.cmd_help, "statut": self.cmd_status, "telechargements": self.cmd_downloads,
             "watchlist": self.cmd_watchlist, "avenir": self.cmd_upcoming, "recherche": self.cmd_search,
             "envoyer": self.cmd_grab, "ajouter": self.cmd_add, "sync": self.cmd_sync, "traiter": self.cmd_process,
             "rss": self.cmd_rss, "espace": self.cmd_space, "maj": self.cmd_update,
@@ -105,12 +146,24 @@ class TelegramBot(object):
         log.debug("Telegram %s refusé : %s", method, str(data)[:200].replace(self.bot_token, "***"))
         return None
 
-    def reply(self, text: str) -> bool:
-        for part in self._split(text):
-            if self._call("sendMessage", {"chat_id": self.chat_id, "text": part, "parse_mode": "HTML",
-                                          "disable_web_page_preview": True}, timeout=20) is None:
+    def reply(self, text: str, markup: Optional[Dict[str, Any]] = None) -> bool:
+        if markup is None:
+            markup = getattr(text, "markup", None)
+        parts = self._split(str(text))
+        for i, part in enumerate(parts):
+            payload = {"chat_id": self.chat_id, "text": part, "parse_mode": "HTML",
+                       "disable_web_page_preview": True}  # type: Dict[str, Any]
+            if markup and i == len(parts) - 1:  # buttons under the last part only
+                payload["reply_markup"] = markup
+            if self._call("sendMessage", payload, timeout=20) is None:
                 return False
         return True
+
+    def register_commands(self) -> bool:
+        """Fill Telegram's "Menu" button (left of the text field) with the commands, for this chat only."""
+        return self._call("setMyCommands", {
+            "commands": [{"command": c, "description": d} for c, d in BOT_COMMANDS],
+            "scope": {"type": "chat", "chat_id": self.chat_id}}, timeout=20) is not None
 
     @staticmethod
     def _split(text: str, limit: int = 4000) -> List[str]:
@@ -142,13 +195,14 @@ class TelegramBot(object):
     def _run(self) -> None:
         offset = self._offset()
         if offset is None:  # first start: never execute commands typed before synoarr listened
-            updates = self._call("getUpdates", {"timeout": 0, "allowed_updates": ["message"]}, timeout=20) or []
+            updates = self._call("getUpdates", {"timeout": 0, "allowed_updates": self.allowed_updates},
+                                 timeout=20) or []
             if updates:
                 offset = max(u.get("update_id", 0) for u in updates if isinstance(u, dict)) + 1
                 self.app.db.set_kv("telegram_offset", str(offset))
         errors = 0
         while not self._stop.is_set():
-            payload = {"timeout": self.poll_timeout, "allowed_updates": ["message"]}  # type: Dict[str, Any]
+            payload = {"timeout": self.poll_timeout, "allowed_updates": self.allowed_updates}  # type: Dict[str, Any]
             if offset is not None:
                 payload["offset"] = offset
             updates = self._call("getUpdates", payload)
@@ -170,42 +224,78 @@ class TelegramBot(object):
 
     def handle_update(self, upd: Dict[str, Any]) -> Optional[str]:
         """Execute one update; returns the reply text (also sent), or None when ignored."""
+        if upd.get("callback_query"):
+            return self.handle_callback(upd["callback_query"])
         msg = upd.get("message") or {}
         chat = msg.get("chat") or {}
         text = (msg.get("text") or "").strip()
-        if str(chat.get("id")) != self.chat_id:
-            cid = chat.get("id")
-            if cid not in self._warned:
-                self._warned.add(cid)
-                log.warning("Telegram : message ignoré d'une conversation non autorisée (chat %s)", cid)
+        if not self._authorized(chat):
             return None
-        if not text.startswith("/"):
-            answer = "Tapez /help pour la liste des commandes."
-        else:
+        pending, self._pending = self._pending, None
+        if text.startswith("/"):
             head, _, args = text[1:].partition(" ")
-            name = head.split("@", 1)[0].lower()
-            name = ALIASES.get(name, name)
-            handler = self.handlers.get(name)
-            answer = handler(args.strip()) if handler else "Commande inconnue : /%s — tapez /help" % esc(name)
+            answer = self.run_command(head.split("@", 1)[0], args)
+        elif pending and text:  # answer to "Quel titre rechercher ?"
+            answer = self.run_command(pending, text)
+        else:
+            answer = Answer("Tapez /menu (boutons) ou /help pour la liste des commandes.", keyboard(MENU_BUTTONS))
         self.reply(answer)
         return answer
+
+    def handle_callback(self, cq: Dict[str, Any]) -> Optional[str]:
+        """A tap on a button: same effect as typing the command."""
+        chat = (cq.get("message") or {}).get("chat") or {}
+        if not self._authorized(chat):
+            return None
+        self._call("answerCallbackQuery", {"callback_query_id": cq.get("id")}, timeout=20)  # stop the spinner
+        kind, _, rest = str(cq.get("data") or "").partition(":")
+        name, _, args = rest.partition(" ")
+        self._pending = None
+        if kind == "ask" and name in ASK_TEXT:
+            self._pending = name
+            answer = Answer(ASK_TEXT[name], {"force_reply": True, "input_field_placeholder": "Titre"})
+        elif kind == "cmd":
+            answer = self.run_command(name, args)
+        else:
+            return None
+        self.reply(answer)
+        return answer
+
+    def _authorized(self, chat: Dict[str, Any]) -> bool:
+        if str(chat.get("id")) == self.chat_id:
+            return True
+        cid = chat.get("id")
+        if cid not in self._warned:
+            self._warned.add(cid)
+            log.warning("Telegram : message ignoré d'une conversation non autorisée (chat %s)", cid)
+        return False
+
+    def run_command(self, name: str, args: str = "") -> str:
+        name = ALIASES.get(name.lower(), name.lower())
+        handler = self.handlers.get(name)
+        return handler(args.strip()) if handler else "Commande inconnue : /%s — tapez /help" % esc(name)
 
     def announce(self) -> None:
         """At startup: confirm an update asked with /maj oui, and tell once that the commands are available."""
         if not self.enabled:
             return
+        self.register_commands()
         if self.app.db.get_kv("telegram_update_pending"):
             if self.reply("✅ <b>synoarr a redémarré</b> après la mise à jour (version %s)." % esc(__version__)):
                 self.app.db.set_kv("telegram_update_pending", None)
         if self.app.db.get_kv("telegram_announced") == ANNOUNCE_ID:
             return
-        if self.reply("🔄 <b>synoarr %s est à jour</b>\nVous pouvez maintenant piloter synoarr depuis Telegram.\n\n%s"
-                      % (esc(__version__), HELP_TEXT)):
+        if self.reply("🔄 <b>synoarr %s est à jour</b>\nVous pouvez maintenant piloter synoarr depuis Telegram, "
+                      "avec les boutons ci-dessous ou /menu.\n\n%s" % (esc(__version__), HELP_TEXT),
+                      keyboard(MENU_BUTTONS)):
             self.app.db.set_kv("telegram_announced", ANNOUNCE_ID)
 
     # ------------------------------------------------------------- commands
+    def cmd_menu(self, args: str) -> str:
+        return Answer("📋 <b>Menu synoarr</b>\nChoisissez une action :", keyboard(MENU_BUTTONS))
+
     def cmd_help(self, args: str) -> str:
-        return HELP_TEXT
+        return Answer(HELP_TEXT, keyboard(MENU_BUTTONS))
 
     def cmd_status(self, args: str) -> str:
         st = self.app.status()
@@ -241,7 +331,7 @@ class TelegramBot(object):
             if x.get("season") is not None:
                 what += " S%02d" % x["season"] + ("E%02d" % x["episode"] if x.get("episode") is not None else "")
             lines.append("• %s — %s (%s)%s" % (esc(what), pct, esc(x.get("status")), speed))
-        return "\n".join(lines)
+        return Answer("\n".join(lines), keyboard([[("🔄 Actualiser", "cmd:telechargements")] + MENU_ROW]))
 
     def cmd_watchlist(self, args: str) -> str:
         medias = self.app.db.list_media(on_watchlist_only=True)
@@ -284,8 +374,8 @@ class TelegramBot(object):
             kind = "magnet" if r.magnet and not r.download_url else ".torrent"
             lines.append("%d. %s\n   %s · %s seeders · %s · %s" % (
                 i, esc(r.title), human(r.size), "?" if r.seeders is None else r.seeders, esc(r.indexer), kind))
-        lines.append("Envoyer : /envoyer <i>n</i>")
-        return "\n".join(lines)
+        lines.append("Envoyer : bouton 📥 ou /envoyer <i>n</i>")
+        return Answer("\n".join(lines), keyboard(numbered_buttons("envoyer", "📥", len(ok)) + [MENU_ROW]))
 
     def cmd_grab(self, args: str) -> str:
         try:
@@ -329,8 +419,9 @@ class TelegramBot(object):
             lines.append("%d. %s%s — %s%s" % (i, esc(c.get("title")), " (%s)" % c["year"] if c.get("year") else "",
                                               "film" if c.get("type") == "movie" else "série",
                                               " · déjà dans la liste" if c.get("in_watchlist") else ""))
-        lines.append("Ajouter : /ajouter <i>n</i>")
-        return "\n".join(lines)
+        lines.append("Ajouter : bouton ➕ ou /ajouter <i>n</i>")
+        return Answer("\n".join(lines),
+                      keyboard(numbered_buttons("ajouter", "➕", len(self._candidates), 3) + [MENU_ROW]))
 
     def cmd_sync(self, args: str) -> str:
         return ("🔄 Synchronisation de la Watchlist et recherches lancées." if self.app.run_watchlist_now()
@@ -391,8 +482,9 @@ class TelegramBot(object):
         if job.status == "error" or res.get("ok") is False:
             return "\n".join(["❌ <b>Vérification impossible</b>"] + lines)
         if res.get("available"):
-            return "\n".join(["🆕 <b>Mise à jour disponible</b> (version installée : %s)" % esc(__version__)] + lines
-                             + ["Installer et redémarrer : /maj oui"])
+            return Answer("\n".join(["🆕 <b>Mise à jour disponible</b> (version installée : %s)" % esc(__version__)]
+                                     + lines + ["Installer et redémarrer : bouton ci-dessous ou /maj oui"]),
+                          keyboard([[("⬇️ Installer et redémarrer", "cmd:maj oui")]]))
         return "\n".join(["✅ <b>synoarr est à jour</b> (version %s)" % esc(__version__)] + lines)
 
     def cmd_space(self, args: str) -> str:
@@ -425,4 +517,4 @@ def from_app(app: "App") -> Optional[TelegramBot]:
                        api_url=getattr(app, "telegram_api_url", None) or "https://api.telegram.org")
 
 
-__all__ = ["TelegramBot", "from_app", "HELP_TEXT", "ANNOUNCE_ID"]
+__all__ = ["TelegramBot", "from_app", "HELP_TEXT", "ANNOUNCE_ID", "MENU_BUTTONS", "Answer"]

@@ -17,7 +17,7 @@ from synoarr.app import App
 from synoarr.config import load_config
 from synoarr.models import Release
 from synoarr.notify import TelegramNotifier
-from synoarr.telegram_bot import ANNOUNCE_ID, HELP_TEXT, TelegramBot
+from synoarr.telegram_bot import ANNOUNCE_ID, HELP_TEXT, MENU_BUTTONS, TelegramBot
 
 from fakes import FakeServer
 
@@ -39,6 +39,12 @@ class FakeBotApi(object):
             self.updates.append({"update_id": uid, "message": {"message_id": uid, "chat": {"id": int(chat)},
                                                                "text": text}})
 
+    def push_button(self, data: str, chat: Any = CHAT) -> None:
+        with self.lock:
+            uid = 100 + len(self.updates)
+            self.updates.append({"update_id": uid, "callback_query": {
+                "id": "cb%d" % uid, "data": data, "message": {"message_id": 1, "chat": {"id": int(chat)}}}})
+
     def handler(self, req):
         prefix = "/bot%s/" % TOKEN
         if not req.path.startswith(prefix):
@@ -54,7 +60,13 @@ class FakeBotApi(object):
             return 200, {}, {"ok": True, "result": res}
         if method == "sendMessage":
             return 200, {}, {"ok": True, "result": {"message_id": 1}}
+        if method in ("answerCallbackQuery", "setMyCommands"):
+            return 200, {}, {"ok": True, "result": True}
         return 404, {}, {"ok": False}
+
+    def calls(self, method: str) -> List[Dict[str, Any]]:
+        return [json.loads(r.body.decode("utf-8")) for r in list(self.srv.requests)
+                if r.path.endswith("/" + method) and r.body]
 
     def sent(self) -> List[Dict[str, Any]]:
         return [json.loads(r.body.decode("utf-8")) for r in list(self.srv.requests)
@@ -101,6 +113,10 @@ class BotTestBase(unittest.TestCase):
 
     def say(self, text: str, chat: Any = CHAT):
         return self.bot.handle_update({"update_id": 1, "message": {"chat": {"id": int(chat)}, "text": text}})
+
+    def tap(self, data: str, chat: Any = CHAT):
+        return self.bot.handle_update({"update_id": 1, "callback_query": {
+            "id": "cb1", "data": data, "message": {"message_id": 5, "chat": {"id": int(chat)}}}})
 
 
 class CommandsTest(BotTestBase):
@@ -245,6 +261,96 @@ class CommandsTest(BotTestBase):
         parts = TelegramBot._split("\n".join("ligne %d %s" % (i, "x" * 80) for i in range(200)))
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(p) <= 4000 for p in parts))
+
+
+class MenuTest(BotTestBase):
+    @staticmethod
+    def buttons(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [b for row in msg.get("reply_markup", {}).get("inline_keyboard", []) for b in row]
+
+    def test_menu_shows_buttons_for_commands(self) -> None:
+        self.assertIn("Menu synoarr", self.say("/menu"))
+        btns = self.buttons(self.api.sent()[-1])
+        datas = [b["callback_data"] for b in btns]
+        for name in ("statut", "telechargements", "watchlist", "avenir", "sync", "traiter", "rss", "espace", "maj",
+                     "help"):
+            self.assertIn("cmd:" + name, datas)
+        self.assertIn("ask:recherche", datas)
+        self.assertIn("ask:ajouter", datas)
+        self.assertTrue(all(len(d.encode("utf-8")) <= 64 for d in datas))  # Telegram limit
+        for kind_name in datas:  # every button leads to a real command
+            self.assertIn(kind_name.split(":", 1)[1], self.bot.handlers)
+        self.say("/help")
+        self.assertEqual(len(self.buttons(self.api.sent()[-1])), sum(len(r) for r in MENU_BUTTONS))
+
+    def test_button_runs_command(self) -> None:
+        with mock.patch.object(self.app, "run_watchlist_now", return_value=True) as sync:
+            self.assertIn("lancées", self.tap("cmd:sync"))
+        sync.assert_called_once_with()
+        self.assertEqual([c["callback_query_id"] for c in self.api.calls("answerCallbackQuery")], ["cb1"])
+        self.assertIn("Indexers actifs", self.tap("cmd:statut"))
+
+    def test_button_from_other_chat_is_ignored(self) -> None:
+        with mock.patch.object(self.app, "run_watchlist_now") as sync:
+            self.assertIsNone(self.tap("cmd:sync", chat=999))
+        sync.assert_not_called()
+        self.assertEqual(self.api.sent(), [])
+        self.assertEqual(self.api.calls("answerCallbackQuery"), [])
+
+    def test_ask_then_title_runs_search_with_grab_buttons(self) -> None:
+        self.assertIn("Quel titre", self.tap("ask:recherche"))
+        self.assertTrue(self.api.sent()[-1]["reply_markup"]["force_reply"])
+        rel = Release(title="Night.of.the.Living.Dead.1968.1080p", indexer="IA", download_url="http://x/a.torrent")
+        with mock.patch.object(self.app.searcher, "search_report", return_value=[(rel, 100, "ok")]) as rep:
+            answer = self.say("Night of the Living Dead 1968")
+        self.assertEqual(rep.call_args[0][0].title, "Night of the Living Dead")
+        self.assertIn("1. Night.of.the.Living.Dead.1968.1080p", answer)
+        self.assertIn("cmd:envoyer 1", [b["callback_data"] for b in self.buttons(self.api.sent()[-1])])
+        with mock.patch.object(self.app.searcher, "grab", return_value=True) as grab:
+            self.assertIn("Envoyé", self.tap("cmd:envoyer 1"))
+        self.assertIs(grab.call_args[0][0], rel)
+        # the question is answered once: plain text afterwards shows the menu again
+        self.assertIn("/menu", self.say("Night of the Living Dead 1968"))
+
+    def test_ask_add_then_add_button(self) -> None:
+        self.tap("ask:ajouter")
+        cands = [{"title": "Dune", "year": 2021, "type": "movie"}]
+        with mock.patch.object(self.app, "search_titles", return_value={"results": cands}):
+            self.assertIn("1. Dune (2021)", self.say("Dune"))
+        self.assertIn("cmd:ajouter 1", [b["callback_data"] for b in self.buttons(self.api.sent()[-1])])
+        with mock.patch.object(self.app, "add_to_watchlist",
+                               return_value={"id": 7, "title": "Dune", "year": 2021, "status": "wanted"}), \
+                mock.patch.object(self.app, "search_now"):
+            self.assertIn("Ajouté : Dune (2021)", self.tap("cmd:ajouter 1"))
+
+    def test_command_cancels_pending_question(self) -> None:
+        self.tap("ask:recherche")
+        self.assertIn("Indexers actifs", self.say("/statut"))
+        self.assertIn("/menu", self.say("Dune"))
+
+    def test_update_available_has_install_button(self) -> None:
+        with mock.patch.object(self.app, "_cmd_update", return_value={"available": True}):
+            self.say("/maj")
+        self.assertEqual([b["callback_data"] for b in self.buttons(self.api.sent()[-1])], ["cmd:maj oui"])
+
+    def test_polling_receives_button_taps(self) -> None:
+        self.app.db.set_kv("telegram_offset", "100")
+        self.api.push_button("cmd:help")
+        self.bot.start()
+        sent = self.api.wait_sent(1)
+        self.assertEqual(sent[0]["text"], HELP_TEXT)
+        gets = self.api.calls("getUpdates")
+        self.assertIn("callback_query", gets[0]["allowed_updates"])
+
+    def test_announce_registers_commands_menu(self) -> None:
+        self.bot.announce()
+        cmds = self.api.calls("setMyCommands")
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(cmds[0]["scope"], {"type": "chat", "chat_id": CHAT})
+        names = [c["command"] for c in cmds[0]["commands"]]
+        self.assertIn("menu", names)
+        self.assertTrue(all(n in self.bot.handlers for n in names))
+        self.assertIn("reply_markup", self.api.sent()[0])
 
 
 class UpdateCommandTest(BotTestBase):

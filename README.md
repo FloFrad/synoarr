@@ -13,7 +13,7 @@ Remplaçant léger de **Prowlarr + Radarr + Sonarr + Filebot**, pensé pour un N
   affiches et onglets de statut, « À venir », recherche manuelle, indexers, commandes, historique, journal et
   configuration par formulaire.
 - **Bonus** : mises à niveau de qualité (720p → 1080p), flux RSS pour les nouveaux épisodes, recherche par titre
-  français, notifications et commandes **Telegram** (`/help`), sous-titres automatiques **OpenSubtitles**.
+  français, notifications et commandes **Telegram** (menu à boutons `/menu`), sous-titres automatiques **OpenSubtitles**.
 
 Aucune dépendance : **Python 3.8+ seul** (déjà présent dans DSM 7). Docker possible mais pas obligatoire.
 
