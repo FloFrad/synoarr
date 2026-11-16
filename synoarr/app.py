@@ -1473,7 +1473,7 @@ class App:
     # ------------------------------------- téléchargements en cours / changer de source (onglet Watchlist)
     DOWNLOADS_CACHE_SECONDS = 5.0     # l'interface se rafraîchit toutes les 5 à 15 s : DSM n'est pas sollicité plus
     DOWNLOADS_ERROR_CACHE_SECONDS = 30.0
-    DOWNLOADS_TIMEOUT = 6.0  # listing de la progression : un DSM muet ne bloque jamais la Watchlist longtemps
+    DOWNLOADS_TIMEOUT = 10.0  # listing de la progression : un DSM muet ne bloque jamais la Watchlist longtemps
     _dl_lock = threading.Lock()  # protège le cache ci-dessous ; jamais tenu pendant un appel réseau
     _dl_cache = None  # type: Optional[Tuple[Any, float, Optional[List[Any]], Optional[str]]]
     _dl_gen = 0  # incrémenté par invalidate_downloads : un rafraîchissement plus ancien n'écrit pas le cache

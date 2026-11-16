@@ -33,8 +33,10 @@ Files = Optional[Mapping[str, Tuple[str, bytes, str]]]
 
 
 class HttpError(Exception):
-    def __init__(self, message: str, status: Optional[int] = None, body: bytes = b"", url: str = ""):
+    def __init__(self, message: str, status: Optional[int] = None, body: bytes = b"", url: str = "",
+                 timed_out: bool = False):
         super().__init__(message)
+        self.timed_out = timed_out  # the server accepted the connection (or not) but did not answer in time
         self.status = status
         self.body = body
         self.url = url
@@ -239,9 +241,10 @@ class HttpClient:
             if isinstance(reason, _SchemeRedirect):
                 return Response(reason.code, {"location": reason.location}, b"", url,
                                 redirect_location=reason.location)
-            raise HttpError("Connexion impossible à %s: %s" % (redact(url), reason), None, b"", url)
+            raise HttpError("Connexion impossible à %s: %s" % (redact(url), reason), None, b"", url,
+                            timed_out=isinstance(reason, (socket.timeout, TimeoutError)))
         except (socket.timeout, TimeoutError) as exc:
-            raise HttpError("Délai dépassé pour %s: %s" % (redact(url), exc), None, b"", url)
+            raise HttpError("Délai dépassé pour %s: %s" % (redact(url), exc), None, b"", url, timed_out=True)
         except (ConnectionError, OSError, http.client.HTTPException) as exc:
             raise HttpError("Erreur réseau pour %s: %s" % (redact(url), exc), None, b"", url)
         except ValueError as exc:  # malformed URL (bad port, unknown scheme...)

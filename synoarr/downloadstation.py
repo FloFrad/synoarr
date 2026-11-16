@@ -94,8 +94,9 @@ _DESTINATION_CODES = (120, 402, 403, 406, 407)
 
 
 class DownloadStationError(Exception):
-    def __init__(self, message: str, code: Optional[int] = None, auth: bool = False):
+    def __init__(self, message: str, code: Optional[int] = None, auth: bool = False, network: bool = False):
         super().__init__(message)
+        self.network = network  # DSM unreachable or too slow: trying another path or API is useless
         self.code = code
         self.auth = auth  # True = login problem (credentials, 2FA...), retrying another API is useless
 
@@ -187,6 +188,10 @@ class DownloadStation:
         self._apis: Optional[Dict[str, Dict[str, Any]]] = None
         self._discovered = False  # True when SYNO.API.Info answered
         self._ds_rechecked = False  # task APIs missing from the first listing were asked again (logged in)
+        self._parent: Optional["DownloadStation"] = None  # quick client: discovery and login done by the parent
+        self._stale_sid: Optional[str] = None  # session DSM refused (the parent must log in again)
+        self._warming: Optional[threading.Thread] = None  # background discovery + login (for quick clients)
+        self._warm_error: Optional[Exception] = None
         self._default_destination: Optional[str] = None  # Download Station's default folder (cache)
         self.last_create: Optional[Dict[str, Any]] = None  # API, HTTP method and "data" of the last create
         self._lock = threading.RLock()
@@ -194,7 +199,9 @@ class DownloadStation:
     def quick_client(self, timeout: float = 6.0) -> "DownloadStation":
         """Copie (mêmes adresse et identifiants, session et API déjà découvertes reprises) avec un délai
         court et sans nouvelle tentative : pour les lectures fréquentes (progression) qui ne doivent jamais
-        bloquer longtemps quand DSM accepte la connexion mais ne répond pas."""
+        bloquer longtemps quand DSM accepte la connexion mais ne répond pas. La découverte des API et la
+        connexion (lentes sur certains DSM) sont faites par le client principal, avec son délai normal, en
+        arrière-plan : le client rapide l'attend au plus *timeout* secondes."""
         http = HttpClient(timeout=timeout, retries=0, verify_ssl=getattr(self.http, "verify_ssl", True),
                           use_proxy=getattr(self.http, "use_proxy", True))
         other = DownloadStation(self.url, self.username, self.password, "", http)
@@ -205,7 +212,56 @@ class DownloadStation:
             other._discovered = self._discovered
             other._ds_rechecked = self._ds_rechecked
             other._default_destination = self._default_destination
+        other._parent = self
         return other
+
+    def _adopt(self, parent: "DownloadStation") -> None:
+        """Take the parent's address, discovered APIs and session (quick client)."""
+        self.url = parent.url
+        self._sid = parent._sid
+        self._apis = dict(parent._apis) if parent._apis is not None else None
+        self._discovered = parent._discovered
+        self._ds_rechecked = parent._ds_rechecked
+
+    def _task_apis_ready(self) -> bool:
+        apis = self._apis or {}
+        return not self._discovered or self._ds_rechecked or TASK_API in apis or TASK2_API in apis
+
+    def _warm(self, stale_sid: Optional[str]) -> None:
+        """Discovery + login with this client's normal timeout (background thread started by a quick client)."""
+        self._warm_error = None
+        try:
+            self._ensure_discovered()
+            if not self._sid or self._sid == stale_sid:
+                self.login()
+            self._ensure_task_apis()
+        except Exception as exc:
+            self._warm_error = exc
+
+    def _from_parent(self) -> None:
+        """Quick client: take the parent's session, after a discovery/login done by the parent in the
+        background when needed (waited for at most this client's timeout: a slow DSM never blocks long)."""
+        parent = self._parent
+        assert parent is not None
+        with parent._lock:
+            if parent._sid and parent._sid != self._stale_sid and parent._apis is not None \
+                    and parent._task_apis_ready():
+                self._adopt(parent)
+                return
+            th = parent._warming
+            if th is None or not th.is_alive():
+                th = threading.Thread(target=parent._warm, args=(self._stale_sid,), name="ds-login", daemon=True)
+                parent._warming = th
+                th.start()
+        th.join(float(getattr(self.http, "timeout", 10) or 10))
+        if th.is_alive():
+            raise DownloadStationError(
+                "DSM (%s) est lent à répondre : connexion à Download Station en cours, la progression sera "
+                "disponible dans quelques instants." % parent.url, network=True)
+        with parent._lock:
+            if parent._warm_error is not None:
+                raise parent._warm_error
+            self._adopt(parent)
 
     # ================================================================ low level
     def _raw(self, path: str, params: Mapping[str, Any], method: str = "GET",
@@ -221,10 +277,15 @@ class DownloadStation:
             else:
                 resp = self.http.post(url, params=params, data=data, files=files)
         except HttpError as exc:
+            if exc.status is None and getattr(exc, "timed_out", False):
+                raise DownloadStationError(
+                    "DSM (%s) ne répond pas à temps (plus de %s s) pour webapi/%s : le NAS est sans doute occupé "
+                    "(démarrage, mise à jour, indexation…). synoarr réessaiera tout seul." % (
+                        self.url, getattr(self.http, "timeout", "?"), path.lstrip("/")), network=True)
             if exc.status is None:
                 raise DownloadStationError(
                     "Impossible de joindre DSM (%s) : %s. Vérifiez [downloadstation] url "
-                    "(ex. http://127.0.0.1:5000 ou https://127.0.0.1:5001)." % (self.url, exc))
+                    "(ex. http://127.0.0.1:5000 ou https://127.0.0.1:5001)." % (self.url, exc), network=True)
             raise DownloadStationError("DSM a répondu HTTP %s pour %s. Vérifiez [downloadstation] url."
                                        % (exc.status, redact(exc.url or url)))
         self._follow_redirect(resp.url)
@@ -264,7 +325,7 @@ class DownloadStation:
         try:
             payload = self._raw("query.cgi", params)
         except DownloadStationError as exc:
-            if "Impossible de joindre" in str(exc):
+            if exc.network:
                 raise
             log.warning("Download Station : découverte des API impossible (%s), chemins par défaut utilisés", exc)
             payload = {}
@@ -279,6 +340,8 @@ class DownloadStation:
             self._discovered = False
 
     def _ensure_discovered(self) -> Dict[str, Dict[str, Any]]:
+        if self._apis is None and self._parent is not None:
+            self._from_parent()
         if self._apis is None:
             self._discover()
         assert self._apis is not None
@@ -291,6 +354,9 @@ class DownloadStation:
         answering "API inexistante" proves that Download Station is missing."""
         apis = self._ensure_discovered()
         if not self._discovered or self._ds_rechecked or TASK_API in apis or TASK2_API in apis:
+            return
+        if self._parent is not None:
+            self._from_parent()
             return
         with self._lock:
             if self._ds_rechecked:
@@ -312,7 +378,7 @@ class DownloadStation:
                     if TASK_API in found or TASK2_API in found:
                         break
             except DownloadStationError as exc:
-                if exc.auth or "Impossible de joindre" in str(exc):
+                if exc.auth or exc.network:
                     raise
                 log.debug("Download Station : nouvelle découverte des API impossible (%s)", exc)
             apis.update(found)
@@ -366,6 +432,11 @@ class DownloadStation:
 
     # ================================================================ auth
     def login(self) -> None:
+        if self._parent is not None:  # quick client: the parent logs in with its normal timeout
+            self._from_parent()
+            if not self._sid:
+                raise DownloadStationError("Connexion à DSM impossible : aucune session reçue.", auth=True)
+            return
         with self._lock:
             if not self.username:
                 raise DownloadStationError("Identifiants Download Station manquants : renseignez [downloadstation] "
@@ -379,7 +450,7 @@ class DownloadStation:
             try:
                 payload = self._raw(info["path"], {}, method="POST", data=params)
             except DownloadStationError as exc:
-                if "Impossible de joindre" in str(exc):
+                if exc.network:
                     raise
                 log.debug("Download Station : login POST en échec (%s), essai en GET", exc)
                 payload = {"success": False, "error": {"code": 101}}
@@ -451,7 +522,7 @@ class DownloadStation:
                         fields["_sid"] = sid
                     payload = self._raw(info["path"], query, method="POST", data=fields, files=files)
             except DownloadStationError as exc:
-                if info.get("guessed") and exc.code is None and "Impossible de joindre" not in str(exc):
+                if info.get("guessed") and exc.code is None and not exc.network:
                     raise self._not_installed_error()  # usual path not served by this DSM
                 raise
             if payload.get("success"):
@@ -459,6 +530,7 @@ class DownloadStation:
             code = self._error_code(payload)
             if code in SESSION_CODES and attempt == 1:
                 log.debug("Download Station : session invalide (code %s), reconnexion", code)
+                self._stale_sid = sid
                 with self._lock:
                     if self._sid == sid:
                         self._sid = None

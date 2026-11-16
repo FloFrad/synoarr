@@ -1010,6 +1010,7 @@ class WebDownloadsTest(RealAppWebBase):
         self.app.db.add_grab(movie, None, None, "Heat.1995.1080p", "Heat.1995.1080p", "Fake", None, 10)
         url = "http://127.0.0.1:%d" % srv.getsockname()[1]
         self.app.ds = DownloadStation(url, "synoarr", "x", "Download", HttpClient(timeout=60, use_proxy=False))
+        self.app.DOWNLOADS_TIMEOUT = 3.0
         self.app.invalidate_downloads()
         results = {}  # type: Dict[str, Any]
 

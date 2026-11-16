@@ -270,6 +270,49 @@ class DownloadStationTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 102)
         self.assertEqual(self.dsm.created, [])
 
+    def test_quick_client_logs_in_through_main_client(self):
+        """A slow DSM login must not hit the short timeout of the progress client."""
+        ds = self.ds()
+        quick = ds.quick_client(timeout=0.5)
+        slow_auth = self.dsm.auth
+
+        def auth(req, p):
+            if ds.http.timeout < 1:  # pragma: no cover - would mean the short client logged in
+                raise AssertionError("login with the short timeout")
+            import time as _t
+            _t.sleep(0.8)  # slower than the quick client's timeout
+            return slow_auth(req, p)
+        with unittest.mock.patch.object(self.dsm, "auth", side_effect=auth):
+            with self.assertRaises(DownloadStationError) as ctx:  # answered within the short timeout
+                quick.list_tasks()
+            self.assertIn("lent à répondre", str(ctx.exception))
+            self.assertTrue(ctx.exception.network)
+            ds._warming.join(5)  # the main client finishes logging in in the background
+            self.assertEqual(len(quick.list_tasks()), 3)
+        self.assertEqual(len(self.dsm.logins), 1)
+        self.assertEqual(ds._sid, quick._sid)  # the main client got the session too
+        self.dsm.expire_next = 1  # session expired: re-login through the main client, once
+        self.assertEqual(len(quick.list_tasks()), 3)
+        self.assertEqual(len(self.dsm.logins), 2)
+        self.assertEqual(ds._sid, quick._sid)
+
+    def test_timeout_message(self):
+        ds = self.ds()
+        ds.login()
+        quick = ds.quick_client(timeout=0.3)
+        legacy = self.dsm.legacy
+
+        def slow(req, p):
+            import time as _t
+            _t.sleep(0.8)
+            return legacy(req, p)
+        with unittest.mock.patch.object(self.dsm, "legacy", side_effect=slow):
+            with self.assertRaises(DownloadStationError) as ctx:
+                quick.list_tasks()
+        self.assertTrue(ctx.exception.network)
+        self.assertIn("ne répond pas à temps", str(ctx.exception))
+        self.assertNotIn("Vérifiez [downloadstation] url", str(ctx.exception))
+
     def test_task_apis_listed_only_after_login(self):
         """After a DSM update, the anonymous listing can miss Download Station: ask again logged in."""
         self.dsm.hidden_anon = {"SYNO.DownloadStation.Task", "SYNO.DownloadStation2.Task"}
