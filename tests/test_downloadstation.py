@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import unittest
+import unittest.mock
 
 from synoarr.downloadstation import DownloadStation, DownloadStationError, map_status, normalize_destination
 from synoarr.httpclient import HttpClient
@@ -55,6 +56,9 @@ class FakeDSM:
         self.password = "p@ss w0rd&é"
         self.otp = False
         self.query_broken = False
+        self.hidden_anon = set()  # APIs not listed to an anonymous SYNO.API.Info query (seen after login)
+        self.unlisted = set()  # APIs served but never listed by SYNO.API.Info
+        self.queries = []  # (query, logged in) of SYNO.API.Info
         self.sids = set()
         self.counter = 0
         self.expire_next = 0  # number of upcoming DS calls answered with 119
@@ -84,7 +88,13 @@ class FakeDSM:
             if self.query_broken:
                 return 404, {}, b"<html>not found</html>"
             assert p["api"] == "SYNO.API.Info" and p["method"] == "query"
-            return ok(self.apis)
+            logged = p.get("_sid") in self.sids
+            self.queries.append((p.get("query"), logged))
+            listed = {k: v for k, v in self.apis.items() if k not in self.unlisted
+                      and (logged or k not in self.hidden_anon)}
+            if p.get("query") != "ALL":
+                listed = {k: v for k, v in listed.items() if k in p.get("query", "").split(",")}
+            return ok(listed)
         api = p.get("api", "")
         if req.path in ("/webapi/entry.cgi", "/webapi/auth.cgi") and api == "SYNO.API.Auth":
             return self.auth(req, p)
@@ -253,8 +263,47 @@ class DownloadStationTest(unittest.TestCase):
         ok_, msg = self.ds().test()
         self.assertFalse(ok_)
         self.assertIn("Centre de paquets", msg)
-        with self.assertRaises(DownloadStationError):
+        self.assertIn("Réparer", msg)
+        self.assertIn("vues par synoarr : SYNO.DownloadStation.Info", msg)
+        with self.assertRaises(DownloadStationError) as ctx:
             self.ds().add_url("magnet:?xt=urn:btih:abc")
+        self.assertEqual(ctx.exception.code, 102)
+        self.assertEqual(self.dsm.created, [])
+
+    def test_task_apis_listed_only_after_login(self):
+        """After a DSM update, the anonymous listing can miss Download Station: ask again logged in."""
+        self.dsm.hidden_anon = {"SYNO.DownloadStation.Task", "SYNO.DownloadStation2.Task"}
+        ds = self.ds()
+        ok_, msg = ds.test()
+        self.assertTrue(ok_, msg)
+        self.assertIn("3 tâche(s)", msg)
+        self.assertEqual(self.dsm.queries[0], ("ALL", False))
+        self.assertIn(True, [logged for _q, logged in self.dsm.queries[1:]])
+        self.assertNotIn("guessed", ds._apis["SYNO.DownloadStation2.Task"])
+        ds.add_url("magnet:?xt=urn:btih:abc")
+        self.assertEqual(self.dsm.created[0][0], "ds2")
+
+    def test_task_apis_never_listed_but_served(self):
+        """DSM lists no Download Station task API at all: the usual paths are tried anyway."""
+        self.dsm.unlisted = {"SYNO.DownloadStation.Task", "SYNO.DownloadStation2.Task"}
+        ds = self.ds()
+        ok_, msg = ds.test()
+        self.assertTrue(ok_, msg)
+        self.assertEqual(len(ds.list_tasks()), 3)
+        ds.add_url("magnet:?xt=urn:btih:abc")
+        self.assertEqual(self.dsm.created[0][0], "ds2")
+        ds.delete_task("dbid_1")
+        self.assertEqual(self.dsm.deleted, ["dbid_1"])
+
+    def test_only_ds2_served_when_unlisted(self):
+        """The legacy API is gone and DS2 is not listed: listing falls back on DS2 after "API inexistante"."""
+        del self.dsm.apis["SYNO.DownloadStation.Task"]
+        self.dsm.unlisted = {"SYNO.DownloadStation2.Task"}
+        ds = self.ds()
+        with unittest.mock.patch.object(self.dsm, "ds2", side_effect=lambda req, p: ok({"task": [
+                {"id": "dbid_7", "title": "X", "status": 2, "size": 1}]}) if p["method"] == "list" else err(103)):
+            tasks = ds.list_tasks()
+        self.assertEqual([t.id for t in tasks], ["dbid_7"])
 
     # ----------------------------------------------------------------- create
     def test_add_torrent_file_ds2(self):

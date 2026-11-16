@@ -186,6 +186,7 @@ class DownloadStation:
         self._sid: Optional[str] = None
         self._apis: Optional[Dict[str, Dict[str, Any]]] = None
         self._discovered = False  # True when SYNO.API.Info answered
+        self._ds_rechecked = False  # task APIs missing from the first listing were asked again (logged in)
         self._default_destination: Optional[str] = None  # Download Station's default folder (cache)
         self.last_create: Optional[Dict[str, Any]] = None  # API, HTTP method and "data" of the last create
         self._lock = threading.RLock()
@@ -202,6 +203,7 @@ class DownloadStation:
             other._sid = self._sid
             other._apis = dict(self._apis) if self._apis is not None else None
             other._discovered = self._discovered
+            other._ds_rechecked = self._ds_rechecked
             other._default_destination = self._default_destination
         return other
 
@@ -282,16 +284,70 @@ class DownloadStation:
         assert self._apis is not None
         return self._apis
 
+    def _ensure_task_apis(self) -> None:
+        """Some DSM versions (after an update, or while a package restarts) list only part of the APIs to an
+        anonymous SYNO.API.Info query. When neither Download Station task API is listed, ask again once,
+        logged in and by name; if DSM still lists none, try the usual paths anyway: only a real call
+        answering "API inexistante" proves that Download Station is missing."""
+        apis = self._ensure_discovered()
+        if not self._discovered or self._ds_rechecked or TASK_API in apis or TASK2_API in apis:
+            return
+        with self._lock:
+            if self._ds_rechecked:
+                return
+            self._ds_rechecked = True
+            names = ",".join(n for n in DEFAULT_APIS if n.startswith("SYNO.DownloadStation"))
+            found: Dict[str, Any] = {}
+            try:
+                if not self._sid:
+                    self.login()
+                for sid in (self._sid, None):
+                    params = {"api": "SYNO.API.Info", "version": 1, "method": "query", "query": names}
+                    if sid:
+                        params["_sid"] = sid
+                    payload = self._raw("query.cgi", params)
+                    data = payload.get("data") if payload.get("success") else None
+                    if isinstance(data, dict):
+                        found.update({k: v for k, v in data.items() if isinstance(v, dict)})
+                    if TASK_API in found or TASK2_API in found:
+                        break
+            except DownloadStationError as exc:
+                if exc.auth or "Impossible de joindre" in str(exc):
+                    raise
+                log.debug("Download Station : nouvelle découverte des API impossible (%s)", exc)
+            apis.update(found)
+            if TASK_API in apis or TASK2_API in apis:
+                log.info("Download Station : API trouvées en seconde découverte (%s)",
+                         ", ".join(sorted(n for n in found if n.startswith("SYNO.DownloadStation"))))
+                return
+            log.warning("Download Station : DSM ne liste aucune API Download Station (%s), essai avec les chemins "
+                        "habituels", self._seen_ds_apis() or "aucune API « DownloadStation » listée")
+            for name in (TASK_API, TASK2_API):
+                apis[name] = dict(DEFAULT_APIS[name], guessed=True)
+
+    def _seen_ds_apis(self) -> str:
+        """Download Station related APIs really listed by DSM (for error messages)."""
+        apis = self._apis or {}
+        return ", ".join(sorted(n for n, v in apis.items() if "download" in n.lower() and not v.get("guessed")))
+
     def has_api(self, name: str) -> bool:
+        if name in (TASK_API, TASK2_API):
+            self._ensure_task_apis()
         apis = self._ensure_discovered()
         return name in apis or (not self._discovered and name in DEFAULT_APIS)
 
     def _not_installed_error(self) -> DownloadStationError:
+        seen = self._seen_ds_apis() if self._discovered else ""
         return DownloadStationError(
             "API Download Station absente sur le NAS : le paquet Download Station n'est pas installé ou n'est "
-            "pas démarré. Installez-le / lancez-le depuis le Centre de paquets de DSM.", 102)
+            "pas démarré. Dans le Centre de paquets de DSM, ouvrez Download Station : il doit être « En cours "
+            "d'exécution » ; après une mise à jour de DSM, cliquez sur « Réparer » ou « Mettre à jour » s'il le "
+            "propose, puis ouvrez Download Station une fois. (API Download Station vues par synoarr : %s)"
+            % (seen or "aucune"), 102)
 
     def _api_info(self, name: str) -> Dict[str, Any]:
+        if name in (TASK_API, TASK2_API):
+            self._ensure_task_apis()
         apis = self._ensure_discovered()
         info = apis.get(name)
         if info is None:
@@ -380,19 +436,24 @@ class DownloadStation:
             fields: Dict[str, Any] = {"api": api, "version": self._version(api, version), "method": method}
             fields.update(params or {})
             sid = self._sid
-            if http_method == "GET":
-                ordered: Dict[str, Any] = {"_sid": sid}  # first, like Prowlarr's DiskStationProxyBase.BuildRequest
-                ordered.update(fields)
-                payload = self._raw(info["path"], ordered)
-            else:
-                query: Dict[str, Any] = {}
-                # Same as Sonarr's DownloadStation proxies: SYNO.DownloadStation2.Task wants _sid in the
-                # query string (api/version/method + params in the body), the legacy APIs in the body.
-                if sid_in_query:
-                    query["_sid"] = sid
+            try:
+                if http_method == "GET":
+                    ordered: Dict[str, Any] = {"_sid": sid}  # first, like Prowlarr's DiskStationProxyBase.BuildRequest
+                    ordered.update(fields)
+                    payload = self._raw(info["path"], ordered)
                 else:
-                    fields["_sid"] = sid
-                payload = self._raw(info["path"], query, method="POST", data=fields, files=files)
+                    query: Dict[str, Any] = {}
+                    # Same as Sonarr's DownloadStation proxies: SYNO.DownloadStation2.Task wants _sid in the
+                    # query string (api/version/method + params in the body), the legacy APIs in the body.
+                    if sid_in_query:
+                        query["_sid"] = sid
+                    else:
+                        fields["_sid"] = sid
+                    payload = self._raw(info["path"], query, method="POST", data=fields, files=files)
+            except DownloadStationError as exc:
+                if info.get("guessed") and exc.code is None and "Impossible de joindre" not in str(exc):
+                    raise self._not_installed_error()  # usual path not served by this DSM
+                raise
             if payload.get("success"):
                 return payload.get("data")
             code = self._error_code(payload)
@@ -404,6 +465,11 @@ class DownloadStation:
                 continue
             raise DownloadStationError(self._call_message(api, method, code), code)
         raise DownloadStationError("Download Station : échec après reconnexion")  # pragma: no cover
+
+    def _fallback_codes(self, api: str) -> Tuple[int, ...]:
+        """Error codes after which the other task API is tried: a guessed path may simply not exist (102)."""
+        guessed = bool((self._apis or {}).get(api, {}).get("guessed"))
+        return _PARAM_CODES if not guessed else _PARAM_CODES + (102,)
 
     def _call_message(self, api: str, method: str, code: int) -> str:
         if code == 102:
@@ -590,7 +656,7 @@ class DownloadStation:
                 tasks = (data or {}).get("tasks") or [] if isinstance(data, dict) else []
                 return [t for t in (self._to_task(x) for x in tasks) if t is not None]
             except DownloadStationError as exc:
-                if exc.auth or exc.code not in _PARAM_CODES or not self.has_api(TASK2_API):
+                if exc.auth or exc.code not in self._fallback_codes(TASK_API) or not self.has_api(TASK2_API):
                     raise
                 log.debug("Download Station : liste via l'ancienne API impossible (%s), essai DownloadStation2", exc)
         if not self.has_api(TASK2_API):
@@ -683,7 +749,7 @@ class DownloadStation:
             try:
                 data = self._call(TASK_API, "delete", {"id": task_id, "force_complete": "false"}, version=1)
             except DownloadStationError as exc:
-                if exc.auth or exc.code not in _PARAM_CODES or not self.has_api(TASK2_API):
+                if exc.auth or exc.code not in self._fallback_codes(TASK_API) or not self.has_api(TASK2_API):
                     raise
                 data = None
             else:
