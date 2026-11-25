@@ -49,6 +49,7 @@ LABELS = {
                         "send_mode": "Envoi des .torrent", "prefer": "Préférence torrent / magnet",
                         "extra_trackers": "Trackers ajoutés aux liens magnet",
                         "stalled_hours": "Abandon sans source après (heures)",
+                        "stuck_days": "Changer de source si bloqué depuis (jours, 0 = jamais)",
                         "test_torrent_url": "Torrent du test d'envoi"},
     "paths": {"download_dir": "Dossier des téléchargements", "movies_dir": "Dossier des films",
               "series_dir": "Dossier des séries", "action": "Action de rangement",

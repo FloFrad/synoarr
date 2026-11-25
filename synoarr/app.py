@@ -1116,6 +1116,73 @@ class App:
             status = "wanted"
         self.db.set_media_status(int(media_id), status)
 
+    def mark_present(self, media_id: Any, season: Any = None, episode: Any = None,
+                     present: bool = True) -> Dict[str, Any]:
+        """« Déjà présent » : the movie / the aired episodes still searched (whole show, a season or one episode)
+        are already in the library under another name -> status done (marked, so it can be undone). The running
+        downloads of a movie are deleted from Download Station. present=False undoes it (back to search).
+        Returns {"ok", "message", "count", "downloads_deleted"}; raises ValueError."""
+        media = self.db.get_media(int(media_id))
+        if media is None:
+            raise ValueError("Élément introuvable : %s" % media_id)
+        s = None if season in (None, "") else int(season)
+        e = None if episode in (None, "") else int(episode)
+        if e is not None and s is None:
+            raise ValueError("Précisez la saison de l'épisode")
+        title = media["title"]
+        deleted, warning = 0, None  # type: int, Optional[str]
+        if media["type"] == "movie":
+            if present:
+                if media.get("status") == "done":
+                    raise ValueError("« %s » est déjà terminé" % title)
+                deleted, warning = self._delete_media_downloads(media)
+                self.db.execute("UPDATE media SET status = 'done', marked_present = ?, updated_at = ? WHERE id = ?",
+                                (now_iso(), now_iso(), media["id"]))
+                msg = "« %s » marqué comme déjà présent dans la bibliothèque" % title
+            else:
+                if not media.get("marked_present"):
+                    raise ValueError("« %s » n'a pas été marqué comme déjà présent" % title)
+                self.db.execute("UPDATE media SET status = CASE WHEN status = 'done' THEN 'wanted' ELSE status END, "
+                                "marked_present = NULL, last_search_at = NULL, updated_at = ? WHERE id = ?",
+                                (now_iso(), media["id"]))
+                msg = "« %s » de nouveau recherché" % title
+            count = 1
+        else:
+            sql, params = "SELECT * FROM episodes WHERE media_id = ? AND season > 0", [media["id"]]  # type: str, List[Any]
+            if s is not None:
+                sql += " AND season = ?"
+                params.append(s)
+            if e is not None:
+                sql += " AND episode = ?"
+                params.append(e)
+            eps = self.db.query(sql, params)
+            today = _dt.date.today().isoformat()
+            if present:
+                # only episodes already aired (or undated): future ones must still be downloaded when they air
+                targets = [x for x in eps if x["status"] in ("wanted", "skipped")
+                           and (e is not None or not x.get("air_date") or x["air_date"][:10] <= today)]
+                if not targets:
+                    raise ValueError("Aucun épisode diffusé encore recherché à marquer pour « %s »" % title)
+            else:
+                targets = [x for x in eps if x.get("marked_present") and x["status"] == "done"]
+                if not targets:
+                    raise ValueError("Aucun épisode marqué comme déjà présent pour « %s »" % title)
+            for x in targets:
+                if present:
+                    self.db.execute("UPDATE episodes SET status = 'done', marked_present = ? WHERE id = ?",
+                                    (now_iso(), x["id"]))
+                else:
+                    self.db.execute("UPDATE episodes SET status = 'wanted', marked_present = NULL, "
+                                    "last_search_at = NULL WHERE id = ?", (x["id"],))
+            count = len(targets)
+            where = (" S%02dE%02d" % (s, e)) if e is not None else (" saison %d" % s if s is not None else "")
+            msg = ("%d épisode(s) de « %s »%s marqué(s) comme déjà présent(s)" if present
+                   else "%d épisode(s) de « %s »%s de nouveau recherché(s)") % (count, title, where)
+        if deleted:
+            msg += " — %d téléchargement(s) supprimé(s) de Download Station" % deleted
+        self.db.add_event("library", msg)
+        return {"ok": True, "message": msg, "count": count, "downloads_deleted": deleted, "warning": warning}
+
     def status(self) -> Dict[str, Any]:
         return {
             "version": __version__,
@@ -1583,6 +1650,14 @@ class App:
                   "speed_up": task.speed_up, "seeders": task.seeders, "leechers": task.leechers,
                   "peers": task.peers, "eta_seconds": eta, "task_id": task.id, "error": task.error,
                   "active": task.status in ACTIVE_DS_STATUSES})
+        # stuck downloads: hours without real progress (snapshot kept by the searcher), shown from 1 day
+        from .db import parse_iso
+        from .searcher import Searcher
+        snap_at = parse_iso(g.get("progress_at"))
+        if snap_at is not None and task.status in ("waiting", "downloading", "unknown") and \
+                downloaded - int(g.get("progress_bytes") or 0) < Searcher.progress_step(size):
+            hours = (_dt.datetime.now() - snap_at).total_seconds() / 3600.0
+            d["stuck_hours"] = round(hours, 1) if hours >= 24 else None
         return d
 
     def _relevant_failed(self, sent: List[Dict[str, Any]], medias: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:

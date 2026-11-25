@@ -242,7 +242,7 @@ Une fois synoarr démarré, **tout se fait depuis cette page**, sans SSH :
 | Onglet | Contenu |
 |---|---|
 | Tableau de bord | recherche manuelle (requête libre → résultats notés, triables et filtrables → « Envoyer à Download Station »), état général, espace disque libre de la vidéothèque (dossier partagé de `movies_dir` / `series_dir`, en orange sous 10 % libres), téléchargements en cours (progression, vitesses, sources), échecs récents, derniers imports, activité récente |
-| Watchlist | films et séries suivis avec leur affiche (TMDb, si une clé `[tmdb] api_key` est configurée), épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » (option « Titre français seulement »), mode « Sélection » : cases à cocher et barre d'actions groupées (Rechercher, Langue, Ignorer, Reprendre, Supprimer) |
+| Watchlist | films et séries suivis avec leur affiche (TMDb, si une clé `[tmdb] api_key` est configurée), épisodes, « Rechercher », « Ignorer », langue par élément (Auto / Anglais / Français), « + Ajouter » (recherche Plex/TMDb ou ajout manuel), « Supprimer », progression de chaque téléchargement (%, taille, vitesses ↓/↑, seeds/pairs, temps restant, état Download Station), « Changer de source » (option « Titre français seulement »), mode « Sélection » : cases à cocher et barre d'actions groupées (Rechercher, Langue, Déjà présent, Ignorer, Reprendre, Supprimer), « Déjà présent » |
 | À venir | épisodes des séries suivies diffusés dans les 7 à 90 prochains jours, groupés par jour (« Aujourd'hui », « Demain », …), films recherchés dont la date de sortie est connue (TMDb), et sorties des 7 derniers jours avec leur statut |
 | Indexers | ajouter (catalogue, URL, import Prowlarr ou Jackett), modifier (nom, URL, clé API, catégories, type), priorité (1 = le plus prioritaire), tester, activer, supprimer |
 | Historique | envois vers Download Station et événements, sur une période au choix (aujourd'hui, 7, 30 — par défaut — ou 90 derniers jours, tout, ou du … au …), mémorisée dans le navigateur |
@@ -264,6 +264,19 @@ taille, seeders, indexer et priorité. Vous pouvez aussi coller un lien magnet o
 ou envoyer un fichier .torrent depuis votre ordinateur. Par défaut l'ancienne tâche Download Station est supprimée
 (case « Supprimer l'ancien téléchargement ») ; cochez « Bloquer l'ancienne release » pour qu'elle ne soit plus jamais
 choisie automatiquement. En mode simulation (`dry_run`), rien n'est envoyé ni supprimé.
+
+**Changement automatique de source** : un téléchargement qui n'a (presque) rien gagné depuis 3 jours (moins de 1 %
+ou de 20 Mo) est signalé dans la Watchlist (« Aucun progrès depuis 3 j »). synoarr cherche alors une autre source :
+s'il en trouve une, l'ancienne tâche est supprimée de Download Station, mise sur liste noire, et la nouvelle envoyée
+(événement « Source changée automatiquement », aussi sur Telegram si `error` est notifié). S'il n'en trouve pas,
+l'ancien téléchargement est gardé et une autre source est cherchée chaque jour. Un téléchargement mis en pause dans
+Download Station n'est jamais remplacé. Délai réglable : `[downloadstation] stuck_days` (0 = jamais).
+
+**Déjà présent** : un film ou un épisode recherché que vous avez déjà (sous un autre nom de fichier) ? Cliquez sur
+« Déjà présent » dans sa carte : synoarr arrête de le chercher (statut « Terminé », badge « déjà présent ») et
+supprime les téléchargements en cours de ce film. Pour une série, le bouton de la carte marque tous les épisodes
+**déjà diffusés** encore recherchés (les prochains seront toujours téléchargés) ; dans « Épisodes », « Saison N déjà
+présente » ou « Présent » sur un épisode. Erreur ? « Remettre en recherche » (film) ou « Rechercher » (épisode).
 
 L'interface demande l'utilisateur `admin` et le mot de passe affiché par `init` (section `[web]` de
 `config.ini`). Ne videz pas ces deux valeurs : l'onglet Configuration affiche vos mots de passe. Sans mot de passe,

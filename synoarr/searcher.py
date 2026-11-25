@@ -1115,6 +1115,7 @@ class Searcher:
             return
         index = TaskIndex(tasks)
         stalled_h = float(getattr(self.cfg.downloadstation, "stalled_hours", 0) or 0)
+        stuck_days = float(getattr(self.cfg.downloadstation, "stuck_days", 0) or 0)
         for g in sent:
             task = index.find(g)
             if task is None:
@@ -1125,26 +1126,129 @@ class Searcher:
             elif stalled_h > 0 and self._is_stalled(task, g, stalled_h):
                 reason = "aucune source après %g h (lien magnet sans métadonnées ou sans pair)" % stalled_h
             else:
+                idle_h = self._idle_hours(g, task)
+                if stuck_days > 0 and idle_h is not None and idle_h >= stuck_days * 24:
+                    self._replace_stuck(g, task, idle_h)
                 continue
             log.warning("Téléchargement en échec : %s (%s) → nouvelle recherche", g["release_title"], reason)
-            self.db.set_grab_status(g["id"], "failed", reason)
-            self.db.block_release(g["release_title"], reason)
+            self._fail_grab(g, task, reason)
+
+    def _fail_grab(self, g: Dict[str, Any], task: Any, reason: str, event: bool = True) -> None:
+        """Close a download for good: blocklisted, Download Station task deleted, item searched again."""
+        self.db.set_grab_status(g["id"], "failed", reason)
+        self.db.block_release(g["release_title"], reason)
+        if event:
             self.db.add_event("download", "Échec du téléchargement %s : %s" % (g["release_title"], reason), "ERROR")
-            try:
-                self.ds.delete_task(task.id)
-            except Exception as exc:
-                log.debug("Suppression de la tâche %s impossible : %s", task.id, exc)
-            if g.get("media_id"):
-                media = self.db.get_media(g["media_id"])
-                if media and media["type"] == "movie":
-                    if not g.get("upgrade"):  # a failed upgrade leaves the movie in the library ("done")
-                        self.db.set_media_status(media["id"], "wanted")
-                    self.db.execute("UPDATE media SET last_search_at = NULL WHERE id = ?", (media["id"],))
-                elif media and g.get("season") is not None:
-                    # back to wanted, except episodes another active download still covers
-                    self.db.reset_grab_episodes(g)
-                    self.db.execute("UPDATE episodes SET last_search_at = NULL WHERE media_id = ? AND season = ?",
-                                    (media["id"], g["season"]))
+        try:
+            self.ds.delete_task(task.id)
+        except Exception as exc:
+            log.debug("Suppression de la tâche %s impossible : %s", task.id, exc)
+        if g.get("media_id"):
+            media = self.db.get_media(g["media_id"])
+            if media and media["type"] == "movie":
+                if not g.get("upgrade"):  # a failed upgrade leaves the movie in the library ("done")
+                    self.db.set_media_status(media["id"], "wanted")
+                self.db.execute("UPDATE media SET last_search_at = NULL WHERE id = ?", (media["id"],))
+            elif media and g.get("season") is not None:
+                # back to wanted, except episodes another active download still covers
+                self.db.reset_grab_episodes(g)
+                self.db.execute("UPDATE episodes SET last_search_at = NULL WHERE media_id = ? AND season = ?",
+                                (media["id"], g["season"]))
+
+    # ---------------------------------------------------------------- stuck downloads (no progress for days)
+    STUCK_STATUSES = ("waiting", "downloading", "unknown")  # paused by the user: never replaced
+    STUCK_MIN_BYTES = 20 * 1024 * 1024
+    STUCK_RETRY_HOURS = 24.0  # no other source: searched again once a day, the current download is kept
+
+    @classmethod
+    def progress_step(cls, size: Any) -> int:
+        """Bytes a download must gain to count as "progressing": 1 % of its size, at least 20 MB."""
+        try:
+            size = int(size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return max(cls.STUCK_MIN_BYTES, size // 100)
+
+    def _idle_hours(self, g: Dict[str, Any], task: Any) -> Optional[float]:
+        """Hours since the download last really progressed (snapshot stored on the grab), None when it does not
+        apply (paused, finished...). The first look at a download that has (almost) nothing counts from its send
+        time, so a download already stuck before this check existed is caught too."""
+        if task.status not in self.STUCK_STATUSES or getattr(task, "is_complete", False):
+            return None
+        downloaded = int(getattr(task, "downloaded", 0) or 0)
+        step = self.progress_step(getattr(task, "size", 0) or g.get("size"))
+        snap_bytes = g.get("progress_bytes")
+        snap_at = parse_iso(g.get("progress_at"))
+        now = _dt.datetime.now()
+        if snap_at is None:
+            if downloaded < step:
+                snap_bytes, snap_at = 0, parse_iso(g.get("created_at")) or now
+            else:
+                snap_bytes, snap_at = downloaded, now
+            self._save_progress(g, snap_bytes, snap_at)
+        elif downloaded - int(snap_bytes or 0) >= step or downloaded < int(snap_bytes or 0):
+            self._save_progress(g, downloaded, now)  # real progress (or restarted task): the clock starts again
+            return 0.0
+        return max(0.0, (now - snap_at).total_seconds() / 3600.0)
+
+    def _save_progress(self, g: Dict[str, Any], downloaded: int, at: "_dt.datetime") -> None:
+        stamp = at.replace(microsecond=0).isoformat(sep=" ")
+        self.db.execute("UPDATE grabs SET progress_bytes = ?, progress_at = ? WHERE id = ?", (downloaded, stamp, g["id"]))
+        g["progress_bytes"], g["progress_at"] = downloaded, stamp
+
+    def _replace_stuck(self, g: Dict[str, Any], task: Any, idle_h: float) -> bool:
+        """Look for another source for a download stuck for days. Found: the stuck one is blocklisted and deleted,
+        the new one sent. Not found: the stuck one is kept (it may still start) and searched again in 24 h."""
+        last = parse_iso(g.get("stuck_checked_at"))
+        if last is not None and (_dt.datetime.now() - last).total_seconds() < self.STUCK_RETRY_HOURS * 3600:
+            return False
+        media = self.db.get_media(g["media_id"]) if g.get("media_id") else None
+        days = idle_h / 24.0
+        pct = getattr(task, "progress", 0.0) or 0.0
+        what = "%s (%.0f %%, sans progrès depuis %.1f j)" % (g["release_title"], pct, days)
+        first = last is None
+        self.db.execute("UPDATE grabs SET stuck_checked_at = ? WHERE id = ?", (now_iso(), g["id"]))
+        g["stuck_checked_at"] = now_iso()
+        if media is None:
+            if first:
+                self.db.add_event("download", "Téléchargement bloqué : %s — envoi manuel, aucune autre source "
+                                  "cherchée automatiquement" % what, "WARNING")
+            return False
+        try:
+            req = self.request_for(media, g.get("season"), g.get("episode"))
+        except ValueError:
+            return False
+        indexers = self.indexers_provider()
+        log.info("Téléchargement bloqué : %s → recherche d'une autre source", what)
+        alt = self._find_best(req, indexers) if indexers else None
+        if alt is None:
+            if first:
+                self.db.add_event("download", "Téléchargement bloqué : %s — aucune autre source pour l'instant, "
+                                  "nouvel essai chaque jour" % what, "WARNING")
+            return False
+        reason = "bloqué : sans progrès depuis %.1f j (%.0f %%)" % (days, pct)
+        self._fail_grab(g, task, reason, event=False)
+        media = self.db.get_media(media["id"]) or media
+        errors = []  # type: List[str]
+        ok = self.grab(alt, media, g.get("season"), g.get("episode"), error_out=errors, upgrade=bool(g.get("upgrade")))
+        if ok and media["type"] == "movie" and not g.get("upgrade"):
+            self.db.execute("UPDATE media SET status = 'grabbed', updated_at = ? WHERE id = ? AND status = 'wanted'",
+                            (now_iso(), media["id"]))
+        elif ok and g.get("season") is not None and not g.get("upgrade"):
+            season = int(g["season"])
+            if g.get("episode") is None:  # season pack
+                self.db.set_episode_status(media["id"], season, None, "grabbed", only_if=("wanted",))
+            else:  # "S01E01E02": every episode of the new release is coming
+                for ep_num in set(parse(alt.title).episodes) | {int(g["episode"])}:
+                    self.db.set_episode_status(media["id"], season, ep_num, "grabbed", only_if=("wanted",))
+        if ok:
+            self.db.add_event("download", "Source changée automatiquement : %s remplacé par %s"
+                              % (what, alt.title), "WARNING")
+        else:
+            self.db.add_event("download", "Téléchargement bloqué %s supprimé, mais l'envoi de %s a échoué (%s) : "
+                              "nouvelle recherche au prochain passage" % (what, alt.title,
+                                                                           errors[0] if errors else "?"), "ERROR")
+        return ok
 
     VANISHED_GRACE_HOURS = 1.0
 

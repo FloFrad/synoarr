@@ -114,7 +114,8 @@ def classify(kind: str, message: str, level: str = "INFO") -> List[str]:
             return ["upgrade", "import"]
         return ["import"]
     if kind == "download":
-        return ["error"] if is_error else []  # échec / bloqué sans source / abandonné
+        # échec / bloqué sans source / abandonné ; WARNING : bloqué depuis des jours, source changée automatiquement
+        return ["error"] if is_error or level == "WARNING" else []
     if kind == "watchlist":
         if not is_error and msg.startswith(("Ajouté", "Réactivé")):
             return ["watchlist"]

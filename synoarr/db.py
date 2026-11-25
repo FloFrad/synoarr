@@ -538,6 +538,13 @@ class Database:
         ("episodes", "imported_release", "TEXT"),
         ("episodes", "library_file", "TEXT"),
         ("grabs", "upgrade", "INTEGER"),
+        # « déjà présent » marked by hand (timestamp): can be undone (« Remettre en recherche »)
+        ("media", "marked_present", "TEXT"),
+        ("episodes", "marked_present", "TEXT"),
+        # stuck downloads: last real progress (bytes, time) and last search for another source
+        ("grabs", "progress_bytes", "INTEGER"),
+        ("grabs", "progress_at", "TEXT"),
+        ("grabs", "stuck_checked_at", "TEXT"),
     )
 
     def _migrate_quality(self) -> None:

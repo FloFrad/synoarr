@@ -423,6 +423,7 @@ class WebServer:
             ("POST", r"/api/media/(\d+)/language", self.api_media_language),
             ("POST", r"/api/media/(\d+)/title_fr", self.api_media_title_fr),
             ("POST", r"/api/media/(\d+)/monitor", self.api_media_monitor),
+            ("POST", r"/api/media/(\d+)/present", self.api_media_present),
             ("GET", r"/api/trending", self.api_trending),
             ("POST", r"/api/trending/add", self.api_trending_add),
             ("POST", r"/api/media/(\d+)/episodes/monitor", self.api_media_episodes_monitor),
@@ -1029,6 +1030,20 @@ class WebServer:
     MONITOR_LABELS = {"": "par défaut", "all": "tous les épisodes", "future": "nouveaux épisodes seulement",
                       "latest_season": "dernière saison", "none": "aucun épisode"}
 
+    def api_media_present(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
+        """{"season": n|null, "episode": n|null, "present": true|false} : « Déjà présent » / « Remettre en recherche »."""
+        self._media_or_404(media_id)
+        data = self._body_dict(body)
+        for key in ("season", "episode"):
+            v = data.get(key)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+                raise HttpProblem(400, "Le champ « %s » doit être un nombre entier positif ou null" % key)
+        try:
+            return self._app_func("mark_present")(media_id, data.get("season"), data.get("episode"),
+                                                  data.get("present", True) is not False)
+        except ValueError as exc:
+            raise HttpProblem(400, str(exc))
+
     def api_media_monitor(self, media_id: int, query: Dict[str, str], body: Any) -> Dict[str, Any]:
         media = self._media_or_404(media_id)
         mode = self._body_dict(body).get("mode")
@@ -1076,7 +1091,7 @@ class WebServer:
         return {"ok": True, "title_fr": value, "message": msg}
 
     # ------------------------------------------------- actions groupées, À venir, tableau de bord
-    BULK_ACTIONS = ("search", "language", "ignore", "unignore", "delete")
+    BULK_ACTIONS = ("search", "language", "ignore", "unignore", "present", "delete")
     BULK_MAX = 500
 
     def _search_many(self, ids: List[int]) -> None:
@@ -1091,7 +1106,7 @@ class WebServer:
         data = self._body_dict(body)
         action = data.get("action")
         if action not in self.BULK_ACTIONS:
-            raise HttpProblem(400, "Action invalide : search, language, ignore, unignore ou delete attendu")
+            raise HttpProblem(400, "Action invalide : search, language, ignore, unignore, present ou delete attendu")
         raw = data.get("ids")
         if not isinstance(raw, list) or not raw:
             raise HttpProblem(400, "Le champ « ids » (liste des éléments sélectionnés) est obligatoire")
@@ -1144,6 +1159,11 @@ class WebServer:
                         skipped.append({"id": mid, "title": title, "reason": "n'était pas ignoré"})
                         continue
                     self.app.set_media_status(mid, "monitored" if media["type"] == "show" else "wanted")
+                elif action == "present":
+                    res = self._app_func("mark_present")(mid) or {}
+                    downloads_deleted += int(res.get("downloads_deleted") or 0)
+                    if res.get("warning"):
+                        warnings.append(str(res["warning"]))
                 else:  # delete
                     res = self.app.remove_from_watchlist(mid, remove_from_plex=remove_from_plex,
                                                          delete_downloads=delete_downloads) or {}
@@ -1160,6 +1180,7 @@ class WebServer:
                "language": "Langues « " + (langs or "automatique") + " » appliquées à %d élément(s)",
                "ignore": "%d élément(s) ignoré(s)",
                "unignore": "%d élément(s) repris",
+               "present": "%d élément(s) marqué(s) comme déjà présent(s)",
                "delete": "%d élément(s) retiré(s) de la liste"}[action] % n
         if action == "language" and to_search:
             msg += " — nouvelle recherche lancée pour %d" % len(to_search)
@@ -1513,6 +1534,7 @@ const ltChips=(list,scope)=>{const n=k=>list.filter(x=>k==='all'||(x.link_type||
   return `<div class="row ltf" role="group" aria-label="Filtrer par type de lien">${c('all','Tous')}${c('torrent','.torrent')}${c('magnet','magnet')}${n('inconnu')?c('inconnu','lien ?'):''}</div>`};
 const pr=x=>x.priority!=null?` <span class="mut" title="Priorité de l'indexer (1 = le plus prioritaire)">· prio ${esc(x.priority)}</span>`:'';
 const fpct=p=>(Math.round(p*10)/10).toLocaleString('fr-FR')+' %';
+const presBtn=(mid,s,e,txt,undo,cls)=>`<button class="sec ${cls||''}" data-${undo?'unpres':'pres'}="${mid}" data-ps="${s==null?'':s}" data-pe="${e==null?'':e}" title="${undo?'Annuler « déjà présent » : chercher à nouveau':'Déjà dans ma bibliothèque (sous un autre nom) : ne plus chercher'}">${txt}</button>`;
 const srcBtn=(mid,s,e,g,label,rt,txt)=>`<button class="sec xs" data-src="${mid}" data-s="${s==null?'':s}" data-e="${e==null?'':e}" data-g="${g||''}" data-t="${esc(label)}" data-rt="${esc(rt||'')}">${txt||'Changer de source'}</button>`;
 function dlRow(d,wm){const st=d.status,live=d.task_id!=null,m=[];
   if(live){m.push(`${size(d.downloaded)||'0 o'} / ${size(d.size)||'?'}`);m.push(`↓ ${spd(d.speed_down)}`);m.push(`↑ ${spd(d.speed_up)}`);
@@ -1524,6 +1546,7 @@ function dlRow(d,wm){const st=d.status,live=d.task_id!=null,m=[];
   return `<div class="dl"><div class="dlh"><span class="b ds-${esc(st)}">${esc(DSL[st]||st)}</span>${live&&d.progress!=null?`<b class="pct">${fpct(d.progress)}</b>`:''}${what?`<b>${esc(what)}</b>`:''}<span class="mut small brk">${esc(d.release_title)}</span></div>
   ${live&&d.progress!=null?`<div class="pbar${st==='error'?' ko':st==='seeding'||st==='finished'?' ok':''}"><i style="width:${Math.max(0,Math.min(100,d.progress))}%"></i></div>`:''}
   <div class="dlm"><span class="mut small">${m.join(' · ')}</span>${d.media_id?srcBtn(d.media_id,d.season,d.episode,d.grab_id,(d.media_title||'')+tgt(d),d.release_title):''}</div>
+  ${d.stuck_hours?`<div class="small o-warn">Aucun progrès depuis ${esc((d.stuck_hours/24).toFixed(1).replace('.',','))} j : une autre source sera essayée automatiquement.</div>`:''}
   ${d.error?`<div class="small o-err">${esc(d.error)}</div>`:''}</div>`}
 let tab=(location.hash||'#dash').slice(1), exp=new Set(), timer=null, mounted=null, dlActive=false;
 async function api(p,method,body){
@@ -1594,7 +1617,7 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${items.length?items.map(m=>{const e=m.episodes,pct=e&&e.total?Math.round(100*e.done/e.total):0,ign=m.status==='ignored',dls=m.downloads||[];
   if(dls.some(d=>d.active))dlActive=true;
   return `<div class="card item${m.on_watchlist?'':' off'}${SEL&&SEL.has(m.id)?' sel':''}" data-id="${m.id}"><div class="wr">${SEL?`<input type="checkbox" class="wck" data-sel="${m.id}"${SEL.has(m.id)?' checked':''} aria-label="Sélectionner ${esc(m.title)}">`:''}${pst(m)}<div class="it"><div><b>${esc(m.title)}</b> ${m.year?`<span class="mut">(${esc(m.year)})</span>`:''}
-  <div class="meta">${badge(m.type)} ${badge(m.status)} ${String(m.plex_key||'').startsWith('local:')?'<span class="b b-local" title="Entrée locale, hors Watchlist Plex">local</span>':''} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
+  <div class="meta">${badge(m.type)} ${badge(m.status)}${m.marked_present&&m.status==='done'?' <span class="b b-done" title="Marqué à la main comme déjà présent">déjà présent</span>':''} ${String(m.plex_key||'').startsWith('local:')?'<span class="b b-local" title="Entrée locale, hors Watchlist Plex">local</span>':''} ${m.is_animation?'<span class="b b-anim">Animation</span>':''} ${m.on_watchlist?'':'<span class="mut">retiré de la Watchlist</span>'}
   ${m.collection?`<span class="mut">Collection : ${esc(m.collection)}</span>`:''}
   ${e?`<span class="mut">${e.done}/${e.total} épisodes · ${e.wanted} recherchés${e.grabbed?' · '+e.grabbed+' en cours':''}</span>`:''}
   ${m.last_search_at?`<span class="mut">dernière recherche ${esc(fdate(m.last_search_at))}</span>`:''}
@@ -1602,6 +1625,8 @@ V.watch=async()=>{const [ms,dl]=await Promise.all([api('media'),api('downloads')
   ${e&&e.total?`<div class="bar"><i style="width:${pct}%"></i></div>`:''}</div>
   <div class="acts"><button data-search="${m.id}"${ign?' disabled':''}>Rechercher</button><button class="sec" data-st="${m.id}" data-v="${ign?'wanted':'ignored'}">${ign?'Reprendre':'Ignorer'}</button>
   ${m.type==='movie'&&m.status==='wanted'&&!dls.length?srcBtn(m.id,null,null,null,m.title,'','Choisir une source'):''}
+  ${m.type==='movie'&&(m.status==='wanted'||m.status==='grabbed')?presBtn(m.id,null,null,'Déjà présent'):''}${m.type==='movie'&&m.status==='done'&&m.marked_present?presBtn(m.id,null,null,'Remettre en recherche',1):''}
+  ${m.type==='show'&&e&&e.wanted>0?presBtn(m.id,null,null,'Déjà présent'):''}
   ${m.type==='show'?`<button class="sec" data-eps="${m.id}">${exp.has(m.id)?'Masquer':'Épisodes'}</button>`:''}${m.type==='show'?monSel(m):''}${langSel(m)}<button class="danger" data-wdel="${m.id}" data-n="${esc(m.title)}" data-local="${String(m.plex_key||'').startsWith('local:')?1:0}" data-dl="${dls.filter(d=>d.grab_status==='sent').length}">Supprimer</button></div></div></div>
   ${dls.length?`<div class="dls">${dls.map(d=>dlRow(d,false)).join('')}</div>`:''}
   ${exp.has(m.id)?epTable(em[m.id]||[],m):''}</div>`}).join(''):(ms.length?'<p class="mut card">Aucun élément dans cet onglet.</p>':'<p class="mut card">Watchlist vide : ajoutez des films ou séries à votre Watchlist Plex puis synchronisez.</p>')}`};
@@ -1609,8 +1634,8 @@ function epTable(eps,m){if(!eps.length)return '<p class="mut">Aucun épisode con
   const fol=e=>e.status!=='skipped',sw=(a)=>a.some(fol);
   return Object.keys(by).map(s=>`<details${Object.keys(by).length<3?' open':''}><summary>Saison ${esc(s)} — ${by[s].filter(e=>e.status==='done').length}/${by[s].length}${sw(by[s])?'':' <span class="mut small">(non suivie)</span>'}</summary>
   <label class="chk efl" title="Suivre / ne plus suivre toute la saison"><input type="checkbox" data-efm="${m.id}" data-s="${esc(s)}" data-e=""${sw(by[s])?' checked':''}> Saison ${esc(s)} suivie</label>
-  ${by[s].filter(e=>e.status==='wanted').length>1?`<div class="row spk">${srcBtn(m.id,+s,null,null,m.title+' saison '+s,'','Choisir un pack pour la saison '+esc(s))}</div>`:''}
-  <table class="eps">${by[s].map(e=>`<tr><td class="nw"><input type="checkbox" title="Épisode suivi" aria-label="Suivre E${pad(e.episode)}" data-efm="${m.id}" data-s="${e.season}" data-e="${e.episode}"${fol(e)?' checked':''}${e.status==='done'||e.status==='grabbed'?' disabled':''}> E${pad(e.episode)}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}${e.status==='wanted'?' '+srcBtn(m.id,e.season,e.episode,null,m.title+` S${pad(e.season)}E${pad(e.episode)}`,'','Source…'):''}</td></tr>`).join('')}</table></details>`).join('')}
+  ${by[s].some(e=>e.status==='wanted')?`<div class="row spk">${by[s].filter(e=>e.status==='wanted').length>1?srcBtn(m.id,+s,null,null,m.title+' saison '+s,'','Choisir un pack pour la saison '+esc(s)):''}${presBtn(m.id,+s,null,'Saison '+esc(s)+' déjà présente','','xs')}</div>`:''}
+  <table class="eps">${by[s].map(e=>`<tr><td class="nw"><input type="checkbox" title="Épisode suivi" aria-label="Suivre E${pad(e.episode)}" data-efm="${m.id}" data-s="${e.season}" data-e="${e.episode}"${fol(e)?' checked':''}${e.status==='done'||e.status==='grabbed'?' disabled':''}> E${pad(e.episode)}</td><td>${esc(e.title||'')}</td><td class="mut">${esc(e.air_date||'')}</td><td>${badge(e.status)}${e.status==='wanted'?' '+srcBtn(m.id,e.season,e.episode,null,m.title+` S${pad(e.season)}E${pad(e.episode)}`,'','Source…')+' '+presBtn(m.id,e.season,e.episode,'Présent','','xs'):''}${e.status==='done'&&e.marked_present?' <span class="mut small">(marqué présent)</span> '+presBtn(m.id,e.season,e.episode,'Rechercher',1,'xs'):''}</td></tr>`).join('')}</table></details>`).join('')}
 /* ------------------------------------------------------------------ À venir */
 let CALD='30';try{CALD=localStorage.getItem('synoarr.cald')||'30'}catch(e){}
 const pday=s=>{const a=String(s).split('-');return new Date(+a[0],+a[1]-1,+a[2])};
@@ -1941,6 +1966,7 @@ app.addEventListener('submit',e=>{if(e.target.id==='prwf'){e.preventDefault();pr
 app.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const d=b.dataset;
   if(d.run)act(()=>api('run/'+d.run,'POST'));
   else if(d.src)openSrc(d);
+  else if(d.pres||d.unpres)markPresent(+(d.pres||d.unpres),d.ps,d.pe,!!d.pres);
   else if(d.wadd)openAdd();
   else if(d.selmode){SEL=SEL?null:new Set();refresh()}
   else if(d.wdel)openDel(d);
@@ -2142,6 +2168,12 @@ function syncBulk(){const on=tab==='watch'&&!!SEL,n=SEL?SEL.size:0;bulkBar.hidde
   document.body.style.setProperty('--bkh',bulkBar.offsetHeight+'px')}
 function selToggle(id,on){if(!SEL)return;if(on===undefined)on=!SEL.has(id);on?SEL.add(id):SEL.delete(id);
   const c=app.querySelector(`.item[data-id="${id}"]`);if(c){c.classList.toggle('sel',on);const k=c.querySelector('[data-sel]');if(k)k.checked=on}syncBulk()}
+function markPresent(id,s,e,present){const m=WMAP[id]||{},t=m.title||'cet élément';
+  const what=e!==''&&e!=null?` S${pad(+s)}E${pad(+e)}`:(s!==''&&s!=null?' (saison '+s+')':'');
+  const dl=(m.downloads||[]).filter(d=>d.grab_status==='sent').length;
+  const q=present?`Marquer « ${t} »${what} comme déjà présent dans votre bibliothèque ? synoarr ne le cherchera plus.`+(m.type==='show'&&e===''?' (épisodes déjà diffusés seulement : les prochains seront téléchargés)':'')+(m.type==='movie'&&dl?`\n\n${dl} téléchargement(s) en cours seront supprimés de Download Station.`:''):`Chercher de nouveau « ${t} »${what} ?`;
+  if(!confirm(q))return;
+  act(()=>api('media/'+id+'/present','POST',{season:s===''||s==null?null:+s,episode:e===''||e==null?null:+e,present}))}
 async function bulk(action,extra){if(!SEL||!SEL.size){toast('Aucun élément sélectionné',true);return null}
   try{const r=await api('media/bulk','POST',Object.assign({ids:[...SEL],action},extra||{}));
     toast(r.message+(r.warning?' — '+r.warning:''),!r.ok);if(action==='delete')(r.done||[]).forEach(id=>SEL&&SEL.delete(id));await refresh();return r}
@@ -2158,7 +2190,9 @@ async function bulkDel(b){b.disabled=true;const r=await bulk('delete',{remove_fr
   if(r)closeGM();else b.disabled=false}
 bulkBar.addEventListener('click',e=>{const b=e.target.closest('button[data-bk]');if(!b||!SEL)return;const k=b.dataset.bk;
   if(k==='all'){WVIS.forEach(id=>SEL.add(id));refresh()}else if(k==='none'){SEL.clear();refresh()}else if(k==='exit'){SEL=null;refresh()}
-  else if(k==='delete')openBulkDel();else bulk(k)});
+  else if(k==='delete')openBulkDel();
+  else if(k==='present'){if(confirm('Marquer les '+SEL.size+' élément(s) sélectionné(s) comme déjà présents dans votre bibliothèque ? (séries : épisodes déjà diffusés ; films : téléchargements en cours supprimés)'))bulk(k)}
+  else bulk(k)});
 bulkBar.addEventListener('change',e=>{if(e.target.id!=='bkl'||e.target.value==='-')return;const v=e.target.value;e.target.value='-';bulk('language',{languages:v})});
 app.addEventListener('click',e=>{if(!SEL||tab!=='watch')return;const c=e.target.closest('.item[data-id]');
   if(!c||e.target.closest('button,a,input,select,label,summary,details,textarea,.dls'))return;selToggle(+c.dataset.id)});
@@ -2299,7 +2333,7 @@ body.selmode main{padding-bottom:calc(var(--bkh,64px) + 16px)}body.selmode #toas
 <span id="bkn" class="bkn" aria-live="polite"></span><span class="bkg"><button type="button" class="xs sec" data-bk="all">Tout</button><button type="button" class="xs sec" data-bk="none">Aucun</button></span>
 <span class="bka"><button type="button" data-bk="search">Rechercher</button>
 <select id="bkl" aria-label="Langues des éléments sélectionnés"><option value="-">Langue…</option><option value="">Auto</option><option value="en">en</option><option value="fr">fr</option><option value="en,fr">en+fr</option></select>
-<button type="button" class="sec" data-bk="ignore">Ignorer</button><button type="button" class="sec" data-bk="unignore">Reprendre</button>
+<button type="button" class="sec" data-bk="present" title="Déjà dans ma bibliothèque : ne plus chercher">Déjà présent</button><button type="button" class="sec" data-bk="ignore">Ignorer</button><button type="button" class="sec" data-bk="unignore">Reprendre</button>
 <button type="button" class="danger" data-bk="delete">Supprimer</button></span><button type="button" class="xs sec bkx" data-bk="exit" aria-label="Quitter le mode Sélection">Fermer</button></div></div>
 <div id="toast" role="status"></div>
 <script>""" + INDEX_JS + """</script></body></html>
